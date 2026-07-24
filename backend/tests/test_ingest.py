@@ -1,6 +1,7 @@
 import io
 import json
 
+import pandas as pd
 import pyarrow.parquet as pq
 import pytest
 from fastapi.testclient import TestClient
@@ -126,6 +127,47 @@ def test_export_before_ingest_returns_400(client):
 
     resp = client.post(f"/datasets/{dataset_id}/export")
     assert resp.status_code == 400
+
+
+def test_excel_blank_cells_do_not_crash_reshape(client):
+    # Unlike CSV, Excel can yield NaN (a float) for a genuinely blank cell
+    # even under dtype=str/keep_default_na=False — this reproduces that.
+    df = pd.DataFrame(
+        {
+            "respondent_id": ["1", "2", "3"],
+            "better_city": ["More parks", "Lower rent", None],
+            "unsafe": [None, None, "Speeding cars"],
+        }
+    )
+    buffer = io.BytesIO()
+    df.to_excel(buffer, index=False, engine="openpyxl")
+    buffer.seek(0)
+
+    files = {
+        "file": (
+            "survey.xlsx",
+            buffer,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    }
+    upload_resp = client.post("/datasets/upload", files=files)
+    assert upload_resp.status_code == 200
+    dataset_id = upload_resp.json()["dataset_id"]
+
+    resp = client.post(
+        f"/datasets/{dataset_id}/columns",
+        json={
+            "respondent_id_column": "respondent_id",
+            "questions": [
+                {"column": "better_city", "label": "What would make the city better?"},
+                {"column": "unsafe", "label": "What makes it feel unsafe?"},
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    counts = {q["label"]: q["response_count"] for q in resp.json()["questions"]}
+    assert counts["What would make the city better?"] == 2
+    assert counts["What makes it feel unsafe?"] == 1
 
 
 def test_upload_rejects_unsupported_type(client):

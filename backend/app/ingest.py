@@ -58,8 +58,16 @@ RESPONSE_PARQUET_SCHEMA = pa.schema(
 
 def _parse_dataframe(buffer: IO[bytes], suffix: str) -> pd.DataFrame:
     if suffix == ".csv":
-        return pd.read_csv(buffer, dtype=str, keep_default_na=False)
-    return pd.read_excel(buffer, dtype=str, keep_default_na=False)
+        df = pd.read_csv(buffer, dtype=str, keep_default_na=False)
+    else:
+        df = pd.read_excel(buffer, dtype=str, keep_default_na=False)
+    # Excel, unlike CSV, can still yield NaN (a float) for a genuinely blank
+    # cell even with dtype=str/keep_default_na=False — missing-value
+    # handling happens independently of dtype coercion there. Normalize to
+    # str everywhere so every downstream .strip() call is safe regardless
+    # of source format. fillna("") first so a blank cell becomes "" rather
+    # than the literal string "nan".
+    return df.fillna("").astype(str)
 
 
 def _read_dataframe(path: Path) -> pd.DataFrame:
