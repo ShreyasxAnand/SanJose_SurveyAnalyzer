@@ -1,6 +1,7 @@
 import datetime as dt
 import io
 import json
+import shutil
 import uuid
 from pathlib import Path
 from typing import IO
@@ -27,6 +28,12 @@ router = APIRouter(prefix="/datasets", tags=["datasets"])
 SUPPORTED_SUFFIXES = {".csv", ".xlsx", ".xls"}
 REPO_ROOT = DATA_DIR.parent
 
+# Encodings a UTF-8 file commonly gets mis-decoded through, producing
+# mojibake like "donâ€™t" for "don't". cp1252 first since it's the more
+# common real-world corruption (Excel/Windows text handling); latin-1 as
+# fallback.
+_MOJIBAKE_ENCODINGS = ("cp1252", "latin-1")
+
 RESPONSE_PARQUET_SCHEMA = pa.schema(
     [
         ("dataset_id", pa.int64()),
@@ -34,8 +41,11 @@ RESPONSE_PARQUET_SCHEMA = pa.schema(
         ("question_label", pa.string()),
         ("source_column", pa.string()),
         ("source_row_index", pa.int64()),
+        ("response_key", pa.string()),
         ("respondent_id", pa.string()),
         ("response_text", pa.string()),
+        ("raw_text_original", pa.string()),
+        ("was_encoding_repaired", pa.bool_()),
         # Phase-3 fields — always null/empty until labeling exists. Typed now
         # so the labeling pass can read and rewrite this file in place later.
         ("sentiment", pa.string()),
@@ -57,6 +67,36 @@ def _read_dataframe(path: Path) -> pd.DataFrame:
         return _parse_dataframe(f, path.suffix.lower())
 
 
+def _repair_mojibake(text: str) -> tuple[str, bool]:
+    """Undo UTF-8 bytes that were previously mis-decoded as cp1252/latin-1.
+    Tries up to 3 passes to catch doubly mangled text. A round-trip through
+    one of these single-byte encodings only changes the text when the bytes
+    happen to form valid UTF-8 on decode, which real, non-mangled text
+    essentially never does by chance — so this is safe against false
+    positives in practice. Returns (repaired_text, was_repaired)."""
+    repaired = text
+    was_repaired = False
+    for _ in range(3):
+        candidate = None
+        for enc in _MOJIBAKE_ENCODINGS:
+            try:
+                attempt = repaired.encode(enc).decode("utf-8")
+            except (UnicodeDecodeError, UnicodeEncodeError):
+                continue
+            if attempt != repaired:
+                candidate = attempt
+                break
+        if candidate is None:
+            break
+        repaired = candidate
+        was_repaired = True
+    return repaired, was_repaired
+
+
+def _response_key(dataset_id: int, question_id: int, source_row_index: int) -> str:
+    return f"{dataset_id}:{question_id}:{source_row_index}"
+
+
 def _get_dataset_or_404(db: Session, dataset_id: int) -> Dataset:
     dataset = db.get(Dataset, dataset_id)
     if dataset is None:
@@ -67,8 +107,15 @@ def _get_dataset_or_404(db: Session, dataset_id: int) -> Dataset:
 def _write_exports(db: Session, dataset: Dataset) -> ExportInfo:
     """Regenerate responses.parquet, responses.csv, and manifest.json from
     the current database state. Postgres/SQLite stays the source of truth —
-    these files are reproducible exports, safe to delete and regenerate."""
+    these files are reproducible exports, safe to delete and regenerate.
+
+    The export directory is wiped and rewritten from scratch each time,
+    rather than overwritten file-by-file — otherwise a re-ingest that drops
+    a question would leave that question's rows stranded in the old export
+    files even though the manifest only reflects the current selection."""
     export_dir = EXPORTS_DIR / str(dataset.id)
+    if export_dir.exists():
+        shutil.rmtree(export_dir)
     export_dir.mkdir(parents=True, exist_ok=True)
 
     questions = (
@@ -86,10 +133,13 @@ def _write_exports(db: Session, dataset: Dataset) -> ExportInfo:
     )
 
     per_question_counts: dict[str, int] = {q.label: 0 for q in questions}
+    encoding_repairs_applied = 0
     records = []
     for r in responses:
         q = question_by_id[r.question_id]
         per_question_counts[q.label] += 1
+        if r.was_encoding_repaired:
+            encoding_repairs_applied += 1
         records.append(
             {
                 "dataset_id": dataset.id,
@@ -97,8 +147,11 @@ def _write_exports(db: Session, dataset: Dataset) -> ExportInfo:
                 "question_label": q.label,
                 "source_column": q.source_column,
                 "source_row_index": r.source_row_index,
+                "response_key": r.response_key,
                 "respondent_id": r.respondent_id,
                 "response_text": r.response_text,
+                "raw_text_original": r.raw_text_original,
+                "was_encoding_repaired": r.was_encoding_repaired,
                 "sentiment": None,
                 "child_category_ids": [],
                 "locations": [],
@@ -135,8 +188,7 @@ def _write_exports(db: Session, dataset: Dataset) -> ExportInfo:
         ],
         "per_question_counts": per_question_counts,
         "total_row_count": len(records),
-        # No encoding-repair step exists yet — always 0 until one is built.
-        "encoding_repairs_applied": 0,
+        "encoding_repairs_applied": encoding_repairs_applied,
     }
     manifest_path = export_dir / "manifest.json"
     manifest_path.write_text(
@@ -174,7 +226,15 @@ def _load_export_info(dataset_id: int) -> ExportInfo | None:
 
 def _dataset_out(db: Session, dataset: Dataset) -> DatasetOut:
     out = DatasetOut.model_validate(dataset)
-    out.exports = _load_export_info(dataset.id)
+    exports = _load_export_info(dataset.id)
+    out.exports = exports
+    # Once exports exist, the manifest is the audited record of what was
+    # actually written to disk — prefer it over the live DB count so the
+    # API response and the manifest can never disagree.
+    if exports is not None:
+        for q in out.questions:
+            if q.label in exports.per_question_counts:
+                q.response_count = exports.per_question_counts[q.label]
     return out
 
 
@@ -271,40 +331,93 @@ def select_columns(
     if missing:
         raise HTTPException(status_code=400, detail=f"Columns not found in file: {missing}")
 
-    # Reshape is a fresh derived artifact — clear any prior selection/reshape
-    # for this dataset without touching the original file on disk.
-    db.query(Response).filter(Response.dataset_id == dataset.id).delete()
-    db.query(QuestionColumn).filter(QuestionColumn.dataset_id == dataset.id).delete()
-
     dataset.respondent_id_column = body.respondent_id_column
 
+    # Upsert QuestionColumn by (dataset_id, source_column) instead of
+    # delete-then-insert, so a column that stays selected across re-runs
+    # keeps the same id — and therefore its Response rows keep theirs too.
+    # Only columns dropped from the new selection get deleted (cascades to
+    # their responses).
+    existing_questions = {
+        q.source_column: q
+        for q in db.query(QuestionColumn)
+        .filter(QuestionColumn.dataset_id == dataset.id)
+        .all()
+    }
+    desired_columns = {q.column for q in body.questions}
+
+    kept_or_created: dict[str, QuestionColumn] = {}
     for position, q in enumerate(body.questions):
-        question = QuestionColumn(
-            dataset_id=dataset.id,
-            source_column=q.column,
-            label=q.label,
-            position=position,
-        )
-        db.add(question)
-        db.flush()  # assign question.id
+        existing = existing_questions.get(q.column)
+        if existing is not None:
+            existing.label = q.label
+            existing.position = position
+            kept_or_created[q.column] = existing
+        else:
+            question = QuestionColumn(
+                dataset_id=dataset.id,
+                source_column=q.column,
+                label=q.label,
+                position=position,
+            )
+            db.add(question)
+            db.flush()  # assign question.id
+            kept_or_created[q.column] = question
+
+    for source_column, existing in existing_questions.items():
+        if source_column not in desired_columns:
+            db.delete(existing)
+    db.flush()
+
+    # Upsert Response by (dataset_id, question_id, source_row_index) for the
+    # same reason. Every cell is re-cleaned on every run (cheap at this
+    # scale) so edits to the mojibake repair logic apply retroactively.
+    for column, question in kept_or_created.items():
+        existing_responses = {
+            r.source_row_index: r
+            for r in db.query(Response)
+            .filter(
+                Response.dataset_id == dataset.id, Response.question_id == question.id
+            )
+            .all()
+        }
+        seen_rows: set[int] = set()
 
         for row_index, row in df.iterrows():
-            text = row[q.column]
-            if not text.strip():
+            raw_text = row[column]
+            if not raw_text.strip():
                 continue
-            db.add(
-                Response(
-                    dataset_id=dataset.id,
-                    question_id=question.id,
-                    source_row_index=int(row_index),
-                    respondent_id=(
-                        row[body.respondent_id_column]
-                        if body.respondent_id_column
-                        else None
-                    ),
-                    response_text=text,
-                )
+            row_index = int(row_index)
+            seen_rows.add(row_index)
+
+            cleaned_text, was_repaired = _repair_mojibake(raw_text.strip())
+            respondent_id = (
+                row[body.respondent_id_column] if body.respondent_id_column else None
             )
+
+            existing_response = existing_responses.get(row_index)
+            if existing_response is not None:
+                existing_response.raw_text_original = raw_text
+                existing_response.response_text = cleaned_text
+                existing_response.was_encoding_repaired = was_repaired
+                existing_response.respondent_id = respondent_id
+            else:
+                db.add(
+                    Response(
+                        dataset_id=dataset.id,
+                        question_id=question.id,
+                        source_row_index=row_index,
+                        response_key=_response_key(dataset.id, question.id, row_index),
+                        respondent_id=respondent_id,
+                        raw_text_original=raw_text,
+                        response_text=cleaned_text,
+                        was_encoding_repaired=was_repaired,
+                    )
+                )
+
+        for row_index, existing_response in existing_responses.items():
+            if row_index not in seen_rows:
+                db.delete(existing_response)
 
     dataset.status = "ingested"
     db.commit()

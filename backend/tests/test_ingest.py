@@ -1,6 +1,7 @@
 import io
 import json
 
+import pyarrow.parquet as pq
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -131,3 +132,126 @@ def test_upload_rejects_unsupported_type(client):
     files = {"file": ("notes.txt", io.BytesIO(b"hello"), "text/plain")}
     resp = client.post("/datasets/upload", files=files)
     assert resp.status_code == 400
+
+
+def test_question_wording_must_differ_from_raw_column_name(client):
+    files = {"file": ("survey.csv", io.BytesIO(CSV_CONTENT.encode()), "text/csv")}
+    dataset_id = client.post("/datasets/upload", files=files).json()["dataset_id"]
+
+    resp = client.post(
+        f"/datasets/{dataset_id}/columns",
+        json={
+            "respondent_id_column": None,
+            "questions": [{"column": "better_city", "label": "better_city"}],
+        },
+    )
+    assert resp.status_code == 422
+
+    resp = client.post(
+        f"/datasets/{dataset_id}/columns",
+        json={
+            "respondent_id_column": None,
+            "questions": [{"column": "better_city", "label": "  "}],
+        },
+    )
+    assert resp.status_code == 422
+
+
+def test_reingest_keeps_stable_question_and_response_ids(client, tmp_path):
+    files = {"file": ("survey.csv", io.BytesIO(CSV_CONTENT.encode()), "text/csv")}
+    dataset_id = client.post("/datasets/upload", files=files).json()["dataset_id"]
+
+    body = {
+        "respondent_id_column": "respondent_id",
+        "questions": [
+            {"column": "better_city", "label": "What would make the city better?"},
+            {"column": "unsafe", "label": "What makes it feel unsafe?"},
+        ],
+    }
+    first = client.post(f"/datasets/{dataset_id}/columns", json=body).json()
+    first_question_ids = {q["source_column"]: q["id"] for q in first["questions"]}
+
+    export_dir = tmp_path / "data" / "exports" / str(dataset_id)
+    first_table = pq.read_table(export_dir / "responses.parquet")
+    first_keys = set(first_table.column("response_key").to_pylist())
+
+    # Re-run the exact same selection — a real analyst re-confirming choices.
+    second = client.post(f"/datasets/{dataset_id}/columns", json=body).json()
+    second_question_ids = {q["source_column"]: q["id"] for q in second["questions"]}
+    second_table = pq.read_table(export_dir / "responses.parquet")
+    second_keys = set(second_table.column("response_key").to_pylist())
+
+    assert first_question_ids == second_question_ids
+    assert first_keys == second_keys
+    assert len(first_keys) == 4
+
+
+def test_shrinking_selection_clears_stale_export_rows(client, tmp_path):
+    files = {"file": ("survey.csv", io.BytesIO(CSV_CONTENT.encode()), "text/csv")}
+    dataset_id = client.post("/datasets/upload", files=files).json()["dataset_id"]
+
+    client.post(
+        f"/datasets/{dataset_id}/columns",
+        json={
+            "respondent_id_column": "respondent_id",
+            "questions": [
+                {"column": "better_city", "label": "What would make the city better?"},
+                {"column": "unsafe", "label": "What makes it feel unsafe?"},
+            ],
+        },
+    )
+
+    second = client.post(
+        f"/datasets/{dataset_id}/columns",
+        json={
+            "respondent_id_column": "respondent_id",
+            "questions": [
+                {"column": "better_city", "label": "What would make the city better?"},
+            ],
+        },
+    ).json()
+
+    assert [q["source_column"] for q in second["questions"]] == ["better_city"]
+    assert second["exports"]["per_question_counts"] == {
+        "What would make the city better?": 2,
+    }
+
+    export_dir = tmp_path / "data" / "exports" / str(dataset_id)
+    manifest = json.loads((export_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["per_question_counts"] == {
+        "What would make the city better?": 2,
+    }
+    raw_csv = (export_dir / "responses.csv").read_text(encoding="utf-8-sig")
+    assert "unsafe" not in raw_csv
+    assert "What makes it feel unsafe?" not in raw_csv
+
+
+def test_encoding_repair_and_raw_text_preserved(client, tmp_path):
+    correct_text = "I don’t like the parks"
+    mojibake_text = correct_text.encode("utf-8").decode("cp1252")
+    assert mojibake_text != correct_text  # sanity: the fixture is actually mangled
+
+    csv_content = f"respondent_id,better_city\n1,{mojibake_text}\n"
+    files = {"file": ("survey.csv", io.BytesIO(csv_content.encode("utf-8")), "text/csv")}
+    dataset_id = client.post("/datasets/upload", files=files).json()["dataset_id"]
+
+    resp = client.post(
+        f"/datasets/{dataset_id}/columns",
+        json={
+            "respondent_id_column": None,
+            "questions": [
+                {"column": "better_city", "label": "What would make the city better?"}
+            ],
+        },
+    )
+    assert resp.status_code == 200
+
+    export_dir = tmp_path / "data" / "exports" / str(dataset_id)
+    manifest = json.loads((export_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["encoding_repairs_applied"] == 1
+
+    table = pq.read_table(export_dir / "responses.parquet")
+    row = table.to_pylist()[0]
+    assert row["response_text"] == correct_text
+    assert row["raw_text_original"] == mojibake_text
+    assert row["was_encoding_repaired"] is True

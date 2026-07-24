@@ -1,6 +1,7 @@
 import datetime as dt
+from typing import Self
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
 
 class ColumnPreview(BaseModel):
@@ -20,6 +21,18 @@ class UploadResponse(BaseModel):
 class QuestionColumnSelection(BaseModel):
     column: str
     label: str
+
+    @model_validator(mode="after")
+    def _label_must_be_real_wording(self) -> Self:
+        label = self.label.strip()
+        if not label:
+            raise ValueError(f"Question wording is required for column '{self.column}'")
+        if label.lower() == self.column.strip().lower():
+            raise ValueError(
+                f"Question wording for '{self.column}' must be the actual question "
+                "text, not the raw column name"
+            )
+        return self
 
 
 class SelectColumnsRequest(BaseModel):
@@ -63,7 +76,10 @@ class ResponseOut(BaseModel):
     id: int
     question_id: int
     source_row_index: int
+    response_key: str
     respondent_id: str | None
+    raw_text_original: str
     response_text: str
+    was_encoding_repaired: bool
 
     model_config = ConfigDict(from_attributes=True)

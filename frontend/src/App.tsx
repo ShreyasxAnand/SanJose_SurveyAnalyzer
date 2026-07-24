@@ -95,20 +95,37 @@ function ColumnSelectStep({
 
   function toggle(column: string) {
     setSelected((s) => ({ ...s, [column]: !s[column] }));
-    if (!labels[column]) {
-      setLabels((l) => ({ ...l, [column]: column }));
-    }
+  }
+
+  function isRealWording(column: string, label: string): boolean {
+    const trimmed = label.trim();
+    return trimmed !== "" && trimmed.toLowerCase() !== column.trim().toLowerCase();
   }
 
   async function handleSubmit() {
-    const questions = upload.columns
-      .filter((c) => selected[c.column])
-      .map((c) => ({ column: c.column, label: labels[c.column] || c.column }));
+    const selectedColumns = upload.columns.filter((c) => selected[c.column]);
 
-    if (questions.length === 0) {
+    if (selectedColumns.length === 0) {
       onError("Select at least one question column.");
       return;
     }
+
+    const missingWording = selectedColumns.filter(
+      (c) => !isRealWording(c.column, labels[c.column] ?? ""),
+    );
+    if (missingWording.length > 0) {
+      onError(
+        `Enter the actual question wording (not the raw column name) for: ${missingWording
+          .map((c) => c.column)
+          .join(", ")}`,
+      );
+      return;
+    }
+
+    const questions = selectedColumns.map((c) => ({
+      column: c.column,
+      label: labels[c.column].trim(),
+    }));
 
     setBusy(true);
     try {
@@ -164,15 +181,23 @@ function ColumnSelectStep({
               </div>
             )}
             {selected[c.column] && (
-              <input
-                style={{ marginLeft: "1.5rem", marginTop: "0.25rem" }}
-                type="text"
-                value={labels[c.column] ?? c.column}
-                onChange={(e) =>
-                  setLabels((l) => ({ ...l, [c.column]: e.target.value }))
-                }
-                placeholder="Question label"
-              />
+              <div style={{ marginLeft: "1.5rem", marginTop: "0.25rem" }}>
+                <input
+                  type="text"
+                  value={labels[c.column] ?? ""}
+                  onChange={(e) =>
+                    setLabels((l) => ({ ...l, [c.column]: e.target.value }))
+                  }
+                  placeholder={`Question wording, e.g. based on "${c.column}"`}
+                  style={{ width: "24rem", maxWidth: "100%" }}
+                />
+                {!isRealWording(c.column, labels[c.column] ?? "") && (
+                  <div style={{ fontSize: "0.85em", color: "#b45309" }}>
+                    Enter the actual question text — the raw column name alone isn't
+                    allowed, since it's what the taxonomy prompt will see later.
+                  </div>
+                )}
+              </div>
             )}
           </div>
         ))}
