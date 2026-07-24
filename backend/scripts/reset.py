@@ -10,6 +10,7 @@ starts from a clean slate instead of half-committed state from a prior run.
 import shutil
 
 from app.db import Base, EXPORTS_DIR, UPLOADS_DIR, engine
+from app import models  # noqa: F401  (registers tables on Base.metadata)
 
 
 def main() -> None:
