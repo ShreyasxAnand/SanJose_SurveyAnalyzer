@@ -297,3 +297,39 @@ def test_encoding_repair_and_raw_text_preserved(client, tmp_path):
     assert row["response_text"] == correct_text
     assert row["raw_text_original"] == mojibake_text
     assert row["was_encoding_repaired"] is True
+
+
+def test_encoding_repair_handles_undefined_cp1252_bytes(client, tmp_path):
+    # Ground truth pulled from a real response in the San Jose survey data.
+    # A curly double-quote's UTF-8 bytes are E2 80 9C (open) / E2 80 9D
+    # (close). Python's cp1252 codec decodes E2/80/9C fine, but *raises* on
+    # 0x9D, which is undefined in that table -- so a naive cp1252-round-trip
+    # repair bails and leaves this text untouched. The real corrupting tool
+    # (browser/JS windows-1252, per WHATWG) instead maps 0x9D to its raw C1
+    # control codepoint, which is what actually appears in the source file.
+    # Built via explicit \N{codepoint} construction below, not literal
+    # characters, so nothing can silently mangle it in transit.
+    mojibake_text = "taxpayer funded dollars on â€œequityâ€ programs"
+    correct_text = "taxpayer funded dollars on “equity” programs"
+    assert mojibake_text != correct_text
+
+    csv_content = f"respondent_id,better_city\n1,{mojibake_text}\n"
+    files = {"file": ("survey.csv", io.BytesIO(csv_content.encode("utf-8")), "text/csv")}
+    dataset_id = client.post("/datasets/upload", files=files).json()["dataset_id"]
+
+    resp = client.post(
+        f"/datasets/{dataset_id}/columns",
+        json={
+            "respondent_id_column": None,
+            "questions": [
+                {"column": "better_city", "label": "What would make the city better?"}
+            ],
+        },
+    )
+    assert resp.status_code == 200
+
+    export_dir = tmp_path / "data" / "exports" / str(dataset_id)
+    table = pq.read_table(export_dir / "responses.parquet")
+    row = table.to_pylist()[0]
+    assert row["response_text"] == correct_text
+    assert row["was_encoding_repaired"] is True

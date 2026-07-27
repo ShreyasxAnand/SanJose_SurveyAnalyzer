@@ -3,6 +3,8 @@ __pycache__/
 *.pyc
 .venv/
 *.egg-info/
+*.env
+.env
 
 # Local-first data (uploads, exports, sqlite db) — never commit survey data
 /data/

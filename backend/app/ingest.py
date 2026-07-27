@@ -6,6 +6,7 @@ import uuid
 from pathlib import Path
 from typing import IO
 
+import ftfy
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -27,12 +28,6 @@ router = APIRouter(prefix="/datasets", tags=["datasets"])
 
 SUPPORTED_SUFFIXES = {".csv", ".xlsx", ".xls"}
 REPO_ROOT = DATA_DIR.parent
-
-# Encodings a UTF-8 file commonly gets mis-decoded through, producing
-# mojibake like "donâ€™t" for "don't". cp1252 first since it's the more
-# common real-world corruption (Excel/Windows text handling); latin-1 as
-# fallback.
-_MOJIBAKE_ENCODINGS = ("cp1252", "latin-1")
 
 RESPONSE_PARQUET_SCHEMA = pa.schema(
     [
@@ -76,29 +71,20 @@ def _read_dataframe(path: Path) -> pd.DataFrame:
 
 
 def _repair_mojibake(text: str) -> tuple[str, bool]:
-    """Undo UTF-8 bytes that were previously mis-decoded as cp1252/latin-1.
-    Tries up to 3 passes to catch doubly mangled text. A round-trip through
-    one of these single-byte encodings only changes the text when the bytes
-    happen to form valid UTF-8 on decode, which real, non-mangled text
-    essentially never does by chance — so this is safe against false
-    positives in practice. Returns (repaired_text, was_repaired)."""
-    repaired = text
-    was_repaired = False
-    for _ in range(3):
-        candidate = None
-        for enc in _MOJIBAKE_ENCODINGS:
-            try:
-                attempt = repaired.encode(enc).decode("utf-8")
-            except (UnicodeDecodeError, UnicodeEncodeError):
-                continue
-            if attempt != repaired:
-                candidate = attempt
-                break
-        if candidate is None:
-            break
-        repaired = candidate
-        was_repaired = True
-    return repaired, was_repaired
+    """Undo UTF-8 bytes that were previously mis-decoded through a
+    single-byte codepage, e.g. "donâ€™t" -> "don't". Delegates to ftfy
+    rather than a hand-rolled cp1252/latin-1 round trip: Python's strict
+    cp1252 codec raises on bytes 0x81/0x8D/0x8F/0x90/0x9D (undefined in
+    that table), but real-world corruption — e.g. from browsers/JS, which
+    follow the WHATWG windows-1252 spec — maps those bytes to their raw C1
+    control codepoints instead of erroring. A naive round trip bails on
+    text containing them (this is exactly what silently left curly
+    double-quotes unrepaired). ftfy.fix_encoding handles this and other
+    mojibake patterns without touching anything beyond encoding repair
+    (unlike ftfy.fix_text, which also normalizes whitespace/quotes/etc.).
+    Returns (repaired_text, was_repaired)."""
+    repaired = ftfy.fix_encoding(text)
+    return repaired, repaired != text
 
 
 def _response_key(dataset_id: int, question_id: int, source_row_index: int) -> str:

@@ -4,5 +4,6 @@ sqlalchemy==2.0.36
 pandas==2.2.3
 openpyxl==3.1.5
 pyarrow==18.1.0
+ftfy==6.3.1
 python-multipart==0.0.20
 pydantic==2.10.4
