@@ -387,7 +387,7 @@ def test_answer_uses_synth_client_and_records_both_models(client, monkeypatch,
     assert manifest["synth_model_id"] == "synth-model"
     assert manifest["usage"]["by_model"] == {
         "synth-model": {"calls": 1, "input_tokens": 100, "output_tokens": 20,
-                        "est_cost_usd": None}}
+                        "thinking_tokens": 0, "est_cost_usd": None}}
     assert manifest["usage"]["calls"] == 1
     # a model with no published rate is named, not silently priced at zero
     assert manifest["usage"]["unpriced_models"] == ["synth-model"]
@@ -398,12 +398,12 @@ def test_usage_block_merges_same_model_and_drops_unused():
     b = FakeClient(model_id="m1")
     unused = FakeClient(model_id="m2")
     a.usage.add(10, 1)
-    b.usage.add(20, 2)
+    b.usage.add(20, 2, thinking_tokens=1)
     block = ask_service.usage_block([a, b, unused, a], elapsed=1.5)
     # same model id merges; the same client passed twice is counted once
     assert block["by_model"] == {
         "m1": {"calls": 2, "input_tokens": 30, "output_tokens": 3,
-               "est_cost_usd": None}}
+               "thinking_tokens": 1, "est_cost_usd": None}}
     assert block["calls"] == 2 and block["input_tokens"] == 30
     assert block["unpriced_models"] == ["m1"]
 

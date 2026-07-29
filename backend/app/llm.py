@@ -27,14 +27,18 @@ MAX_ATTEMPTS = 6
 # induction MAP/ASSIGN/DEDUP and labeling. Hundreds to thousands of calls.
 DEFAULT_MODEL = "gemini-3.5-flash-lite"
 
-# The answer-writing (SYNTH) model: exactly one call per analyst question, so
-# it can afford to be the better model. Measured 2026-07-29 against
-# flash-lite on an identical synth prompt: 3.6-flash spends ~8x the visible
-# output in *thinking* tokens (552 thoughts vs 69 answer tokens) and takes
-# ~6x longer, but narrates the computed counts the lite model silently drops.
-# That trade is right for one call and catastrophic for thousands — which is
-# why this is a separate constant and NOT the default above.
-DEFAULT_SYNTH_MODEL = "gemini-3.6-flash"
+# The answer-writing (SYNTH) model. Kept as a separate constant because
+# synthesis is one call per analyst question while every other stage scales
+# with the corpus, so this is the one place a pricier model could be afforded.
+#
+# Currently the same as DEFAULT_MODEL, by decision on cost (2026-07-29).
+# gemini-3.6-flash was tried here and reverted: it writes better answers —
+# it narrates the computed counts flash-lite sometimes drops — but it bills
+# thinking tokens at the output rate, ~8x the visible output (552 thoughts vs
+# 69 answer tokens on an identical prompt), taking an ask from ~$0.011 to
+# ~$0.038 and ~6x longer. To try it again, set this to "gemini-3.6-flash" or
+# pass --synth-model / GEMINI_SYNTH_MODEL; nothing else needs to change.
+DEFAULT_SYNTH_MODEL = DEFAULT_MODEL
 
 # Published USD per 1M tokens, (input, output), checked against
 # ai.google.dev/gemini-api/docs/pricing on 2026-07-29. The output rate
@@ -114,7 +118,12 @@ def resolve_api_key(explicit: str | None = None) -> str | None:
 @dataclass
 class Usage:
     input_tokens: int = 0
+    # billed output — thinking tokens included, because that is how the output
+    # rate is charged
     output_tokens: int = 0
+    # the thinking share of output_tokens, tracked separately for reporting
+    # only. Never subtract it from output_tokens: it is billed, just invisible.
+    thinking_tokens: int = 0
     calls: int = 0
     # `x += y` is a read-modify-write, not an atomic operation, so concurrent
     # callers silently lose increments and the manifest under-reports spend.
@@ -122,10 +131,12 @@ class Usage:
     _lock: threading.Lock = field(
         default_factory=threading.Lock, repr=False, compare=False)
 
-    def add(self, input_tokens: int, output_tokens: int) -> None:
+    def add(self, input_tokens: int, output_tokens: int,
+            thinking_tokens: int = 0) -> None:
         with self._lock:
             self.input_tokens += input_tokens
             self.output_tokens += output_tokens
+            self.thinking_tokens += thinking_tokens
             self.calls += 1
 
     def cost_usd(self, price_in_per_mtok: float, price_out_per_mtok: float) -> float:
@@ -248,8 +259,9 @@ class GeminiClient:
             raise RuntimeError(f"Gemini returned empty text (finishReason={finish}).")
 
         meta = payload.get("usageMetadata") or {}
-        out_tokens = meta.get("candidatesTokenCount", 0) + meta.get("thoughtsTokenCount", 0)
-        self.usage.add(meta.get("promptTokenCount", 0), out_tokens)
+        thoughts = meta.get("thoughtsTokenCount", 0) or 0
+        out_tokens = meta.get("candidatesTokenCount", 0) + thoughts
+        self.usage.add(meta.get("promptTokenCount", 0), out_tokens, thoughts)
         return text
 
     def _post_with_retries(self, body: dict) -> dict:

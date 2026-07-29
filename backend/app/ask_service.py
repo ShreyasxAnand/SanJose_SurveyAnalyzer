@@ -170,10 +170,13 @@ def usage_block(clients: list[ModelClient], elapsed: float) -> dict:
         if not c.usage.calls:
             continue
         e = by_model.setdefault(
-            c.model_id, {"calls": 0, "input_tokens": 0, "output_tokens": 0})
+            c.model_id, {"calls": 0, "input_tokens": 0, "output_tokens": 0,
+                         "thinking_tokens": 0})
         e["calls"] += c.usage.calls
         e["input_tokens"] += c.usage.input_tokens
         e["output_tokens"] += c.usage.output_tokens
+        # a share of output_tokens, not an addition to it — billed, invisible
+        e["thinking_tokens"] += c.usage.thinking_tokens
 
     unpriced = []
     total_cost = 0.0

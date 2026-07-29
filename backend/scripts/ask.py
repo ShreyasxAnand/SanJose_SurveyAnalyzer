@@ -105,13 +105,18 @@ def main() -> None:
     ctx = ask_service.load_context(dataset_id, args.parquet, args.description)
 
     client = GeminiClient(model=args.model, max_output_tokens=args.max_output_tokens)
-    synth_client = GeminiClient(model=args.synth_model or llm.DEFAULT_SYNTH_MODEL,
-                                max_output_tokens=args.max_output_tokens)
+    synth_model = args.synth_model or llm.DEFAULT_SYNTH_MODEL
+    # One client when both stages run the same model, so usage and the cost
+    # printout stay a single line instead of two identically-labelled ones
+    synth_client = (client if synth_model == client.model_id else
+                    GeminiClient(model=synth_model,
+                                 max_output_tokens=args.max_output_tokens))
     t0 = time.time()
     print(f'question: "{args.question}"')
     print(f"dataset {dataset_id}: {len(ctx.valid_ids)} categories across "
           f"{len(ctx.question_ids)} questions")
-    print(f"models: route={client.model_id}, answer={synth_client.model_id}")
+    print(f"model: {client.model_id}" if synth_client is client else
+          f"models: route={client.model_id}, answer={synth_client.model_id}")
 
     route, route_stats = ask_service.propose(client, args.question, ctx,
                                              args.description)
@@ -174,10 +179,10 @@ def main() -> None:
 
     total = 0.0
     unpriced = False
-    for c, price_in, price_out in (
-        (client, args.price_in, args.price_out),
-        (synth_client, args.synth_price_in, args.synth_price_out),
-    ):
+    billed = [(client, args.price_in, args.price_out)]
+    if synth_client is not client:
+        billed.append((synth_client, args.synth_price_in, args.synth_price_out))
+    for c, price_in, price_out in billed:
         u = c.usage
         if not u.calls:
             continue
@@ -185,9 +190,12 @@ def main() -> None:
             cost = u.cost_usd(price_in, price_out)
         else:
             cost = llm.price_usd(c.model_id, u.input_tokens, u.output_tokens)
-        # thinking tokens are billed at the output rate and are already folded
-        # into output_tokens, so this is the real figure, not the visible one
-        thinking = " incl. thinking" if c is synth_client else ""
+        # thinking tokens are billed at the output rate and already folded
+        # into output_tokens — surfaced here because they are the difference
+        # between a cheap model and an expensive one, and they are invisible
+        # in the answer itself
+        thinking = (f" ({u.thinking_tokens:,} thinking)"
+                    if u.thinking_tokens else "")
         if cost is None:
             unpriced = True
             print(f"  {c.model_id}: {u.calls} call(s), {u.input_tokens:,} in / "

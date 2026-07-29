@@ -93,11 +93,14 @@ def _client(monkeypatch, **kwargs):
     return llm.GeminiClient(**kwargs)
 
 
-def _ok_response():
+def _ok_response(thoughts: int | None = None):
+    usage = {"promptTokenCount": 1, "candidatesTokenCount": 1}
+    if thoughts is not None:
+        usage["thoughtsTokenCount"] = thoughts
     payload = {
         "candidates": [{"content": {"parts": [{"text": '{"ok": true}'}]},
                         "finishReason": "STOP"}],
-        "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1},
+        "usageMetadata": usage,
     }
 
     class _Resp:
@@ -117,6 +120,27 @@ def _http_error(code, headers=None):
     return urllib.error.HTTPError(
         url="https://example", code=code, msg="err",
         hdrs=headers or {}, fp=io.BytesIO(b""))
+
+
+def test_thinking_tokens_are_billed_as_output_and_reported_separately(monkeypatch):
+    """A thinking model's real cost is invisible in its answer. Thoughts must
+    be counted INTO output_tokens (that is how they are charged) and also
+    tracked on their own so the bill can be explained."""
+    client = _client(monkeypatch)
+    monkeypatch.setattr(llm.urllib.request, "urlopen",
+                        lambda req, timeout: _ok_response(thoughts=500))
+    client.complete("s", "u")
+    assert client.usage.output_tokens == 501      # 1 visible + 500 thinking
+    assert client.usage.thinking_tokens == 500
+    assert llm.price_usd("gemini-3.6-flash", 0, client.usage.output_tokens) == \
+        pytest.approx(501 / 1_000_000 * 7.50)
+
+
+def test_synth_model_defaults_to_the_cheap_model(monkeypatch):
+    """Answer synthesis runs on the same cheap model as everything else, by
+    decision on cost (2026-07-29). This guards against an upgrade sneaking
+    back in unnoticed — flipping it is fine, doing so silently is not."""
+    assert llm.DEFAULT_SYNTH_MODEL == llm.DEFAULT_MODEL == "gemini-3.5-flash-lite"
 
 
 def test_retry_honors_retry_after_on_429(monkeypatch):
