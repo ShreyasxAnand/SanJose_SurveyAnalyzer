@@ -19,6 +19,11 @@ class Dataset(Base):
     original_path: Mapped[str] = mapped_column(String, nullable=False)
     sheet_name: Mapped[str | None] = mapped_column(String, nullable=True)
     respondent_id_column: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Free-text survey description collected at column-select time. Purely
+    # descriptive (what the survey is, who answered) — it feeds every prompt
+    # via context_block and is hashed into run ids, so editing it re-versions
+    # induction/labeling runs automatically.
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String, default="uploaded")
     uploaded_at: Mapped[dt.datetime] = mapped_column(
         DateTime, default=lambda: dt.datetime.now(dt.timezone.utc)
@@ -55,10 +60,6 @@ class QuestionColumn(Base):
     responses: Mapped[list["Response"]] = relationship(
         back_populates="question", cascade="all, delete-orphan"
     )
-
-    @property
-    def response_count(self) -> int:
-        return len(self.responses)
 
 
 class Response(Base):
@@ -98,6 +99,10 @@ class Response(Base):
     raw_text_original: Mapped[str] = mapped_column(Text, nullable=False)
     response_text: Mapped[str] = mapped_column(Text, nullable=False)
     was_encoding_repaired: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Sentinel non-answer ("n/a", ".", "idk", ...) — stored and exported like
+    # any response (original data immutable), but flagged so induction and
+    # labeling can skip it without re-deriving the predicate.
+    is_nonanswer: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     dataset: Mapped["Dataset"] = relationship(back_populates="responses")
     question: Mapped["QuestionColumn"] = relationship(back_populates="responses")

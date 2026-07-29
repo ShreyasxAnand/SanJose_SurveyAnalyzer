@@ -10,6 +10,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app import db as db_module
 from app import ingest as ingest_module
+from app import summary as summary_module
 from app.db import Base, get_db
 from app.main import app
 
@@ -41,6 +42,10 @@ def client(tmp_path, monkeypatch):
         monkeypatch.setattr(module, "UPLOADS_DIR", uploads_dir, raising=False)
         monkeypatch.setattr(module, "EXPORTS_DIR", exports_dir, raising=False)
     monkeypatch.setattr(ingest_module, "REPO_ROOT", tmp_path)
+    # _write_exports joins the latest labels run via summary.LABELS_DIR —
+    # point it into the tmp tree so a test dataset id that collides with a
+    # real one (both start at 1) can't leak repo labels into test exports
+    monkeypatch.setattr(summary_module, "LABELS_DIR", data_dir / "labels")
 
     def override_get_db():
         session = TestingSessionLocal()
@@ -297,6 +302,188 @@ def test_encoding_repair_and_raw_text_preserved(client, tmp_path):
     assert row["response_text"] == correct_text
     assert row["raw_text_original"] == mojibake_text
     assert row["was_encoding_repaired"] is True
+
+
+def test_sentinel_rows_flagged_not_dropped(client, tmp_path):
+    # "n/a" is a sentinel; "None" deliberately is not (a real answer to
+    # "what makes you feel unsafe"). Both are stored and exported — flagged,
+    # never dropped.
+    csv_content = (
+        "respondent_id,better_city\n"
+        "1,n/a\n"
+        "2,None\n"
+        "3,More parks\n"
+    )
+    files = {"file": ("survey.csv", io.BytesIO(csv_content.encode()), "text/csv")}
+    dataset_id = client.post("/datasets/upload", files=files).json()["dataset_id"]
+
+    resp = client.post(
+        f"/datasets/{dataset_id}/columns",
+        json={
+            "respondent_id_column": None,
+            "questions": [
+                {"column": "better_city", "label": "What would make the city better?"}
+            ],
+        },
+    )
+    assert resp.status_code == 200
+
+    export_dir = tmp_path / "data" / "exports" / str(dataset_id)
+    rows = {
+        r["response_text"]: r
+        for r in pq.read_table(export_dir / "responses.parquet").to_pylist()
+    }
+    assert len(rows) == 3  # all three stored
+    assert rows["n/a"]["is_nonanswer"] is True
+    assert rows["None"]["is_nonanswer"] is False
+    assert rows["More parks"]["is_nonanswer"] is False
+
+    manifest = json.loads((export_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["per_question_nonanswer_counts"] == {
+        "What would make the city better?": 1,
+    }
+    assert manifest["per_question_counts"] == {
+        "What would make the city better?": 3,
+    }
+
+
+def test_empty_selected_column_is_400(client):
+    csv_content = (
+        "respondent_id,better_city,empty_col\n"
+        "1,More parks,\n"
+        "2,Lower rent,\n"
+    )
+    files = {"file": ("survey.csv", io.BytesIO(csv_content.encode()), "text/csv")}
+    dataset_id = client.post("/datasets/upload", files=files).json()["dataset_id"]
+
+    resp = client.post(
+        f"/datasets/{dataset_id}/columns",
+        json={
+            "respondent_id_column": None,
+            "questions": [
+                {"column": "better_city", "label": "What would make the city better?"},
+                {"column": "empty_col", "label": "A question nobody answered?"},
+            ],
+        },
+    )
+    assert resp.status_code == 400
+    assert "empty_col" in resp.json()["detail"]
+    # nothing was ingested
+    assert client.get(f"/datasets/{dataset_id}").json()["status"] == "uploaded"
+
+
+def test_description_round_trip(client, tmp_path):
+    files = {"file": ("survey.csv", io.BytesIO(CSV_CONTENT.encode()), "text/csv")}
+    dataset_id = client.post("/datasets/upload", files=files).json()["dataset_id"]
+
+    body = {
+        "respondent_id_column": "respondent_id",
+        "questions": [
+            {"column": "better_city", "label": "What would make the city better?"},
+        ],
+        "dataset_description": "A survey of city residents about their city.",
+    }
+    first = client.post(f"/datasets/{dataset_id}/columns", json=body).json()
+    assert first["description"] == "A survey of city residents about their city."
+
+    export_dir = tmp_path / "data" / "exports" / str(dataset_id)
+    manifest = json.loads((export_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["dataset_description"] == (
+        "A survey of city residents about their city."
+    )
+
+    # Re-selecting without the field preserves the saved description.
+    body.pop("dataset_description")
+    second = client.post(f"/datasets/{dataset_id}/columns", json=body).json()
+    assert second["description"] == "A survey of city residents about their city."
+
+
+def test_export_joins_latest_labels(client, tmp_path):
+    files = {"file": ("survey.csv", io.BytesIO(CSV_CONTENT.encode()), "text/csv")}
+    dataset_id = client.post("/datasets/upload", files=files).json()["dataset_id"]
+
+    resp = client.post(
+        f"/datasets/{dataset_id}/columns",
+        json={
+            "respondent_id_column": "respondent_id",
+            "questions": [
+                {"column": "better_city", "label": "What would make the city better?"},
+            ],
+        },
+    ).json()
+    question_id = resp["questions"][0]["id"]
+    labeled_key = f"{dataset_id}:{question_id}:0"  # "More parks", row 0
+
+    def write_run(run_id: str, label_ids: list[str], fit: int) -> None:
+        run_dir = (
+            tmp_path / "data" / "labels" / str(dataset_id) / str(question_id) / run_id
+        )
+        run_dir.mkdir(parents=True)
+        (run_dir / "assignments.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "response_key": labeled_key,
+                        "label_ids": label_ids,
+                        "uncategorized": False,
+                        "fit": fit,
+                        "locations": ["parks"],
+                        "time_context": [],
+                        "actionability": "general",
+                        "event_occurred": False,
+                    },
+                    {  # key no DB row has — must be counted, not dropped
+                        "response_key": f"{dataset_id}:{question_id}:999",
+                        "label_ids": [],
+                        "uncategorized": True,
+                    },
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+    write_run("2026-01-01T00-00-00Z_aaaaaaaa", ["old_label"], 1)
+    write_run("2026-06-01T00-00-00Z_bbbbbbbb", ["new_label"], 3)
+
+    export = client.post(f"/datasets/{dataset_id}/export")
+    assert export.status_code == 200
+
+    export_dir = tmp_path / "data" / "exports" / str(dataset_id)
+    rows = {
+        r["response_key"]: r
+        for r in pq.read_table(export_dir / "responses.parquet").to_pylist()
+    }
+    labeled = rows[labeled_key]
+    assert labeled["label_ids"] == ["new_label"]  # newer run wins
+    assert labeled["fit"] == 3
+    assert labeled["locations"] == ["parks"]
+    assert labeled["event_occurred"] is False
+    assert labeled["respondent_key"] == f"{dataset_id}:0"
+
+    unlabeled = rows[f"{dataset_id}:{question_id}:1"]  # "Lower rent", no run entry
+    assert unlabeled["label_ids"] is None
+    assert unlabeled["uncategorized"] is None
+    assert unlabeled["fit"] is None
+
+    manifest = json.loads((export_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["labels_runs"] == {
+        str(question_id): "2026-06-01T00-00-00Z_bbbbbbbb"
+    }
+    assert manifest["labels_unmatched_keys"] == 1
+
+
+def test_export_schema_is_v2(client):
+    # Pins the schema-v2 field set: sentiment is gone (labeling v2 never
+    # produces it), child_category_ids became label_ids, and the labeling v2
+    # fields all exist.
+    names = [f.name for f in ingest_module.RESPONSE_PARQUET_SCHEMA]
+    assert names == [
+        "dataset_id", "question_id", "question_label", "source_column",
+        "source_row_index", "response_key", "respondent_key", "respondent_id",
+        "response_text", "raw_text_original", "was_encoding_repaired",
+        "is_nonanswer", "label_ids", "uncategorized", "fit", "locations",
+        "time_context", "actionability", "event_occurred",
+    ]
 
 
 def test_encoding_repair_handles_undefined_cp1252_bytes(client, tmp_path):

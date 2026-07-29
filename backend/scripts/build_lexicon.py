@@ -24,13 +24,15 @@ def main() -> None:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--parquet")
     ap.add_argument("--model", default=None)
-    ap.add_argument("--description", default=induction.DEFAULT_DATASET_DESCRIPTION)
+    ap.add_argument("--description", default=None,
+                    help="default: the export manifest's dataset_description")
     ap.add_argument("--show-terms", action="store_true", help="print candidates and exit")
     ap.add_argument("--price-in", type=float, default=0.30)
     ap.add_argument("--price-out", type=float, default=2.50)
     args = ap.parse_args()
 
     parquet = induction.discover_parquet(args.parquet)
+    args.description = induction.resolve_description(args.description, parquet)
     df = pd.read_parquet(parquet)
     texts = [str(t) for t in df["response_text"].tolist()]
     keys = [str(k) for k in df["response_key"].tolist()]

@@ -135,6 +135,11 @@ def cmd_apply(args, question: str) -> None:
         "relabelled_pool_size": len(pool_keys),
         "relabel_report": relabel_report,
         "relabel_cost_usd": round(cost, 4),
+        # only the relabelled pool went through LABEL_SYSTEM; the rest of this
+        # run's assignments were carried over from `derived_from`, so this
+        # stamps the pool's provenance and is null when nothing was relabelled
+        "relabel_prompt_sha256_16": (
+            labeling.prompt_hash(args.description) if relabel_report else None),
         "diagnostics_before": {k: v for k, v in before.items()
                                if k != "missing_category_pool"},
         "diagnostics_after": {k: v for k, v in after.items()
@@ -167,10 +172,14 @@ def main() -> None:
     ap.add_argument("--edits", help="edits JSON to apply; omit for report mode")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--model", default=None)
-    ap.add_argument("--description", default=induction.DEFAULT_DATASET_DESCRIPTION)
+    ap.add_argument("--description", default=None,
+                    help="default: the export manifest's dataset_description")
     ap.add_argument("--price-in", type=float, default=0.30)
     ap.add_argument("--price-out", type=float, default=2.50)
     args = ap.parse_args()
+
+    args.description = induction.resolve_description(
+        args.description, induction.discover_parquet(args.parquet))
 
     if args.edits:
         cmd_apply(args, args.question)

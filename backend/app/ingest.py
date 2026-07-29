@@ -12,14 +12,17 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from fastapi import APIRouter, Depends, HTTPException, UploadFile
 from fastapi.responses import FileResponse
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.db import DATA_DIR, EXPORTS_DIR, UPLOADS_DIR, get_db
 from app.models import Dataset, QuestionColumn, Response
+from app.nonanswer import is_nonanswer_text
 from app.schemas import (
     ColumnPreview,
     DatasetOut,
     ExportInfo,
+    QuestionColumnOut,
     SelectColumnsRequest,
     UploadResponse,
 )
@@ -29,6 +32,15 @@ router = APIRouter(prefix="/datasets", tags=["datasets"])
 SUPPORTED_SUFFIXES = {".csv", ".xlsx", ".xls"}
 REPO_ROOT = DATA_DIR.parent
 
+# Export schema v2 — aligned with labeling SCHEMA_VERSION 2 (which dropped
+# sentiment and added fit/time_context/actionability/event_occurred).
+# `child_category_ids` became `label_ids` to match assignments.json exactly.
+# The label block is None (not []) on rows no labeling run has covered, so
+# "never labeled" and "labeled, no category" stay distinguishable. Exports
+# are wipe-and-rewrite artifacts and load_question inspects the actual
+# schema, so v1 exports keep working until regenerated.
+EXPORT_SCHEMA_VERSION = 2
+LIST_COLUMNS = ("label_ids", "locations", "time_context")
 RESPONSE_PARQUET_SCHEMA = pa.schema(
     [
         ("dataset_id", pa.int64()),
@@ -37,16 +49,20 @@ RESPONSE_PARQUET_SCHEMA = pa.schema(
         ("source_column", pa.string()),
         ("source_row_index", pa.int64()),
         ("response_key", pa.string()),
+        ("respondent_key", pa.string()),
         ("respondent_id", pa.string()),
         ("response_text", pa.string()),
         ("raw_text_original", pa.string()),
         ("was_encoding_repaired", pa.bool_()),
-        # Phase-3 fields — always null/empty until labeling exists. Typed now
-        # so the labeling pass can read and rewrite this file in place later.
-        ("sentiment", pa.string()),
-        ("child_category_ids", pa.list_(pa.string())),
-        ("locations", pa.list_(pa.string())),
+        ("is_nonanswer", pa.bool_()),
+        # labeling v2 fields — null until a labels run exists for the row
+        ("label_ids", pa.list_(pa.string())),
         ("uncategorized", pa.bool_()),
+        ("fit", pa.int64()),
+        ("locations", pa.list_(pa.string())),
+        ("time_context", pa.list_(pa.string())),
+        ("actionability", pa.string()),
+        ("event_occurred", pa.bool_()),
     ]
 )
 
@@ -98,10 +114,39 @@ def _get_dataset_or_404(db: Session, dataset_id: int) -> Dataset:
     return dataset
 
 
+def _load_label_assignments(dataset_id: int) -> tuple[dict[str, dict], dict[str, str]]:
+    """(response_key -> latest assignment record, question_id -> labels run
+    id) for every question with a labels run on disk. Same latest-run
+    convention as summary/locations. Lazy import keeps ingest usable without
+    the pipeline modules loaded."""
+    from app.summary import LABELS_DIR, latest_run_dir
+
+    by_key: dict[str, dict] = {}
+    runs: dict[str, str] = {}
+    ds_dir = LABELS_DIR / str(dataset_id)
+    if not ds_dir.exists():
+        return by_key, runs
+    for qdir in sorted(p for p in ds_dir.iterdir() if p.is_dir()):
+        run_dir = latest_run_dir(qdir, "assignments.json")
+        if run_dir is None:
+            continue
+        runs[qdir.name] = run_dir.name
+        assignments = json.loads(
+            (run_dir / "assignments.json").read_text(encoding="utf-8")
+        )
+        for a in assignments:
+            key = a.get("response_key")
+            if key:
+                by_key[key] = a
+    return by_key, runs
+
+
 def _write_exports(db: Session, dataset: Dataset) -> ExportInfo:
     """Regenerate responses.parquet, responses.csv, and manifest.json from
-    the current database state. Postgres/SQLite stays the source of truth —
-    these files are reproducible exports, safe to delete and regenerate.
+    the current database state, left-joining the latest labeling run per
+    question (rows without one get None for the whole label block). The
+    database stays the source of truth — these files are reproducible
+    exports, safe to delete and regenerate.
 
     The export directory is wiped and rewritten from scratch each time,
     rather than overwritten file-by-file — otherwise a re-ingest that drops
@@ -119,21 +164,41 @@ def _write_exports(db: Session, dataset: Dataset) -> ExportInfo:
         .all()
     )
     question_by_id = {q.id: q for q in questions}
+    # Column tuples, not ORM objects — at 30k rows x several questions the
+    # identity-map bookkeeping is the dominant cost of the old query.
     responses = (
-        db.query(Response)
+        db.query(
+            Response.question_id,
+            Response.source_row_index,
+            Response.response_key,
+            Response.respondent_id,
+            Response.response_text,
+            Response.raw_text_original,
+            Response.was_encoding_repaired,
+            Response.is_nonanswer,
+        )
         .filter(Response.dataset_id == dataset.id)
         .order_by(Response.question_id, Response.source_row_index)
         .all()
     )
 
+    labels_by_key, labels_runs = _load_label_assignments(dataset.id)
+    matched_keys = 0
+
     per_question_counts: dict[str, int] = {q.label: 0 for q in questions}
+    per_question_nonanswer_counts: dict[str, int] = {q.label: 0 for q in questions}
     encoding_repairs_applied = 0
     records = []
     for r in responses:
         q = question_by_id[r.question_id]
         per_question_counts[q.label] += 1
+        if r.is_nonanswer:
+            per_question_nonanswer_counts[q.label] += 1
         if r.was_encoding_repaired:
             encoding_repairs_applied += 1
+        a = labels_by_key.get(r.response_key)
+        if a is not None:
+            matched_keys += 1
         records.append(
             {
                 "dataset_id": dataset.id,
@@ -142,14 +207,19 @@ def _write_exports(db: Session, dataset: Dataset) -> ExportInfo:
                 "source_column": q.source_column,
                 "source_row_index": r.source_row_index,
                 "response_key": r.response_key,
+                "respondent_key": f"{dataset.id}:{r.source_row_index}",
                 "respondent_id": r.respondent_id,
                 "response_text": r.response_text,
                 "raw_text_original": r.raw_text_original,
                 "was_encoding_repaired": r.was_encoding_repaired,
-                "sentiment": None,
-                "child_category_ids": [],
-                "locations": [],
-                "uncategorized": None,
+                "is_nonanswer": r.is_nonanswer,
+                "label_ids": a.get("label_ids") if a else None,
+                "uncategorized": a.get("uncategorized") if a else None,
+                "fit": a.get("fit") if a else None,
+                "locations": a.get("locations") if a else None,
+                "time_context": a.get("time_context") if a else None,
+                "actionability": a.get("actionability") if a else None,
+                "event_occurred": a.get("event_occurred") if a else None,
             }
         )
 
@@ -161,8 +231,10 @@ def _write_exports(db: Session, dataset: Dataset) -> ExportInfo:
     csv_records = [
         {
             **rec,
-            "child_category_ids": json.dumps(rec["child_category_ids"]),
-            "locations": json.dumps(rec["locations"]),
+            **{
+                col: json.dumps(rec[col]) if rec[col] is not None else ""
+                for col in LIST_COLUMNS
+            },
         }
         for rec in records
     ]
@@ -171,18 +243,26 @@ def _write_exports(db: Session, dataset: Dataset) -> ExportInfo:
     ).to_csv(csv_path, index=False, encoding="utf-8-sig")
 
     manifest = {
+        "export_schema_version": EXPORT_SCHEMA_VERSION,
         "dataset_id": dataset.id,
         "source_filename": dataset.original_filename,
         "sheet": dataset.sheet_name,
         "ingested_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "respondent_id_column": dataset.respondent_id_column,
+        "dataset_description": dataset.description or "",
         "column_mapping": [
             {"question_id": q.id, "source_column": q.source_column, "label": q.label}
             for q in questions
         ],
         "per_question_counts": per_question_counts,
+        "per_question_nonanswer_counts": per_question_nonanswer_counts,
         "total_row_count": len(records),
         "encoding_repairs_applied": encoding_repairs_applied,
+        # which labeling run each question's label columns came from, and how
+        # many assignment keys had no DB row (stale run vs re-ingest) — never
+        # dropped silently
+        "labels_runs": labels_runs,
+        "labels_unmatched_keys": len(labels_by_key) - matched_keys,
     }
     manifest_path = export_dir / "manifest.json"
     manifest_path.write_text(
@@ -219,17 +299,43 @@ def _load_export_info(dataset_id: int) -> ExportInfo | None:
 
 
 def _dataset_out(db: Session, dataset: Dataset) -> DatasetOut:
-    out = DatasetOut.model_validate(dataset)
     exports = _load_export_info(dataset.id)
-    out.exports = exports
-    # Once exports exist, the manifest is the audited record of what was
-    # actually written to disk — prefer it over the live DB count so the
-    # API response and the manifest can never disagree.
-    if exports is not None:
-        for q in out.questions:
-            if q.label in exports.per_question_counts:
-                q.response_count = exports.per_question_counts[q.label]
-    return out
+    # One grouped COUNT instead of a per-question len(responses) property,
+    # which materialized every Response row.
+    counts_by_qid = dict(
+        db.query(Response.question_id, func.count(Response.id))
+        .filter(Response.dataset_id == dataset.id)
+        .group_by(Response.question_id)
+        .all()
+    )
+    questions = []
+    for q in sorted(dataset.questions, key=lambda q: q.position):
+        # Once exports exist, the manifest is the audited record of what was
+        # actually written to disk — prefer it over the live DB count so the
+        # API response and the manifest can never disagree.
+        if exports is not None and q.label in exports.per_question_counts:
+            count = exports.per_question_counts[q.label]
+        else:
+            count = counts_by_qid.get(q.id, 0)
+        questions.append(
+            QuestionColumnOut(
+                id=q.id,
+                source_column=q.source_column,
+                label=q.label,
+                response_count=count,
+            )
+        )
+    return DatasetOut(
+        id=dataset.id,
+        name=dataset.name,
+        original_filename=dataset.original_filename,
+        status=dataset.status,
+        uploaded_at=dataset.uploaded_at,
+        respondent_id_column=dataset.respondent_id_column,
+        description=dataset.description,
+        questions=questions,
+        exports=exports,
+    )
 
 
 @router.post("/upload", response_model=UploadResponse)
@@ -325,7 +431,21 @@ def select_columns(
     if missing:
         raise HTTPException(status_code=400, detail=f"Columns not found in file: {missing}")
 
+    # A selected column with zero non-empty cells would silently become a
+    # question with zero responses — that is never what the analyst meant.
+    empty_cols = [
+        q.column for q in body.questions
+        if int((df[q.column].str.strip() != "").sum()) == 0
+    ]
+    if empty_cols:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Selected columns have no non-empty values: {empty_cols}",
+        )
+
     dataset.respondent_id_column = body.respondent_id_column
+    if body.dataset_description is not None:
+        dataset.description = body.dataset_description.strip() or None
 
     # Upsert QuestionColumn by (dataset_id, source_column) instead of
     # delete-then-insert, so a column that stays selected across re-runs
@@ -364,54 +484,63 @@ def select_columns(
     db.flush()
 
     # Upsert Response by (dataset_id, question_id, source_row_index) for the
-    # same reason. Every cell is re-cleaned on every run (cheap at this
-    # scale) so edits to the mojibake repair logic apply retroactively.
+    # same reason. Every cell is re-cleaned on every run so edits to the
+    # mojibake repair logic apply retroactively. Bulk mappings instead of
+    # per-row ORM objects: at 30k rows x several questions the unit-of-work
+    # bookkeeping is minutes, the bulk path is seconds. enumerate position
+    # equals the old df.iterrows() index — these frames always carry the
+    # default RangeIndex.
+    respondent_ids = (
+        df[body.respondent_id_column].tolist() if body.respondent_id_column else None
+    )
     for column, question in kept_or_created.items():
-        existing_responses = {
-            r.source_row_index: r
-            for r in db.query(Response)
+        existing_ids = dict(
+            db.query(Response.source_row_index, Response.id)
             .filter(
                 Response.dataset_id == dataset.id, Response.question_id == question.id
             )
             .all()
-        }
+        )
+        inserts: list[dict] = []
+        updates: list[dict] = []
         seen_rows: set[int] = set()
 
-        for row_index, row in df.iterrows():
-            raw_text = row[column]
+        for row_index, raw_text in enumerate(df[column].tolist()):
             if not raw_text.strip():
                 continue
-            row_index = int(row_index)
             seen_rows.add(row_index)
 
             cleaned_text, was_repaired = _repair_mojibake(raw_text.strip())
-            respondent_id = (
-                row[body.respondent_id_column] if body.respondent_id_column else None
-            )
-
-            existing_response = existing_responses.get(row_index)
-            if existing_response is not None:
-                existing_response.raw_text_original = raw_text
-                existing_response.response_text = cleaned_text
-                existing_response.was_encoding_repaired = was_repaired
-                existing_response.respondent_id = respondent_id
+            fields = {
+                "respondent_id": respondent_ids[row_index] if respondent_ids else None,
+                "raw_text_original": raw_text,
+                "response_text": cleaned_text,
+                "was_encoding_repaired": was_repaired,
+                "is_nonanswer": is_nonanswer_text(cleaned_text),
+            }
+            existing_id = existing_ids.get(row_index)
+            if existing_id is not None:
+                updates.append({"id": existing_id, **fields})
             else:
-                db.add(
-                    Response(
-                        dataset_id=dataset.id,
-                        question_id=question.id,
-                        source_row_index=row_index,
-                        response_key=_response_key(dataset.id, question.id, row_index),
-                        respondent_id=respondent_id,
-                        raw_text_original=raw_text,
-                        response_text=cleaned_text,
-                        was_encoding_repaired=was_repaired,
-                    )
+                inserts.append(
+                    {
+                        "dataset_id": dataset.id,
+                        "question_id": question.id,
+                        "source_row_index": row_index,
+                        "response_key": _response_key(dataset.id, question.id, row_index),
+                        **fields,
+                    }
                 )
 
-        for row_index, existing_response in existing_responses.items():
-            if row_index not in seen_rows:
-                db.delete(existing_response)
+        db.bulk_insert_mappings(Response, inserts)
+        db.bulk_update_mappings(Response, updates)
+
+        stale_ids = [rid for idx, rid in existing_ids.items() if idx not in seen_rows]
+        # chunk the IN() list — SQLite's default parameter limit is 999
+        for i in range(0, len(stale_ids), 900):
+            db.query(Response).filter(
+                Response.id.in_(stale_ids[i : i + 900])
+            ).delete(synchronize_session=False)
 
     dataset.status = "ingested"
     db.commit()

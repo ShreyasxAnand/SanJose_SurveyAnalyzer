@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 import os
+import random
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -16,7 +18,42 @@ from pathlib import Path
 from typing import Protocol
 
 RETRYABLE_HTTP = {429, 500, 502, 503, 504}
-MAX_ATTEMPTS = 4
+# 6 attempts with exponential backoff ≈ 62s cumulative — a production run is
+# hundreds of calls across 8 workers, so 429 bursts are the expected case,
+# not an anomaly.
+MAX_ATTEMPTS = 6
+
+# The workhorse for anything whose call count scales with the corpus —
+# induction MAP/ASSIGN/DEDUP and labeling. Hundreds to thousands of calls.
+DEFAULT_MODEL = "gemini-3.5-flash-lite"
+
+# The answer-writing (SYNTH) model: exactly one call per analyst question, so
+# it can afford to be the better model. Measured 2026-07-29 against
+# flash-lite on an identical synth prompt: 3.6-flash spends ~8x the visible
+# output in *thinking* tokens (552 thoughts vs 69 answer tokens) and takes
+# ~6x longer, but narrates the computed counts the lite model silently drops.
+# That trade is right for one call and catastrophic for thousands — which is
+# why this is a separate constant and NOT the default above.
+DEFAULT_SYNTH_MODEL = "gemini-3.6-flash"
+
+# Published USD per 1M tokens, (input, output), checked against
+# ai.google.dev/gemini-api/docs/pricing on 2026-07-29. The output rate
+# INCLUDES thinking tokens — which is why complete() folds thoughtsTokenCount
+# into output_tokens. A model absent from this table prices to None rather
+# than to a guess: an unpriced run reports tokens and says the cost is
+# unknown, which is recoverable; a confidently wrong dollar figure is not.
+PRICES_PER_MTOK: dict[str, tuple[float, float]] = {
+    "gemini-3.5-flash-lite": (0.30, 2.50),
+    "gemini-3.6-flash": (1.50, 7.50),
+}
+
+
+def price_usd(model_id: str, input_tokens: int, output_tokens: int) -> float | None:
+    rate = PRICES_PER_MTOK.get(model_id)
+    if rate is None:
+        return None
+    return input_tokens / 1_000_000 * rate[0] + output_tokens / 1_000_000 * rate[1]
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -79,11 +116,17 @@ class Usage:
     input_tokens: int = 0
     output_tokens: int = 0
     calls: int = 0
+    # `x += y` is a read-modify-write, not an atomic operation, so concurrent
+    # callers silently lose increments and the manifest under-reports spend.
+    # Excluded from repr/eq so Usage still compares and prints as plain data.
+    _lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False, compare=False)
 
     def add(self, input_tokens: int, output_tokens: int) -> None:
-        self.input_tokens += input_tokens
-        self.output_tokens += output_tokens
-        self.calls += 1
+        with self._lock:
+            self.input_tokens += input_tokens
+            self.output_tokens += output_tokens
+            self.calls += 1
 
     def cost_usd(self, price_in_per_mtok: float, price_out_per_mtok: float) -> float:
         return (
@@ -117,11 +160,13 @@ class GeminiClient:
         temperature: float = 0.0,
         max_output_tokens: int = 16384,
         timeout_s: int = 240,
+        seed: int | None = 7,
+        min_interval_s: float = 0.1,
     ) -> None:
         # Pinned to a concrete version, not a "-latest" alias: the manifest
         # records model_id so a run can be reproduced, which an alias silently
         # breaks when it moves. Override per-run with --model or GEMINI_MODEL.
-        self.model_id = model or os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
+        self.model_id = model or os.environ.get("GEMINI_MODEL", DEFAULT_MODEL)
         self.api_key = resolve_api_key(api_key)
         if not self.api_key:
             raise RuntimeError(
@@ -132,7 +177,41 @@ class GeminiClient:
         self.temperature = temperature
         self.max_output_tokens = max_output_tokens
         self.timeout_s = timeout_s
+        # Temperature 0 alone does NOT make Gemini deterministic — the API
+        # documents seed as the reproducibility knob. Even with it, Google
+        # only offers best-effort determinism, so this narrows run-to-run
+        # drift rather than eliminating it. 7 to match the pipeline's other
+        # fixed seeds; None omits the field entirely.
+        self.seed = seed
+        # Instance-level rate limiter — effectively global, since every
+        # script run shares one client across its worker threads. 0.1s means
+        # at most ~10 requests/s regardless of worker count; 0 disables.
+        self.min_interval_s = min_interval_s
+        self._rl_lock = threading.Lock()
+        self._next_ok = 0.0
         self.usage = Usage()
+
+    def _throttle(self) -> None:
+        if self.min_interval_s <= 0:
+            return
+        with self._rl_lock:
+            now = time.monotonic()
+            wait = self._next_ok - now
+            self._next_ok = max(now, self._next_ok) + self.min_interval_s
+        if wait > 0:
+            time.sleep(wait)
+
+    def _backoff_delay(self, attempt: int, http_error: urllib.error.HTTPError | None = None) -> float:
+        """Exponential backoff with jitter; a 429's Retry-After header, when
+        present, overrides the exponential schedule."""
+        retry_after = None
+        if http_error is not None and http_error.code == 429:
+            try:
+                retry_after = float(http_error.headers.get("Retry-After", ""))
+            except (TypeError, ValueError):
+                retry_after = None
+        base = retry_after if retry_after else min(60, 2 ** attempt)
+        return base * (1 + random.uniform(0.0, 0.25))
 
     def _url(self) -> str:
         return (
@@ -148,6 +227,7 @@ class GeminiClient:
                 "temperature": self.temperature,
                 "maxOutputTokens": self.max_output_tokens,
                 "responseMimeType": "application/json",
+                **({"seed": self.seed} if self.seed is not None else {}),
             },
         }
         payload = self._post_with_retries(body)
@@ -176,6 +256,7 @@ class GeminiClient:
         data = json.dumps(body).encode("utf-8")
         last_err: Exception | None = None
         for attempt in range(1, MAX_ATTEMPTS + 1):
+            self._throttle()
             req = urllib.request.Request(
                 self._url(),
                 data=data,
@@ -193,13 +274,13 @@ class GeminiClient:
                     pass
                 if e.code in RETRYABLE_HTTP and attempt < MAX_ATTEMPTS:
                     last_err = e
-                    time.sleep(2**attempt)
+                    time.sleep(self._backoff_delay(attempt, e))
                     continue
                 raise RuntimeError(f"Gemini HTTP {e.code}: {detail}") from e
             except (urllib.error.URLError, TimeoutError) as e:
                 if attempt < MAX_ATTEMPTS:
                     last_err = e
-                    time.sleep(2**attempt)
+                    time.sleep(self._backoff_delay(attempt))
                     continue
                 raise RuntimeError(f"Gemini request failed after {MAX_ATTEMPTS} attempts: {e}") from e
         raise RuntimeError(f"Gemini request failed: {last_err}")

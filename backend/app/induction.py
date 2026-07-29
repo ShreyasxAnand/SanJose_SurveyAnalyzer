@@ -49,6 +49,7 @@ import math
 import random
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -65,31 +66,70 @@ MAX_RESPONSE_CHARS = 500          # truncation cap inside prompts (counted in ma
 MAX_EXAMPLES_PER_LABEL = 6
 MAX_EVIDENCE_PER_CANDIDATE = 10
 LARGE_MERGE_GROUP = 4             # groups this size or bigger get needs_review
+# MAP calls are independent, so concurrency changes latency and nothing else.
+# Bounded because the ceiling is the provider's rate limit, not local CPU.
+DEFAULT_WORKERS = 8
 
-# Pure null tokens only. "none"/"nothing" are deliberately NOT here: for a
-# question like "what makes you feel unsafe" they are a real answer (nothing
-# does) and the taxonomy should surface that as a category, not lose it.
-SENTINEL_NON_ANSWERS = {
-    "n/a", "na", "n.a", "n.a.", "idk", "i don't know", "i dont know",
-    "dont know", "don't know", "no comment", "nil", "nada", "x", "xx",
-    "xxx", "?", "??", "???", "-", "--", ".", "..", "...", "unsure",
-    "not sure",
-}
+# Consolidation batching. Candidates grow ~0.3 per response with no
+# saturation, so at production scale (~4k responses/question) ~1,000
+# candidates reach the sort step — far too many for any single call whose
+# output must echo every id. The sort is therefore two stages: one VOCAB
+# call fixes the theme list (output = themes only, tiny), then ASSIGN
+# batches classify candidates against that frozen vocabulary (output = one
+# id->theme pair per candidate, bounded per batch).
+ASSIGN_BATCH_SIZE = 120
+# Dedup within a theme: lists up to this size stay one call (the validated
+# small-corpus behavior); larger themes get sub-batched with a survivors
+# round, so every call stays the "~10-40 names on one topic" problem the
+# prompt was tuned for.
+DEDUP_MAX_SINGLE = 60
+DEDUP_SUB_BATCH = 40
+# Measured on the 599-respondent test dataset (2026-07): ~0.3 candidates
+# proposed per usable response, roughly flat across chunks. Used only by the
+# dry-run cost estimate.
+EST_CANDIDATES_PER_RESPONSE = 0.30
+
+# Sentinel-non-answer logic lives in app.nonanswer (shared with ingest,
+# which flags rows at write time). Re-exported under the old names so
+# existing callers and tests keep working.
+from .nonanswer import SENTINEL_NON_ANSWERS, is_nonanswer_text as _is_sentinel  # noqa: E402
 
 TEXT_COLUMN_CANDIDATES = ["raw_text", "response_text", "text"]
 QUESTION_TEXT_COLUMN_CANDIDATES = ["question_text", "question_label", "label"]
 
-# TEMPORARY. Phase 1 will collect this at upload and store it on the Dataset;
-# this constant only exists so the plumbing can be exercised before that UI
-# lands. Purely descriptive by design: it says what the survey is and who
-# answered it, never what the analyst hopes to find. Stating an area of
-# interest here would bias induction toward confirming it, which is exactly
-# what "grounded ONLY in these responses" is meant to prevent.
+# DEPRECATED — survives only as the last-resort fallback for exports written
+# before the description was collected at ingest (see resolve_description).
+# Purely descriptive by design: it says what the survey is and who answered
+# it, never what the analyst hopes to find. Stating an area of interest here
+# would bias induction toward confirming it, which is exactly what "grounded
+# ONLY in these responses" is meant to prevent.
 DEFAULT_DATASET_DESCRIPTION = (
     "This survey is the Community Focus Area survey for San José. It asks "
     "residents a variety of questions about San José and how it can be "
     "improved in various ways."
 )
+
+
+def resolve_description(explicit: str | None, parquet_path: Path | None = None) -> str:
+    """Resolve the dataset description: explicit --description beats the
+    export manifest's dataset_description (collected in the ingest UI) beats
+    the deprecated legacy constant. Note the description is hashed into run
+    ids (prompt_hash), so a changed description automatically versions the
+    runs it produces."""
+    if explicit and explicit.strip():
+        return explicit.strip()
+    if parquet_path is not None:
+        manifest_path = Path(parquet_path).parent / "manifest.json"
+        if manifest_path.exists():
+            try:
+                described = json.loads(
+                    manifest_path.read_text(encoding="utf-8")
+                ).get("dataset_description", "")
+            except (OSError, json.JSONDecodeError):
+                described = ""
+            if described.strip():
+                return described.strip()
+    return DEFAULT_DATASET_DESCRIPTION
 
 # ---------------------------------------------------------------------------
 # Prompts (hashed into the manifest; edit = new prompt version)
@@ -143,35 +183,62 @@ MAP_USER = """Responses ({n} total):
 {numbered_responses}
 """
 
-ASSIGN_SYSTEM = """\
-{dataset_context}You are organizing candidate categories for one open-ended survey question.
+VOCAB_SYSTEM = """\
+{dataset_context}You are defining broad parent themes for candidate categories induced from one
+open-ended survey question.
 
 Survey question shown to respondents:
 "{question_text}"
 
-You will receive candidate categories (id, name, description). Sort ALL of
-them into a small set of broad parent themes. That is the only task right now.
+You will receive the NAMES of every candidate category. Propose 5-8 broad,
+reusable parent themes that together cover most of them. Prefer theme names
+that would also make sense for a different survey question — for example:
+property crime, violent crime, policing and justice, homelessness,
+transportation, cleanliness and infrastructure, cost of living, city
+governance.
 
 Rules:
-- No id may appear under more than one parent.
-- Use 5-8 parents. Prefer broad, reusable theme names that would also make
-  sense for a different survey question — for example: property crime,
-  violent crime, policing and justice, homelessness, transportation,
-  cleanliness and infrastructure, cost of living, city governance.
-- Sort a candidate only where it genuinely belongs. If a candidate fits none
-  of your themes, LEAVE IT OUT of every parent — it gets flagged for a human
-  instead. Do NOT invent a catch-all theme, and do NOT widen a theme's
-  meaning to swallow leftovers: a theme whose members have nothing to do with
-  each other is worse than no theme at all.
-- Do NOT rename, rewrite, combine, or delete any candidate here. Sorting only.
+- Themes only. Do NOT assign, rename, rewrite, or list any candidate.
+- Do NOT invent a catch-all theme ("other", "miscellaneous"): a candidate
+  that fits no theme gets flagged for a human later, not swept into a bucket.
+- "description": one sentence saying what belongs under the theme.
 - Never estimate counts or frequencies.
 
 Return ONLY valid JSON, exactly this shape:
-{{"parents": [{{"name": "...", "description": "...",
-"members": ["c00_03", "c01_07"]}}]}}
+{{"themes": [{{"name": "...", "description": "..."}}]}}
 """
 
-ASSIGN_USER = """Candidate categories ({n} total):
+VOCAB_USER = """Candidate category names ({n} total):
+{name_lines}
+"""
+
+ASSIGN_BATCH_SYSTEM = """\
+{dataset_context}You are sorting candidate categories into a FIXED set of parent themes for one
+open-ended survey question.
+
+Survey question shown to respondents:
+"{question_text}"
+
+Themes (name — what belongs):
+{theme_lines}
+
+You will receive candidate categories (id, name, description). For each id,
+answer with the name of the ONE theme it genuinely belongs under, copied
+exactly as written above.
+
+Rules:
+- Every id gets exactly one answer.
+- If a candidate fits none of the themes, answer "none" — it gets flagged for
+  a human instead. Do NOT widen a theme's meaning to swallow leftovers, and
+  do NOT treat any theme as a catch-all.
+- Do NOT rename, rewrite, combine, or delete any candidate. Sorting only.
+- Never estimate counts or frequencies.
+
+Return ONLY valid JSON, exactly this shape:
+{{"assignments": [{{"id": "c00_03", "theme": "property crime"}}]}}
+"""
+
+ASSIGN_BATCH_USER = """Candidate categories ({n} total):
 {candidate_lines}
 """
 
@@ -326,9 +393,16 @@ def _pick_column(columns: list[str], candidates: list[str], what: str) -> str:
     raise KeyError(f"No {what} column found. Tried {candidates}; parquet has {columns}")
 
 
-def load_question(parquet_path: Path, question: str) -> tuple[list[ResponseRow], dict, list[dict]]:
-    """Return (usable rows, meta, filtered non-answers). Inspects the actual
-    schema instead of trusting any listing."""
+def load_questions_bulk(
+    parquet_path: Path, question_ids: list[str] | None = None
+) -> dict[str, tuple[list[ResponseRow], dict, list[dict]]]:
+    """Load any number of questions with ONE parquet read (load_question used
+    to re-read the whole file per question — five questions meant five full
+    reads on every ask request). Returns {question_id: (usable rows, meta,
+    filtered non-answers)}. question_ids=None loads every question present.
+    Inspects the actual schema instead of trusting any listing; prefers the
+    export's is_nonanswer column when present (schema v2), falling back to
+    the shared predicate for older exports."""
     import pandas as pd
 
     df = pd.read_parquet(parquet_path)
@@ -337,72 +411,97 @@ def load_question(parquet_path: Path, question: str) -> tuple[list[ResponseRow],
         raise KeyError(f"Parquet has no question_id column; columns: {columns}")
     text_col = _pick_column(columns, TEXT_COLUMN_CANDIDATES, "response text")
 
-    qmask = df["question_id"].astype(str) == str(question)
-    sub = df[qmask]
-    if sub.empty:
-        available = (
-            df["question_id"].astype(str).value_counts().to_dict()
-        )
+    qid_str = df["question_id"].astype(str)
+    present = list(dict.fromkeys(qid_str.tolist()))
+    wanted = present if question_ids is None else [str(q) for q in question_ids]
+    missing = [q for q in wanted if q not in present]
+    if missing:
+        available = qid_str.value_counts().to_dict()
         raise SystemExit(
-            f"Question {question!r} not in parquet. Available (id: n): {available}"
+            f"Question {missing[0]!r} not in parquet. Available (id: n): {available}"
         )
 
-    # question wording — load-bearing for the prompt
-    question_text = str(question)
-    for c in QUESTION_TEXT_COLUMN_CANDIDATES:
-        if c in columns:
-            vals = sub[c].dropna().unique()
-            if len(vals):
-                question_text = str(vals[0])
-                break
+    sentinel_source = "parquet" if "is_nonanswer" in columns else "computed"
+    out: dict[str, tuple[list[ResponseRow], dict, list[dict]]] = {}
+    for question in wanted:
+        sub = df[qid_str == question]
 
-    dataset_id = ""
-    if "dataset_id" in columns:
-        ids = sub["dataset_id"].dropna().unique()
-        if len(ids):
-            dataset_id = str(ids[0])
-    if not dataset_id:
-        dataset_id = parquet_path.parent.name  # exports/{dataset_id}/file.parquet
+        # question wording — load-bearing for the prompt
+        question_text = str(question)
+        for c in QUESTION_TEXT_COLUMN_CANDIDATES:
+            if c in columns:
+                vals = sub[c].dropna().unique()
+                if len(vals):
+                    question_text = str(vals[0])
+                    break
 
-    rows: list[ResponseRow] = []
-    filtered: list[dict] = []
-    n_empty = 0
-    for pos, (idx, r) in enumerate(sub.iterrows()):
-        text = r[text_col]
-        text = "" if text is None or (isinstance(text, float) and math.isnan(text)) else str(text)
-        if "response_key" in columns and r["response_key"] and str(r["response_key"]) != "nan":
-            key = str(r["response_key"])
-        else:
-            sri = r["source_row_index"] if "source_row_index" in columns else idx
-            key = f"{dataset_id}:{question}:{sri}"
-        stripped = text.strip()
-        if not stripped:
-            n_empty += 1
-            continue
-        if _is_sentinel(stripped):
-            filtered.append({"response_key": key, "text": stripped})
-            continue
-        rows.append(ResponseRow(response_key=key, text=stripped))
+        dataset_id = ""
+        if "dataset_id" in columns:
+            ids = sub["dataset_id"].dropna().unique()
+            if len(ids):
+                dataset_id = str(ids[0])
+        if not dataset_id:
+            dataset_id = parquet_path.parent.name  # exports/{dataset_id}/file.parquet
 
-    meta = {
-        "parquet_path": str(parquet_path),
-        "parquet_columns": columns,
-        "text_column_used": text_col,
-        "dataset_id": dataset_id,
-        "question_id": str(question),
-        "question_text": question_text,
-        "rows_for_question": int(len(sub)),
-        "rows_empty": n_empty,
-        "rows_sentinel_filtered": len(filtered),
-        "rows_used": len(rows),
-    }
-    return rows, meta, filtered
+        # Columnar lists once, then a plain zip loop — no per-row Series.
+        texts_list = sub[text_col].tolist()
+        keys_list = sub["response_key"].tolist() if "response_key" in columns else None
+        sri_list = (
+            sub["source_row_index"].tolist()
+            if "source_row_index" in columns
+            else list(sub.index)
+        )
+        nonanswer_list = (
+            sub["is_nonanswer"].tolist() if "is_nonanswer" in columns else None
+        )
+
+        rows: list[ResponseRow] = []
+        filtered: list[dict] = []
+        n_empty = 0
+        for pos in range(len(texts_list)):
+            text = texts_list[pos]
+            text = (
+                ""
+                if text is None or (isinstance(text, float) and math.isnan(text))
+                else str(text)
+            )
+            raw_key = keys_list[pos] if keys_list is not None else None
+            if raw_key and str(raw_key) != "nan":
+                key = str(raw_key)
+            else:
+                key = f"{dataset_id}:{question}:{sri_list[pos]}"
+            stripped = text.strip()
+            if not stripped:
+                n_empty += 1
+                continue
+            flag = nonanswer_list[pos] if nonanswer_list is not None else None
+            is_sentinel = bool(flag) if isinstance(flag, bool) else _is_sentinel(stripped)
+            if is_sentinel:
+                filtered.append({"response_key": key, "text": stripped})
+                continue
+            rows.append(ResponseRow(response_key=key, text=stripped))
+
+        meta = {
+            "parquet_path": str(parquet_path),
+            "parquet_columns": columns,
+            "text_column_used": text_col,
+            "dataset_id": dataset_id,
+            "question_id": str(question),
+            "question_text": question_text,
+            "rows_for_question": int(len(sub)),
+            "rows_empty": n_empty,
+            "rows_sentinel_filtered": len(filtered),
+            "rows_used": len(rows),
+            "sentinel_source": sentinel_source,
+        }
+        out[question] = (rows, meta, filtered)
+    return out
 
 
-def _is_sentinel(text: str) -> bool:
-    s = text.strip().lower()
-    s = s.strip(" \t.!?")
-    return not s or s in SENTINEL_NON_ANSWERS
+def load_question(parquet_path: Path, question: str) -> tuple[list[ResponseRow], dict, list[dict]]:
+    """Return (usable rows, meta, filtered non-answers) for one question —
+    thin wrapper over load_questions_bulk."""
+    return load_questions_bulk(parquet_path, [str(question)])[str(question)]
 
 
 def list_questions(parquet_path: Path) -> list[dict]:
@@ -594,15 +693,105 @@ def _candidate_lines(labels: list[ProvisionalLabel]) -> str:
     )
 
 
-def build_assign_prompts(
+def build_vocab_prompts(
     question_text: str, labels: list[ProvisionalLabel], dataset_description: str = ""
 ) -> tuple[str, str]:
+    """Theme-vocabulary call: every candidate NAME goes in (names alone keep
+    the prompt small at any corpus size), only themes come out."""
+    seen: set[str] = set()
+    names: list[str] = []
+    for lab in labels:
+        key = lab.name.strip().lower()
+        if key and key not in seen:
+            seen.add(key)
+            names.append(lab.name.strip())
     return (
-        ASSIGN_SYSTEM.format(
+        VOCAB_SYSTEM.format(
             dataset_context=context_block(dataset_description), question_text=question_text
         ),
-        ASSIGN_USER.format(n=len(labels), candidate_lines=_candidate_lines(labels)),
+        VOCAB_USER.format(n=len(names), name_lines="\n".join(f"- {n}" for n in names)),
     )
+
+
+def parse_vocab(raw: str) -> tuple[list[dict], list[str]]:
+    """-> ([{"name", "description"}], warnings). Blank/duplicate names are
+    dropped; more than 12 themes is truncated; zero themes is a ValueError
+    (the caller's JSON-retry path handles it)."""
+    obj = extract_json(raw)
+    themes: list[dict] = []
+    warnings: list[str] = []
+    seen: set[str] = set()
+    for t in obj.get("themes") or []:
+        if not isinstance(t, dict):
+            continue
+        name = str(t.get("name", "")).strip()
+        if not name:
+            continue
+        if name.lower() in seen:
+            warnings.append(f"vocab: duplicate theme {name!r} dropped")
+            continue
+        seen.add(name.lower())
+        themes.append({"name": name, "description": str(t.get("description", "")).strip()})
+    if len(themes) > 12:
+        warnings.append(f"vocab: {len(themes)} themes returned, keeping the first 12")
+        themes = themes[:12]
+    if not themes:
+        raise ValueError("vocab call returned no usable themes")
+    return themes, warnings
+
+
+def build_assign_batch_prompts(
+    question_text: str,
+    themes: list[dict],
+    batch: list[ProvisionalLabel],
+    dataset_description: str = "",
+) -> tuple[str, str]:
+    theme_lines = "\n".join(
+        f"- {t['name']} — {t['description']}" if t["description"] else f"- {t['name']}"
+        for t in themes
+    )
+    return (
+        ASSIGN_BATCH_SYSTEM.format(
+            dataset_context=context_block(dataset_description),
+            question_text=question_text,
+            theme_lines=theme_lines,
+        ),
+        ASSIGN_BATCH_USER.format(n=len(batch), candidate_lines=_candidate_lines(batch)),
+    )
+
+
+def parse_assign_batch(
+    raw: str, batch: list[ProvisionalLabel], theme_names: list[str]
+) -> tuple[dict[str, str], list[str]]:
+    """-> (pid -> canonical theme name, warnings). Unknown ids are ignored;
+    an unknown theme or "none" leaves the candidate unsorted (a real state a
+    human reviews, never an error); ids the model skipped stay unsorted too —
+    a candidate is never lost to a bad answer."""
+    obj = extract_json(raw)
+    canonical = {t.lower(): t for t in theme_names}
+    by_pid = {lab.pid: lab for lab in batch}
+    mapping: dict[str, str] = {}
+    warnings: list[str] = []
+    for a in obj.get("assignments") or []:
+        if not isinstance(a, dict):
+            continue
+        pid = str(a.get("id", "")).strip()
+        theme = str(a.get("theme", "")).strip()
+        if pid not in by_pid:
+            warnings.append(f"assign: unknown id {pid!r} ignored")
+            continue
+        if pid in mapping:
+            warnings.append(f"assign: id {pid!r} answered twice, first answer kept")
+            continue
+        if theme.lower() == "none" or not theme:
+            continue                      # explicit no-fit -> unsorted
+        canon = canonical.get(theme.lower())
+        if canon is None:
+            warnings.append(
+                f"assign: id {pid!r} given unknown theme {theme!r}, left unsorted")
+            continue
+        mapping[pid] = canon
+    return mapping, warnings
 
 
 def build_dedup_prompts(
@@ -709,47 +898,6 @@ def apply_cross_merges(
     return out, merge_log, warnings
 
 
-def parse_assignment(
-    raw: str, labels: list[ProvisionalLabel]
-) -> tuple[list[tuple[str, str, list[str]]], list[str]]:
-    """Sort labels into (parent_name, description, pids) buckets.
-
-    Anything the model failed to place lands in a trailing unnamed bucket
-    rather than being dropped — an unsorted candidate is still a real
-    candidate, and the reviewer needs to see it."""
-    obj = extract_json(raw)
-    by_id = {lab.pid: lab for lab in labels}
-    placed: set[str] = set()
-    groups: list[tuple[str, str, list[str]]] = []
-    warnings: list[str] = []
-
-    for g in obj.get("parents") or []:
-        if not isinstance(g, dict):
-            continue
-        name = str(g.get("name", "")).strip()
-        if not name:
-            continue
-        pids: list[str] = []
-        for raw_id in _str_list(g.get("members")):
-            if raw_id not in by_id:
-                warnings.append(f"theme {name!r}: unknown id {raw_id!r} ignored")
-            elif raw_id in placed:
-                warnings.append(f"theme {name!r}: id {raw_id!r} already sorted elsewhere, ignored")
-            elif raw_id not in pids:
-                pids.append(raw_id)
-        if not pids:
-            warnings.append(f"theme {name!r}: no valid members, dropped")
-            continue
-        placed.update(pids)
-        groups.append((name, str(g.get("description", "")).strip(), pids))
-
-    leftover = [lab.pid for lab in labels if lab.pid not in placed]
-    if leftover:
-        warnings.append(f"{len(leftover)} candidate(s) not sorted into any theme; left unparented")
-        groups.append(("", "", leftover))
-    return groups, warnings
-
-
 def _combine(labels: list[ProvisionalLabel], name: str) -> ProvisionalLabel:
     """Fold several provisional labels into one. Keeps the longest description
     and the union of include/exclude — no model call, no information dropped."""
@@ -844,6 +992,91 @@ def apply_dedup(
         warnings.append(f"theme {parent_name!r}: all members marked too_broad, absorption skipped")
         return [by_id[pid] for pid in too_broad], [], [], warnings
     return out, absorbed, merge_log, warnings
+
+
+def dedup_theme(
+    client: ModelClient,
+    question_text: str,
+    parent_name: str,
+    members: list[ProvisionalLabel],
+    dataset_description: str = "",
+    workers: int = 1,
+) -> tuple[list[ProvisionalLabel], list[Candidate], list[dict], list[str], list[dict]]:
+    """Dedup one theme's members, batching when the theme is large.
+
+    <= DEDUP_MAX_SINGLE members: one call, exactly the validated small-corpus
+    behavior. Larger: round 1 dedups contiguous sub-batches, round 2 dedups
+    the survivors together — every duplicate pair is co-visible in one of the
+    two rounds (same sub-batch, or both survive to round 2). DEDUP_SYSTEM is
+    reused verbatim for both rounds; its "duplication is the expected case"
+    framing holds inside a sub-batch because the seeded shuffle spreads
+    restatements of every popular idea across chunks.
+
+    Round-1 sub-batches are independent (like MAP chunks) and run
+    concurrently with workers > 1; results are reassembled in batch order so
+    the outcome never depends on completion order.
+
+    A failed call never loses candidates — that batch passes through unmerged
+    and the failure is disclosed. Returns (kept, absorbed, merge_log,
+    warnings, failures)."""
+    failures: list[dict] = []
+
+    def one_call(subset: list[ProvisionalLabel], where: str
+                 ) -> tuple[list[ProvisionalLabel], list[Candidate], list[dict], list[str]]:
+        try:
+            system, user = build_dedup_prompts(
+                question_text, parent_name, subset, dataset_description)
+            raw = _complete_json(client, system, user)
+            return apply_dedup(raw, subset, parent_name)
+        except (ValueError, json.JSONDecodeError, RuntimeError) as exc:
+            failures.append({
+                "stage": "dedup", "theme": parent_name, "batch": where,
+                "n_candidates": len(subset),
+                "error": f"{type(exc).__name__}: {exc}"[:300],
+            })
+            return list(subset), [], [], []      # pass through unmerged
+
+    if len(members) <= DEDUP_MAX_SINGLE:
+        kept, absorbed, log, warns = one_call(members, "single")
+        return kept, absorbed, log, warns, failures
+
+    subs = [members[bi:bi + DEDUP_SUB_BATCH]
+            for bi in range(0, len(members), DEDUP_SUB_BATCH)]
+    results: dict[int, tuple] = {}
+    n_workers = max(1, min(workers, len(subs)))
+    if n_workers == 1:
+        for si, sub in enumerate(subs):
+            results[si] = one_call(sub, f"round1:{si}")
+    else:
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            futures = {pool.submit(one_call, sub, f"round1:{si}"): si
+                       for si, sub in enumerate(subs)}
+            for fut in as_completed(futures):
+                results[futures[fut]] = fut.result()
+
+    survivors: list[ProvisionalLabel] = []
+    absorbed_all: list[Candidate] = []
+    log_all: list[dict] = []
+    warns_all: list[str] = []
+    for si in range(len(subs)):                 # batch order, not completion order
+        kept, absorbed, log, warns = results[si]
+        for entry in log:
+            entry["round"] = 1
+        survivors.extend(kept)
+        absorbed_all.extend(absorbed)
+        log_all.extend(log)
+        warns_all.extend(warns)
+    failures.sort(key=lambda f: f.get("batch", ""))
+
+    if len(survivors) > 150:
+        warns_all.append(
+            f"theme {parent_name!r}: {len(survivors)} round-1 survivors in one "
+            "survivors call — large, but output stays small")
+    kept, absorbed, log, warns = one_call(survivors, "round2")
+    for entry in log:
+        entry["round"] = 2
+    return (kept, absorbed_all + absorbed, log_all + log,
+            warns_all + warns, failures)
 
 
 
@@ -976,52 +1209,88 @@ def _complete_json(client: ModelClient, system: str, user: str) -> str:
         )
 
 
-def run_induction(
+def _map_one_chunk(
+    i: int,
+    chunk: list[ResponseRow],
+    question_text: str,
+    client: ModelClient,
+    dataset_description: str,
+) -> tuple[int, list[Candidate], int, int, dict | None]:
+    """One MAP call. Returns (chunk_index, candidates, invalid_citations,
+    n_truncated, failure or None). Raises nothing — one bad chunk must not
+    destroy an otherwise good run."""
+    system, user, n_trunc = build_map_prompts(question_text, chunk, dataset_description)
+    try:
+        raw = client.complete(system, user)
+        try:
+            cands, invalid = parse_map_output(raw, i, chunk)
+        except (ValueError, json.JSONDecodeError):
+            # one retry with an explicit nudge
+            raw = client.complete(
+                system + "\nYour previous output was not valid JSON. Return ONLY the JSON object.",
+                user,
+            )
+            cands, invalid = parse_map_output(raw, i, chunk)
+    except (ValueError, json.JSONDecodeError, RuntimeError) as exc:
+        return i, [], 0, n_trunc, {
+            "chunk": i, "n_responses": len(chunk),
+            "error": f"{type(exc).__name__}: {exc}"[:300]}
+    return i, cands, invalid, n_trunc, None
+
+
+def run_map_phase(
     rows: list[ResponseRow],
     meta: dict,
     client: ModelClient,
     chunk_size: int = 120,
     seed: int = 7,
     dataset_description: str = "",
-) -> tuple[dict, dict]:
-    """Full pipeline over already-loaded rows. Returns (taxonomy, run_report)."""
+    workers: int = DEFAULT_WORKERS,
+) -> tuple[list[Candidate], dict]:
+    """The MAP fan-out: every chunk proposes candidates. Returns
+    (all_candidates, map_report). Raises only if every chunk failed."""
     chunks = make_chunks(rows, chunk_size, seed)
     print(f"{len(rows)} responses -> {len(chunks)} chunk(s) "
           f"(sizes: {[len(c) for c in chunks]}, seed={seed})")
+
+    # MAP calls are independent; only the reassembly order matters. Candidate
+    # ids are already namespaced by chunk index, and downstream auto_merge is
+    # order-sensitive, so results are collected as they land but stitched back
+    # in chunk order — the taxonomy must not depend on which call returned first.
+    done: dict[int, tuple[list[Candidate], int, int, dict | None]] = {}
+    n_workers = max(1, min(workers, len(chunks))) if chunks else 1
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        futures = [
+            pool.submit(_map_one_chunk, i, chunk, meta["question_text"],
+                        client, dataset_description)
+            for i, chunk in enumerate(chunks)
+        ]
+        for n_finished, fut in enumerate(as_completed(futures), start=1):
+            i, cands, invalid, n_trunc, failure = fut.result()
+            done[i] = (cands, invalid, n_trunc, failure)
+            if failure:
+                print(f"  [{n_finished}/{len(chunks)}] chunk {i}: FAILED after retry "
+                      f"({failure['error'].split(':')[0]}) — skipping, "
+                      f"{len(chunks[i])} responses uncovered")
+            else:
+                print(f"  [{n_finished}/{len(chunks)}] chunk {i}: {len(cands)} "
+                      f"candidates, {invalid} invalid citations")
 
     all_candidates: list[Candidate] = []
     per_chunk_stats, total_invalid, total_truncated = [], 0, 0
     failed_chunks: list[dict] = []
     for i, chunk in enumerate(chunks):
-        system, user, n_trunc = build_map_prompts(meta["question_text"], chunk, dataset_description)
+        cands, invalid, n_trunc, failure = done[i]
         total_truncated += n_trunc
-        try:
-            raw = client.complete(system, user)
-            try:
-                cands, invalid = parse_map_output(raw, i, chunk)
-            except (ValueError, json.JSONDecodeError):
-                # one retry with an explicit nudge
-                raw = client.complete(
-                    system + "\nYour previous output was not valid JSON. Return ONLY the JSON object.",
-                    user,
-                )
-                cands, invalid = parse_map_output(raw, i, chunk)
-        except (ValueError, json.JSONDecodeError, RuntimeError) as exc:
-            # One bad chunk must not destroy an otherwise good run. The chunk's
-            # responses go uncovered, so this is recorded in the manifest rather
-            # than swallowed — a taxonomy built from 8 of 9 chunks has to say so.
-            failed_chunks.append({"chunk": i, "n_responses": len(chunk),
-                                  "error": f"{type(exc).__name__}: {exc}"[:300]})
+        if failure:
+            failed_chunks.append(failure)
             per_chunk_stats.append({"chunk": i, "n_responses": len(chunk),
                                     "n_candidates": 0, "invalid_citations": 0,
                                     "failed": True})
-            print(f"  chunk {i}: FAILED after retry ({type(exc).__name__}) — skipping, "
-                  f"{len(chunk)} responses uncovered")
             continue
         total_invalid += invalid
         per_chunk_stats.append({"chunk": i, "n_responses": len(chunk),
                                 "n_candidates": len(cands), "invalid_citations": invalid})
-        print(f"  chunk {i}: {len(cands)} candidates, {invalid} invalid citations")
         all_candidates.extend(cands)
 
     n_ok = len(chunks) - len(failed_chunks)
@@ -1030,6 +1299,111 @@ def run_induction(
             f"All {len(chunks)} chunks failed; no taxonomy to build. First error: "
             f"{failed_chunks[0]['error']}"
         )
+
+    map_report = {
+        "n_chunks": len(chunks),
+        "n_chunks_succeeded": n_ok,
+        "failed_chunks": failed_chunks,
+        "chunk_size_target": chunk_size,
+        "seed": seed,
+        # membership is reconstructible: make_chunks(rows, chunk_size, seed)
+        # is deterministic, so the full per-chunk key listing is not stored
+        "chunk_sizes": [len(c) for c in chunks],
+        "per_chunk": per_chunk_stats,
+        "total_invalid": total_invalid,
+        "total_truncated": total_truncated,
+    }
+    return all_candidates, map_report
+
+
+def write_candidates_checkpoint(
+    path: Path,
+    candidates: list[Candidate],
+    map_report: dict,
+    meta: dict,
+    prompt_sha: str,
+) -> None:
+    """Persist the MAP phase so a consolidation failure never re-pays the MAP
+    spend (~98% of an induction run). Doubles as an audit artifact — left in
+    the run dir permanently."""
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "prompt_sha256_16": prompt_sha,
+        "meta": meta,
+        "map_report": map_report,
+        "candidates": [
+            {
+                "cid": c.cid, "chunk_index": c.chunk_index, "name": c.name,
+                "description": c.description, "include": c.include,
+                "exclude": c.exclude,
+                "evidence": [
+                    {"response_key": r.response_key, "text": r.text}
+                    for r in c.evidence
+                ],
+            }
+            for c in candidates
+        ],
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+
+def load_candidates_checkpoint(
+    path: Path,
+) -> tuple[list[Candidate], dict, dict, str]:
+    """-> (candidates, map_report, meta, prompt_sha256_16)."""
+    obj = json.loads(Path(path).read_text(encoding="utf-8"))
+    candidates = [
+        Candidate(
+            cid=c["cid"], chunk_index=c["chunk_index"], name=c["name"],
+            description=c["description"], include=c["include"],
+            exclude=c["exclude"],
+            evidence=[ResponseRow(**r) for r in c["evidence"]],
+        )
+        for c in obj["candidates"]
+    ]
+    return candidates, obj["map_report"], obj["meta"], obj["prompt_sha256_16"]
+
+
+def _assign_one_batch(
+    bi: int,
+    batch: list[ProvisionalLabel],
+    question_text: str,
+    themes: list[dict],
+    client: ModelClient,
+    dataset_description: str,
+) -> tuple[int, dict[str, str], list[str], dict | None]:
+    """One ASSIGN batch. Raises nothing — a failed batch leaves its
+    candidates unsorted (flagged for a human), never lost."""
+    theme_names = [t["name"] for t in themes]
+    try:
+        system, user = build_assign_batch_prompts(
+            question_text, themes, batch, dataset_description)
+        raw = _complete_json(client, system, user)
+        mapping, warnings = parse_assign_batch(raw, batch, theme_names)
+        return bi, mapping, warnings, None
+    except (ValueError, json.JSONDecodeError, RuntimeError) as exc:
+        return bi, {}, [], {
+            "stage": "assign", "batch": bi, "n_candidates": len(batch),
+            "error": f"{type(exc).__name__}: {exc}"[:300]}
+
+
+def run_consolidation(
+    all_candidates: list[Candidate],
+    map_report: dict,
+    meta: dict,
+    client: ModelClient,
+    dataset_description: str = "",
+    workers: int = DEFAULT_WORKERS,
+    checkpoint_hint: str = "",
+) -> tuple[dict, dict]:
+    """Everything after MAP: exact merge, theme vocabulary, batched assign,
+    per-theme dedup, cross-theme dedup, taxonomy assembly. Per-batch
+    failures are contained and disclosed in consolidation_failures; only the
+    vocabulary call is load-bearing enough to abort (and by then the MAP
+    checkpoint exists, so a re-run resumes for pennies)."""
+    n_ok = map_report["n_chunks_succeeded"]
+    consolidation_failures: list[dict] = []
 
     provisional = auto_merge(all_candidates)
     exact_merge_log = [
@@ -1048,33 +1422,105 @@ def run_induction(
     llm_merge_log: list[dict] = []
     parents: list[ProvisionalParent] = []
     final = provisional
+    theme_vocab: list[str] = []
+    n_assign_batches = 0
+    cross_theme_skipped: dict | None = None
     if n_ok > 1 and len(provisional) > 1:
         # Sort into themes first, then dedupe inside each theme. Two easy jobs
-        # beat one hard one: a single global "merge these 61 candidates" call
+        # beat one hard one: a single global "merge these candidates" call
         # asks a model to hold every pairwise comparison at once, and the
         # cheaper the model the more reliably it answers by merging nothing.
-        # Sorting is easy, and once sorted, duplicates can only be siblings —
-        # so each dedup call sees ~10 names on one topic.
-        system, user = build_assign_prompts(meta["question_text"], provisional, dataset_description)
-        raw = _complete_json(client, system, user)
-        groups, warns = parse_assignment(raw, provisional)
+        # The sort itself is two stages so no call's output ever scales with
+        # candidate count: VOCAB fixes the themes, ASSIGN batches classify.
+        try:
+            system, user = build_vocab_prompts(
+                meta["question_text"], provisional, dataset_description)
+            raw = _complete_json(client, system, user)
+            themes, warns = parse_vocab(raw)
+        except (ValueError, json.JSONDecodeError, RuntimeError) as exc:
+            hint = (f" MAP results are checkpointed; re-run with --resume "
+                    f"{checkpoint_hint}" if checkpoint_hint else "")
+            raise RuntimeError(
+                f"Theme-vocabulary call failed ({type(exc).__name__}: {exc})."
+                f"{hint}") from exc
         warnings += warns
-        print(f"  sorted into {len(groups)} theme(s)")
+        theme_vocab = [t["name"] for t in themes]
+        print(f"  theme vocabulary: {theme_vocab}")
+
+        batches = [provisional[i:i + ASSIGN_BATCH_SIZE]
+                   for i in range(0, len(provisional), ASSIGN_BATCH_SIZE)]
+        n_assign_batches = len(batches)
+        assign_done: dict[int, tuple[dict[str, str], list[str], dict | None]] = {}
+        n_workers = max(1, min(workers, len(batches)))
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            futures = [
+                pool.submit(_assign_one_batch, bi, batch, meta["question_text"],
+                            themes, client, dataset_description)
+                for bi, batch in enumerate(batches)
+            ]
+            for fut in as_completed(futures):
+                bi, mapping, warns, failure = fut.result()
+                assign_done[bi] = (mapping, warns, failure)
+
+        theme_by_pid: dict[str, str] = {}
+        for bi in range(len(batches)):
+            mapping, warns, failure = assign_done[bi]
+            warnings += warns
+            if failure:
+                consolidation_failures.append(failure)
+                print(f"  assign batch {bi}: FAILED — "
+                      f"{failure['n_candidates']} candidate(s) left unsorted")
+            theme_by_pid.update(mapping)
+
+        # rebuild the old (name, description, pids) groups shape, in vocab
+        # order, with the unsorted bucket trailing — everything downstream
+        # of `groups` is unchanged
+        groups: list[tuple[str, str, list[str]]] = []
+        for t in themes:
+            pids = [lab.pid for lab in provisional
+                    if theme_by_pid.get(lab.pid) == t["name"]]
+            if pids:
+                groups.append((t["name"], t["description"], pids))
+        leftover = [lab.pid for lab in provisional if lab.pid not in theme_by_pid]
+        if leftover:
+            warnings.append(f"{len(leftover)} candidate(s) not sorted into any "
+                            "theme; left unparented")
+            groups.append(("", "", leftover))
+        print(f"  sorted into {len(groups)} theme(s) "
+              f"({n_assign_batches} assign batch(es))")
 
         by_pid = {lab.pid: lab for lab in provisional}
+        theme_members = [(name, description, [by_pid[p] for p in pids])
+                         for name, description, pids in groups]
+        # Themes are independent of one another, so they dedup concurrently
+        # (and round-1 sub-batches inside a large theme run concurrently
+        # too). Results are assembled in theme order below — the taxonomy
+        # never depends on which call returned first.
+        dedup_results: dict[int, tuple] = {}
+        multi = [gi for gi, (_, _, members) in enumerate(theme_members)
+                 if len(members) >= 2]
+        if multi:
+            with ThreadPoolExecutor(max_workers=max(1, min(workers, len(multi)))) as pool:
+                futures = {
+                    pool.submit(dedup_theme, client, meta["question_text"],
+                                theme_members[gi][0] or "Unsorted",
+                                theme_members[gi][2], dataset_description,
+                                workers): gi
+                    for gi in multi
+                }
+                for fut in as_completed(futures):
+                    dedup_results[futures[fut]] = fut.result()
+
         final = []
-        for name, description, pids in groups:
-            members = [by_pid[p] for p in pids]
-            if len(members) < 2:
+        for gi, (name, description, members) in enumerate(theme_members):
+            if gi not in dedup_results:
                 final.extend(members)
                 kept, absorbed = members, []
             else:
-                system, user = build_dedup_prompts(meta["question_text"], name or "Unsorted", members,
-                                                   dataset_description)
-                raw = _complete_json(client, system, user)
-                kept, absorbed, log, warns = apply_dedup(raw, members, name or "Unsorted")
+                kept, absorbed, log, warns, failures = dedup_results[gi]
                 llm_merge_log += log
                 warnings += warns
+                consolidation_failures += failures
                 final.extend(kept)
             print(f"  theme {name or '(unsorted)'!r}: {len(members)} -> {len(kept)} label(s)"
                   + (f", {len(absorbed)} absorbed" if absorbed else ""))
@@ -1084,23 +1530,34 @@ def run_induction(
                         name=name,
                         description=description,
                         child_pids=[lab.pid for lab in kept],
-                        rationale="theme assigned in the sort step",
+                        rationale="theme fixed by the vocabulary step",
                         absorbed=absorbed,
                     )
                 )
 
         # Last pass: the same idea filed under two themes is invisible to
-        # per-theme dedup by construction. Cheap here — the list is short and
-        # already clean, unlike the raw candidate pile a global merge would face.
+        # per-theme dedup by construction. Input is small (surviving labels
+        # only) and the default answer is empty, so it stays one call — but a
+        # failure here must not kill a run this close to done: the review
+        # loop's overlap diagnostics are the designed backstop for residual
+        # cross-theme duplicates.
         theme_of = {pid: p.name for p in parents for pid in p.child_pids}
         if len(parents) > 1 and len(final) > 1:
-            system, user = build_cross_prompts(meta["question_text"], final, theme_of, dataset_description)
-            raw = _complete_json(client, system, user)
-            final, log, warns = apply_cross_merges(raw, final, parents, theme_of)
-            llm_merge_log += log
-            warnings += warns
-            if log:
-                print(f"  cross-theme: {len(log)} duplicate(s) merged across themes")
+            try:
+                system, user = build_cross_prompts(
+                    meta["question_text"], final, theme_of, dataset_description)
+                raw = _complete_json(client, system, user)
+                final, log, warns = apply_cross_merges(raw, final, parents, theme_of)
+                llm_merge_log += log
+                warnings += warns
+                if log:
+                    print(f"  cross-theme: {len(log)} duplicate(s) merged across themes")
+            except (ValueError, json.JSONDecodeError, RuntimeError) as exc:
+                err = f"{type(exc).__name__}: {exc}"[:300]
+                cross_theme_skipped = {"error": err}
+                consolidation_failures.append({"stage": "cross", "error": err})
+                print("  cross-theme pass FAILED — skipped; review-loop overlap "
+                      "diagnostics will surface residual duplicates")
 
     # chunk_support is "proposed by k of N"; N must be the chunks that actually
     # answered, or a failed chunk silently deflates every label's support
@@ -1108,22 +1565,28 @@ def run_induction(
 
     run_report = {
         "chunks": {
-            "n_chunks": len(chunks),
+            "n_chunks": map_report["n_chunks"],
             "n_chunks_succeeded": n_ok,
-            "failed_chunks": failed_chunks,
-            "chunk_size_target": chunk_size,
-            "seed": seed,
-            "assignment": {
-                str(i): [r.response_key for r in chunk] for i, chunk in enumerate(chunks)
-            },
+            "failed_chunks": map_report["failed_chunks"],
+            "chunk_size_target": map_report["chunk_size_target"],
+            "seed": map_report["seed"],
+            "chunk_sizes": map_report["chunk_sizes"],
+            "assignment_note": (
+                "chunk membership reconstructible via "
+                "make_chunks(rows, chunk_size_target, seed)"
+            ),
         },
-        "per_chunk": per_chunk_stats,
-        "responses_truncated_in_prompt": total_truncated,
-        "invalid_evidence_citations": total_invalid,
+        "per_chunk": map_report["per_chunk"],
+        "responses_truncated_in_prompt": map_report["total_truncated"],
+        "invalid_evidence_citations": map_report["total_invalid"],
         "candidates_proposed": len(all_candidates),
         "labels_after_exact_merge": len(provisional),
         "labels_final": len(taxonomy["labels"]),
         "parents_final": len(taxonomy["parents"]),
+        "theme_vocab": theme_vocab,
+        "assign": {"batch_size": ASSIGN_BATCH_SIZE,
+                   "n_batches": n_assign_batches},
+        "consolidation_failures": consolidation_failures,
         "labels_unparented": [
             l["name"] for l in taxonomy["labels"] if l["parent_id"] is None
         ],
@@ -1135,7 +1598,37 @@ def run_induction(
         "merge_warnings": warnings,
         "singletons": [l["name"] for l in taxonomy["labels"] if l["singleton"]],
     }
+    if cross_theme_skipped is not None:
+        run_report["cross_theme_skipped"] = cross_theme_skipped
     return taxonomy, run_report
+
+
+def run_induction(
+    rows: list[ResponseRow],
+    meta: dict,
+    client: ModelClient,
+    chunk_size: int = 120,
+    seed: int = 7,
+    dataset_description: str = "",
+    workers: int = DEFAULT_WORKERS,
+    checkpoint_dir: Path | None = None,
+) -> tuple[dict, dict]:
+    """Full pipeline over already-loaded rows. Returns (taxonomy, run_report).
+    With checkpoint_dir, MAP results are persisted before consolidation so a
+    consolidation failure can resume via scripts.induce --resume."""
+    all_candidates, map_report = run_map_phase(
+        rows, meta, client, chunk_size=chunk_size, seed=seed,
+        dataset_description=dataset_description, workers=workers)
+    hint = ""
+    if checkpoint_dir is not None:
+        write_candidates_checkpoint(
+            Path(checkpoint_dir) / "candidates_checkpoint.json",
+            all_candidates, map_report, meta, prompt_hash(dataset_description))
+        hint = str(checkpoint_dir)
+    return run_consolidation(
+        all_candidates, map_report, meta, client,
+        dataset_description=dataset_description, workers=workers,
+        checkpoint_hint=hint)
 
 
 def write_artifacts(taxonomy: dict, manifest: dict, out_root: Path | None = None) -> Path:
@@ -1154,7 +1647,8 @@ def write_artifacts(taxonomy: dict, manifest: dict, out_root: Path | None = None
 
 def prompt_hash(dataset_description: str = "") -> str:
     blob = (
-        MAP_SYSTEM + MAP_USER + ASSIGN_SYSTEM + ASSIGN_USER
+        MAP_SYSTEM + MAP_USER + VOCAB_SYSTEM + VOCAB_USER
+        + ASSIGN_BATCH_SYSTEM + ASSIGN_BATCH_USER
         + DEDUP_SYSTEM + DEDUP_USER + CROSS_SYSTEM + CROSS_USER
         + (dataset_description or "")
     ).encode("utf-8")
@@ -1207,6 +1701,17 @@ def print_diagnostics(taxonomy: dict, report: dict, usage_line: str) -> None:
     if big:
         print(f"large merge groups (>= {LARGE_MERGE_GROUP} members): "
               f"{[m['result_name'] for m in big]}  <-- check for over-collapse")
+    cfails = report.get("consolidation_failures", [])
+    if cfails:
+        print(f"CONSOLIDATION FAILURES: {len(cfails)} batch/stage call(s) failed — "
+              f"their candidates passed through unsorted/unmerged, never lost:")
+        for f in cfails:
+            where = f.get("theme") or f.get("batch", "")
+            print(f"  {f['stage']} {where}: {f['error'].split(':')[0]}  <-- WARN")
+    if report.get("cross_theme_skipped"):
+        print("cross-theme pass SKIPPED (call failed) — residual cross-theme "
+              "duplicates possible; the review loop's overlap diagnostics are "
+              "the backstop  <-- WARN")
     for w in report["merge_warnings"]:
         print(f"merge guard: {w}")
     print(usage_line)
@@ -1215,22 +1720,54 @@ def print_diagnostics(taxonomy: dict, report: dict, usage_line: str) -> None:
 def estimate_dry_run(rows: list[ResponseRow], meta: dict, chunk_size: int, seed: int,
                      price_in: float, price_out: float,
                      dataset_description: str = "") -> None:
+    """Plan + cost estimate mirroring the real call structure (MAP fan-out,
+    VOCAB, batched ASSIGN, two-round DEDUP, CROSS) — the old flat
+    '+4000 in / +2000 out for consolidation' guess under-reported the exact
+    stages that dominate at production scale."""
     chunks = make_chunks(rows, chunk_size, seed)
     est_in = est_out = 0
     for chunk in chunks:
         system, user, _ = build_map_prompts(meta["question_text"], chunk, dataset_description)
         est_in += (len(system) + len(user)) // 4
         est_out += 2500
+
+    n_calls = {"map": len(chunks), "vocab": 0, "assign": 0, "dedup": 0, "cross": 0}
     if len(chunks) > 1:
-        est_in += 4000
-        est_out += 2000
+        n_cand = max(1, round(len(rows) * EST_CANDIDATES_PER_RESPONSE))
+        n_after_exact = max(1, round(n_cand * 0.95))
+        n_calls["vocab"] = 1
+        est_in += n_after_exact * 10 + 500
+        est_out += 500
+        n_calls["assign"] = -(-n_after_exact // ASSIGN_BATCH_SIZE)
+        est_in += n_calls["assign"] * (ASSIGN_BATCH_SIZE * 39 + 1000)
+        est_out += n_calls["assign"] * 1600
+        # ~6 themes; per theme either one call or sub-batches + survivors round
+        n_themes = 6
+        per_theme = max(1, round(n_after_exact * 0.85 / n_themes))
+        if per_theme <= DEDUP_MAX_SINGLE:
+            n_calls["dedup"] = n_themes
+            est_in += n_themes * (per_theme * 39 + 800)
+            est_out += n_themes * (per_theme * 12 + 300)
+        else:
+            sub = -(-per_theme // DEDUP_SUB_BATCH)
+            n_calls["dedup"] = n_themes * (sub + 1)
+            est_in += n_themes * (sub + 1) * (DEDUP_SUB_BATCH * 39 + 800)
+            est_out += n_themes * (sub + 1) * (DEDUP_SUB_BATCH * 12 + 300)
+        n_calls["cross"] = 1
+        est_in += round(n_after_exact * 0.35) * 45 + 800
+        est_out += 500
+
     cost = est_in / 1e6 * price_in + est_out / 1e6 * price_out
+    total_calls = sum(n_calls.values())
     print(f"DRY RUN — no API calls made, nothing written.")
     print(f"  responses: {len(rows)} usable "
           f"({meta['rows_sentinel_filtered']} sentinel non-answers filtered, "
           f"{meta['rows_empty']} empty)")
-    print(f"  plan: {len(chunks)} map call(s) + {1 if len(chunks) > 1 else 0} merge call")
-    print(f"  est tokens: ~{est_in:,} in / ~{est_out:,} out")
+    print(f"  plan: {n_calls['map']} map + {n_calls['vocab']} vocab + "
+          f"{n_calls['assign']} assign + ~{n_calls['dedup']} dedup + "
+          f"{n_calls['cross']} cross = ~{total_calls} calls")
+    print(f"  est tokens: ~{est_in:,} in / ~{est_out:,} out "
+          f"(consolidation modeled at {EST_CANDIDATES_PER_RESPONSE} candidates/response)")
     print(f"  est cost at ${price_in}/M in, ${price_out}/M out: ~${cost:.3f}")
 
 
