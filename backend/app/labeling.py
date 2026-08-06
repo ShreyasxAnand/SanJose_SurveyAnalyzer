@@ -4,11 +4,13 @@ This is where scale lives. Induction reads a sample of the corpus; labeling
 reads all of it, which is the only way to get real counts. Counts come from
 counting rows, never from a model estimate.
 
-Per response the model returns: child label_ids (multi-label), sentiment, an
-explicit `uncategorized` when nothing fits, and a fit score. Guards mirror
-induction's evidence resolution — responses are numbered in the prompt and
-resolved back to response_key in code, and any label_id the model invents is
-dropped and counted rather than trusted.
+Per response the model returns: child label_ids (multi-label), an explicit
+`uncategorized` when nothing fits, a fit score, verbatim `locations` and
+`time_context` spans, `actionability` (specific/general), and `event_occurred`.
+Guards mirror induction's evidence resolution — responses are numbered in the
+prompt and resolved back to response_key in code, any label_id the model
+invents is dropped and counted rather than trusted, and a location or time
+span not literally present in the response text is dropped the same way.
 
 `uncategorized` and low `fit` are not failures; they are the completeness
 signal. A cluster of them is how a missing category announces itself without
@@ -19,7 +21,6 @@ from __future__ import annotations
 import hashlib
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
 
 from .llm import ModelClient
 

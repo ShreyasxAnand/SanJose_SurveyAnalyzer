@@ -32,7 +32,7 @@ import json
 import re
 
 from app import induction, labeling
-from app.induction import Candidate, ResponseRow
+from app.induction import ResponseRow
 
 # Below this many uncovered rows, skip pool induction entirely: a MAP call
 # over a handful of responses produces n=1 noise labels, and the review loop

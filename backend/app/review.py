@@ -25,7 +25,6 @@ a human as evidence, never auto-applied.
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 SCHEMA_VERSION = 1
 OVERLAP_THRESHOLD = 0.40   # |A∩B| / min(|A|,|B|) — report, never auto-merge

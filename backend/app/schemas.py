@@ -222,19 +222,6 @@ class AppendResponse(BaseModel):
     warnings: list[str] = []
 
 
-class ResponseOut(BaseModel):
-    id: int
-    question_id: int
-    source_row_index: int
-    response_key: str
-    respondent_id: str | None
-    raw_text_original: str
-    response_text: str
-    was_encoding_repaired: bool
-
-    model_config = ConfigDict(from_attributes=True)
-
-
 # --- Phase 5: two-step ask (stateless — the browser carries the proposal) ---
 
 

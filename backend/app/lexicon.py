@@ -221,7 +221,13 @@ def match_responses(lexicon: dict, keys: list[str], texts: list[str]) -> dict[st
 
 def match_query(lexicon: dict, query: str) -> list[str]:
     """Concepts a free-text query plausibly refers to. Deliberately literal —
-    a concept matches if its name or one of its terms appears in the query."""
+    a concept matches if its name or one of its terms appears in the query.
+
+    Currently unused, and kept on purpose: the ask path has the ROUTE model
+    pick concepts instead, which catches paraphrases this cannot. This is the
+    deterministic alternative, worth reaching for if model-picked concepts ever
+    prove unreliable. Not dead by accident — don't delete it as such.
+    """
     q = query.lower()
     hits = []
     for concept in lexicon["concepts"]:

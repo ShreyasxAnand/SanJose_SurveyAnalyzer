@@ -54,8 +54,6 @@ LABEL_USD_PER_RESPONSE = 0.10 / 500
 # corpus size, so these do not scale with the file.
 FLAT_STAGE_USD = 0.001
 
-VALID_STATUS = {"pending", "running", "done", "failed", "skipped"}
-
 
 @dataclass
 class Stage:
