@@ -40,6 +40,28 @@ ACTIONABILITY_PHRASE = {
     "specific": "proposing a specific, concrete action",
     "general": "raising a general concern rather than a concrete action",
 }
+# These caps protect the synth model's ATTENTION, not the bill (~22 tokens per
+# response, so even 500 quotes is only ~15k prompt tokens).
+#
+# They were raised to 50/500 on 2026-08-03 to stop a uniform draw missing
+# minority signals, on the math that a 10%-prevalence sub-signal is missed
+# 0.5% of the time at 50 quotes vs 35% at 10. That math is right and it
+# optimizes the wrong quantity: what matters is P(signal reaches the ANSWER)
+# = P(in prompt) x P(the model actually uses it), and the second term
+# collapses as the prompt grows. Measured over 40 answers on dataset 2
+# (2026-08-05), median share of shown quotes cited: 55% at 60, 35% at 120,
+# 21% at 150-250, 7.8% at 500 — so the raise cut end-to-end signal delivery
+# from ~0.18 to ~0.05 while looking like an improvement on paper.
+#
+# Worse, at 500 the answer silently drops whole categories the analyst
+# selected: median category coverage 100% at 120 vs 90% at 500, and on a
+# 16-candidate question 75% -> 37.5%.
+#
+# 10/120 won: same median citations as 20/120 (26) with longer answers
+# (9,514 vs 8,557 chars), higher utilisation (30% vs 23%) and a smaller,
+# cheaper prompt. Do not raise these without re-running that sweep — this
+# failure is invisible in latency and cost, which both *improve* as the
+# budget grows, and invisible in the sampling math, which improves too.
 DEFAULT_MAX_QUOTES_PER_LABEL = 10
 DEFAULT_MAX_TOTAL_QUOTES = 120
 MIN_QUOTES_PER_LABEL = 3
@@ -66,8 +88,13 @@ Decide how to answer the analyst's question:
   - "comparative" — the question asks how groups of responses differ; contrast them
   - "hybrid" — aggregate first, then explain the top categories from responses
 - "candidates": EVERY child category relevant to the question, each with a
-  one-line rationale and a relevance rating. There is no cap — include all
-  genuinely relevant categories, and nothing else. Copy label_id exactly.
+  relevance rating and a rationale of AT MOST 10 WORDS — a fragment, not a
+  sentence. For example a rationale might read: direct match, trash on
+  sidewalks. There is no cap on how MANY candidates — include all genuinely
+  relevant categories, and nothing else. Copy label_id exactly.
+- "reason": at most 15 words.
+- Never write a double quote inside any rationale or reason: it breaks the
+  JSON. Use plain words or a comma instead.
 - "groups": ONLY for route "comparative": two or more named groups of
   label_ids to contrast (e.g. downtown categories vs neighborhood ones).
 - "lexicon_concepts": names from the lexicon concept list (if shown) whose
@@ -83,13 +110,14 @@ Decide how to answer the analyst's question:
   Leave it EMPTY for a general where-question: group_by "location" already
   organizes by place, and adding a broad filter would hide how many
   responses named no place at all.
-{actionability_block}{event_block}- Never estimate counts, frequencies, or percentages.
+{actionability_block}{event_block}{time_block}- Never estimate counts, frequencies, or percentages.
 
 Return ONLY valid JSON, exactly this shape:
 {{"answerable": true, "route": "retrieval", "reason": "one line",
 "candidates": [{{"label_id": "2_001", "relevance": "high", "rationale": "..."}}],
 "groups": [], "lexicon_concepts": [], "group_by": "category",
-"location_filter": [], "actionability_filter": "", "event_filter": ""}}
+"location_filter": [], "actionability_filter": "", "event_filter": "",
+"time_filter": ""}}
 """
 
 # Only shown when the labels actually carry an actionability code — a filter
@@ -127,6 +155,20 @@ EVENT_BLOCK = """\
   incident: not recounting one does not mean nothing happened.
 """
 
+# Like EVENT_BLOCK: capability first, severity after, and no negative
+# direction — a response naming no time of day is not evidence about when
+# anything happened.
+TIME_BLOCK = """\
+- "time_filter": {n_night} coded responses explicitly mention nighttime
+  ("at night", "after dark") and {n_day} mention daytime, out of
+  {n_mentioned} naming any time at all. When the analyst asks specifically
+  about experiences at night or during the day, set this to "night" or
+  "day" — those responses are real evidence, so such a question IS
+  answerable and must not be refused. Leave it "" otherwise. There is no
+  filter for responses naming no time: not naming one does not mean it
+  happened at any particular time of day.
+"""
+
 ROUTE_USER = """Analyst question:
 {question}
 """
@@ -156,6 +198,10 @@ Rules:
     each), one per distinct theme or cost/issue type.
   - Inside each section, **bold** the key finding and use "- " bullets for
     lists of specifics. Keep paragraphs to 2-3 sentences.
+  - Ground each section in AT LEAST 3 distinct cited verbatims (more is
+    fine) whenever that many relevant responses were shown — a section
+    resting on one or two citations under-uses the evidence. Never pad with
+    irrelevant citations if fewer than 3 apply.
   - If the whole answer fits in one or two short paragraphs, skip the
     subheadings — do not pad a short answer with structure.
 - {route_guidance}
@@ -199,10 +245,12 @@ def build_route_prompts(question: str, summary_text: str,
                         dataset_description: str = "",
                         actionability_counts: dict[str, int] | None = None,
                         event_counts: tuple[int, int] | None = None,
+                        time_counts: dict[str, int] | None = None,
                         ) -> tuple[str, str]:
-    """`event_counts` is (n_reporting_an_incident, n_coded); both optional
-    blocks are omitted entirely when the artifacts don't carry the field, so
-    the router is never offered a filter the data cannot honour."""
+    """`event_counts` is (n_reporting_an_incident, n_coded); `time_counts`
+    is {"day": n, "night": n, "mentioned": n}. All optional blocks are
+    omitted entirely when the artifacts don't carry the field, so the
+    router is never offered a filter the data cannot honour."""
     act_block = ""
     if actionability_counts:
         act_block = ACTIONABILITY_BLOCK.format(
@@ -214,11 +262,17 @@ def build_route_prompts(question: str, summary_text: str,
     if event_counts and event_counts[0]:
         evt_block = EVENT_BLOCK.format(n_events=event_counts[0],
                                        n_coded=event_counts[1])
+    time_block = ""
+    if time_counts and (time_counts.get("day") or time_counts.get("night")):
+        time_block = TIME_BLOCK.format(n_night=time_counts.get("night", 0),
+                                       n_day=time_counts.get("day", 0),
+                                       n_mentioned=time_counts.get("mentioned", 0))
     system = ROUTE_SYSTEM.format(
         dataset_context=context_block(dataset_description),
         summary=summary_text.rstrip(),
         actionability_block=act_block,
         event_block=evt_block,
+        time_block=time_block,
     )
     return system, ROUTE_USER.format(question=question.strip())
 
@@ -245,11 +299,25 @@ def normalize_event(raw) -> str:
     return "invalid"
 
 
+def normalize_time(raw) -> str:
+    """Map a requested time filter onto "" | "day" | "night". No filter for
+    responses naming no time — see TIME_BLOCK."""
+    v = str(raw or "").strip().lower()
+    if v in {"", "any", "all", "none", "null"}:
+        return ""
+    if v in {"night", "nighttime", "evening", "dark", "after dark"}:
+        return "night"
+    if v in {"day", "daytime", "daylight", "morning", "afternoon"}:
+        return "day"
+    return "invalid"
+
+
 def parse_route_output(raw: str, valid_ids: set[str],
                        valid_concepts: set[str],
                        valid_locations: set[str] = frozenset(),
                        actionability_available: bool = False,
-                       events_available: bool = False) -> tuple[dict, dict]:
+                       events_available: bool = False,
+                       time_available: bool = False) -> tuple[dict, dict]:
     """Validate the routing decision. Returns (route, stats). Invented label
     ids, unknown concepts and unknown locations are dropped and counted; a
     malformed route raises so the caller's retry path can handle it."""
@@ -350,6 +418,17 @@ def parse_route_output(raw: str, valid_ids: set[str],
             "incident; ignoring the filter")
         event_filter = ""
 
+    time_filter = normalize_time(obj.get("time_filter"))
+    if time_filter == "invalid":
+        stats["warnings"].append(
+            f"unknown time_filter {str(obj.get('time_filter'))!r}, ignored")
+        time_filter = ""
+    if time_filter and not time_available:
+        stats["warnings"].append(
+            "time_filter requested but no response carries a classified "
+            "time-of-day mention; ignoring the filter")
+        time_filter = ""
+
     answerable = bool(obj.get("answerable", True)) and bool(candidates)
     if obj.get("answerable", True) and not candidates:
         stats["warnings"].append(
@@ -366,6 +445,7 @@ def parse_route_output(raw: str, valid_ids: set[str],
         "location_filter": location_filter,
         "actionability_filter": actionability_filter,
         "event_filter": event_filter,
+        "time_filter": time_filter,
     }, stats
 
 
@@ -382,6 +462,84 @@ def members_by_label(assignments: list[dict]) -> dict[str, list[str]]:
     return out
 
 
+def composite_sample(keys: list[str], budget: int, rng: random.Random,
+                     tags_of) -> tuple[list[str], dict | None]:
+    """Pick `budget` keys as coverage picks + a uniform draw.
+
+    A pure uniform sample loses minority signals: a sub-signal present in 10%
+    of a category is entirely absent from a 10-quote draw 35% of the time.
+    So half the budget greedily covers "signal tags" — metadata the pipeline
+    already computed per response (co-assigned labels, places, actionability,
+    event flag, length band) — guaranteeing every distinct signal the data
+    carries at least one quote while the budget lasts. The other half stays a
+    uniform draw, because coverage picks over-represent unusual responses and
+    the answer still needs to reflect what is typical.
+
+    Deterministic: keys are visited in sorted order, ties break on that order,
+    and the fill uses the caller's seeded rng. Returns (sorted selection,
+    detail-for-disclosure); detail is None when no sampling happened.
+    """
+    keys = sorted(keys)
+    if len(keys) <= budget:
+        return keys, None
+    tag_sets = {k: tags_of(k) for k in keys}
+    all_tags: set[str] = set().union(*tag_sets.values())
+    cover_budget = budget // 2
+    covered: set[str] = set()
+    chosen: list[str] = []
+    chosen_set: set[str] = set()
+    while len(chosen) < cover_budget and len(covered) < len(all_tags):
+        best, best_gain = None, 0
+        for k in keys:
+            if k in chosen_set:
+                continue
+            gain = len(tag_sets[k] - covered)
+            if gain > best_gain:
+                best, best_gain = k, gain
+        if best is None:
+            break
+        chosen.append(best)
+        chosen_set.add(best)
+        covered |= tag_sets[best]
+    remaining = [k for k in keys if k not in chosen_set]
+    n_fill = budget - len(chosen)
+    fill = rng.sample(remaining, n_fill) if len(remaining) > n_fill else remaining
+    detail = {"coverage_picks": len(chosen), "random_picks": len(fill),
+              "tags_covered": len(covered), "tags_total": len(all_tags)}
+    return sorted(chosen + fill), detail
+
+
+def _sampling_note(shown: int, total: int, detail: dict | None = None,
+                   n_withheld: int = 0, withheld_reason: str = "") -> str:
+    """The disclosure string for one category/place, or "" when the quotes
+    shown really are all of them.
+
+    Keeps the "showing k of n" prefix the quote headers and manifest have
+    always used, then says how the sample was composed — an undisclosed
+    stratification would read as a uniform draw, which it no longer is.
+
+    `n_withheld` covers responses counted in `total` that were deliberately
+    not quotable here. In group_by=location a response naming two places is
+    quoted once, under the higher-count place; without this the second place's
+    header rendered as "all n" while showing fewer, telling the synth model it
+    had that place's complete evidence when it did not.
+    """
+    if shown >= total and not detail and not n_withheld:
+        return ""
+    note = f"showing {shown} of {total}"
+    if detail and detail["coverage_picks"]:
+        note += (f" ({detail['coverage_picks']} covering "
+                 f"{detail['tags_covered']} signal tags — co-labels, places, "
+                 f"actionability, events, length; {detail['random_picks']} random")
+        uncovered = detail["tags_total"] - detail["tags_covered"]
+        if uncovered:
+            note += f"; {uncovered} tags uncovered"
+        note += ")"
+    if n_withheld and withheld_reason:
+        note += f"; {n_withheld} {withheld_reason}"
+    return note
+
+
 def gather_evidence(
     route: dict,
     index: dict[str, dict],                    # label_id -> summary entry (+question_id)
@@ -395,9 +553,15 @@ def gather_evidence(
     actionability_of: dict[str, str] | None = None,        # response_key -> specific|general
     event_keys: set[str] | None = None,        # responses reporting an incident
     event_coded_keys: set[str] | None = None,  # responses the pass actually coded
+    location_implicit_questions: dict[str, set[str]] | None = None,
+    time_day_keys: set[str] | None = None,     # day/night from time_context spans
+    time_night_keys: set[str] | None = None,
+    time_mentioned_keys: set[str] | None = None,
 ) -> dict:
-    """Counts + numbered quotes for the synth prompt. Sampling is seeded and
-    disclosed; counts always cover the full (possibly filtered) membership.
+    """Counts + numbered quotes for the synth prompt. Sampling is seeded,
+    composite (coverage picks over signal tags + a uniform draw — see
+    composite_sample) and disclosed; counts always cover the full (possibly
+    filtered) membership.
 
     Three orthogonal filters compose here, each restricting the same evidence
     set and each leaving the unfiltered per-category count behind for
@@ -413,6 +577,7 @@ def gather_evidence(
     loc_filter = route.get("location_filter") or []
     act_filter = route.get("actionability_filter") or ""
     evt_filter = route.get("event_filter") or ""
+    time_filter = route.get("time_filter") or ""
     group_by = route.get("group_by", "category")
 
     allowed: set[str] | None = None
@@ -426,10 +591,25 @@ def gather_evidence(
     def restrict(keys: set[str]) -> set[str]:
         return keys if allowed is None else (allowed & keys)
 
+    implicit_qs: list[str] = []
     if loc_filter and location_members:
         hits: set[str] = set()
         for name in loc_filter:
             hits.update(location_members.get(name, []))
+        # A question whose own wording names the place ("changes to improve
+        # downtown") makes every answer to it about that place by
+        # construction — those responses match implicitly instead of being
+        # dropped for not re-typing the place name. Disclosed downstream.
+        if location_implicit_questions:
+            iq = {q for name in loc_filter
+                  for q in location_implicit_questions.get(name, set())}
+            if iq:
+                for c in route["candidates"]:
+                    if index[c["label_id"]]["question_id"] in iq:
+                        hits.update(members.get(c["label_id"], []))
+                implicit_qs = sorted(
+                    iq & {index[c["label_id"]]["question_id"]
+                          for c in route["candidates"]})
         allowed = restrict(hits)
 
     # `coded` is tracked separately from `matching` because a response the
@@ -457,6 +637,21 @@ def gather_evidence(
             "matching": len(pre & event_keys),
         }
         allowed = restrict(set(event_keys))
+
+    # `mentioning` is tracked because a response naming no time of day is not
+    # evidence about when anything happened — only the responses that named
+    # one are classifiable, and the disclosure must say so.
+    time_denominator: dict[str, int] | None = None
+    if time_filter:
+        t_keys = time_night_keys if time_filter == "night" else time_day_keys
+        if t_keys is not None:
+            pre = scope_under(allowed)
+            time_denominator = {
+                "in_scope": len(pre),
+                "mentioning": len(pre & (time_mentioned_keys or set())),
+                "matching": len(pre & t_keys),
+            }
+            allowed = restrict(set(t_keys))
 
     def member_keys(lid: str) -> list[str]:
         keys = members.get(lid, [])
@@ -486,6 +681,50 @@ def gather_evidence(
     rng = random.Random(seed)
     quotes, n = [], 0
     sampling_notes: dict[str, str] = {}
+
+    # Signal tags for composite sampling — the inversions (key -> labels,
+    # key -> places) cover the whole corpus, so they are built once and only
+    # if some category actually overflows its quote budget.
+    _tag_ctx: dict | None = None
+
+    def tag_context() -> dict:
+        nonlocal _tag_ctx
+        if _tag_ctx is None:
+            labels_of: dict[str, list[str]] = {}
+            for l, ks in members.items():
+                for k in ks:
+                    labels_of.setdefault(k, []).append(l)
+            places_of: dict[str, list[str]] = {}
+            for name, ks in (location_members or {}).items():
+                for k in ks:
+                    places_of.setdefault(k, []).append(name)
+            _tag_ctx = {"labels_of": labels_of, "places_of": places_of}
+        return _tag_ctx
+
+    def tags_for(sample_keys: list[str], exclude_lid: str = ""):
+        """tags_of callable for one category/place: length bands are terciles
+        WITHIN this group, so "long for this question" stays meaningful."""
+        ctx = tag_context()
+        lens = sorted(len(texts[k]) for k in sample_keys)
+        t1, t2 = lens[len(lens) // 3], lens[(2 * len(lens)) // 3]
+
+        def tags_of(k: str) -> set[str]:
+            ln = len(texts[k])
+            tags = {"len:" + ("short" if ln <= t1 else
+                              "long" if ln > t2 else "mid")}
+            for l in ctx["labels_of"].get(k, ()):
+                if l != exclude_lid:
+                    tags.add("colabel:" + l)
+            for p in ctx["places_of"].get(k, ()):
+                tags.add("place:" + p)
+            v = (actionability_of or {}).get(k)
+            if v:
+                tags.add("act:" + v)
+            if event_keys and k in event_keys:
+                tags.add("evt:reported")
+            return tags
+
+        return tags_of
 
     def add_quote(key: str, lid: str, location: str | None = None) -> None:
         nonlocal n
@@ -545,12 +784,20 @@ def gather_evidence(
         for lc in location_counts:          # highest-count place
             if lc["name"] not in quotable_locs:
                 continue
-            keys = sorted(k for k in loc_sets[lc["name"]]
-                          if k in texts and k not in quoted)
-            if len(keys) > per_loc:
-                keys = sorted(rng.sample(keys, per_loc))
-                sampling_notes[f"loc:{lc['name']}"] = \
-                    f"showing {per_loc} of {lc['count']}"
+            available = sorted(k for k in loc_sets[lc["name"]]
+                               if k in texts and k not in quoted)
+            # counted in lc["count"] but not quotable here — already quoted
+            # under a higher-count place, or absent from the text map. Must be
+            # disclosed: otherwise this place's header claims "all n".
+            n_withheld = lc["count"] - len(available)
+            keys, detail = available, None
+            if len(available) > per_loc:
+                keys, detail = composite_sample(available, per_loc, rng,
+                                                tags_for(available))
+            note = _sampling_note(len(keys), lc["count"], detail, n_withheld,
+                                  "already quoted under another place")
+            if note:
+                sampling_notes[f"loc:{lc['name']}"] = note
             for k in keys:
                 quoted.add(k)
                 add_quote(k, owner.get(k, ""), location=lc["name"])
@@ -587,10 +834,19 @@ def gather_evidence(
             if lid not in quotable_lids:
                 continue
             all_keys = keys_by_lid[lid]
-            keys = [k for k in all_keys if k in texts]
-            if len(keys) > per_label:
-                keys = sorted(rng.sample(keys, per_label))
-                sampling_notes[lid] = f"showing {per_label} of {len(all_keys)}"
+            available = [k for k in all_keys if k in texts]
+            # a member the corpus has no text for (a labels run referencing
+            # rows a re-ingest dropped) is counted but unquotable — say so
+            # rather than letting the header read "all n"
+            n_withheld = len(all_keys) - len(available)
+            keys, detail = available, None
+            if len(available) > per_label:
+                keys, detail = composite_sample(available, per_label, rng,
+                                                tags_for(available, lid))
+            note = _sampling_note(len(keys), len(all_keys), detail, n_withheld,
+                                  "have no stored response text")
+            if note:
+                sampling_notes[lid] = note
             for k in keys:
                 add_quote(k, lid)
 
@@ -606,10 +862,13 @@ def gather_evidence(
             "group_by": group_by, "location_filter": loc_filter,
             "location_counts": location_counts,
             "location_denominator": location_denominator,
+            "location_filter_implicit_questions": implicit_qs,
             "actionability_filter": act_filter,
             "actionability_denominator": actionability_denominator,
             "event_filter": evt_filter,
-            "event_denominator": event_denominator}
+            "event_denominator": event_denominator,
+            "time_filter": time_filter,
+            "time_denominator": time_denominator}
 
 
 def lexicon_counts(lexicon: dict, concept_names: list[str],
@@ -650,12 +909,27 @@ def filter_phrase(evidence: dict) -> str:
         parts.append(ACTIONABILITY_PHRASE.get(act, act))
     if evidence.get("event_filter"):
         parts.append("recounting a first-hand incident")
+    t = evidence.get("time_filter")
+    if t:
+        parts.append(f"mentioning {t}time" if t in {"day", "night"} else t)
     return " and ".join(parts)
 
 
 def render_counts_block(evidence: dict, lex_counts: list[dict],
-                        question_totals: dict[str, int]) -> str:
+                        question_totals: dict[str, int],
+                        question_texts: dict[str, str] | None = None) -> str:
+    def q_phrase(qid: str) -> str:
+        """How a survey question reads in a count line — its own wording when
+        known, so counts from different questions never read as one ranking."""
+        text = (question_texts or {}).get(qid, "")
+        return f'question {qid} ("{text}")' if text else f"question {qid}"
+
     lines = []
+    for qid in evidence.get("location_filter_implicit_questions") or []:
+        lines.append(f'- every response to {q_phrase(qid)} is about '
+                     f'{", ".join(evidence.get("location_filter") or [])} by '
+                     f'construction (the question itself asks about it), so '
+                     f'all of them count as mentioning it')
     denom_act = evidence.get("actionability_denominator")
     if denom_act:
         act = evidence.get("actionability_filter", "")
@@ -686,6 +960,18 @@ def render_counts_block(evidence: dict, lex_counts: list[dict],
         lines.append('- the remainder did not DESCRIBE an incident, which is '
                      'not the same as nothing having happened to them — never '
                      'report it as such')
+    denom_time = evidence.get("time_denominator")
+    if denom_time:
+        t = evidence.get("time_filter", "")
+        lines.append(f'- responses in scope before the {t}time filter: '
+                     f'{denom_time["in_scope"]}; of those, '
+                     f'{denom_time["mentioning"]} named any time of day at all')
+        lines.append(f'- responses explicitly mentioning {t}time: '
+                     f'{denom_time["matching"]} — the answer covers ONLY '
+                     f'these, and must state this denominator')
+        lines.append('- the remainder named no time of day, which says '
+                     'nothing about when their experience happened — never '
+                     'report it as the other time of day')
     denom_loc = evidence.get("location_denominator")
     if denom_loc:
         lines.append(f'- responses in scope (union of selected categories): '
@@ -699,7 +985,8 @@ def render_counts_block(evidence: dict, lex_counts: list[dict],
     phrase = filter_phrase(evidence)
     for s in sorted(evidence["selection"], key=lambda s: -s["count"]):
         total = question_totals.get(s["question_id"])
-        denom = f" of {total} coded responses to question {s['question_id']}" if total else ""
+        denom = (f" of {total} coded responses to {q_phrase(s['question_id'])}"
+                 if total else "")
         if "count_unfiltered" in s:
             lines.append(f'- {s["name"]} ({s["label_id"]}): {s["count"]} responses '
                          f'{phrase} '
@@ -758,9 +1045,17 @@ def render_quotes_block(evidence: dict, index: dict[str, dict],
 def build_synth_prompts(question: str, route: dict, evidence: dict,
                         index: dict[str, dict], lex_counts: list[dict],
                         question_totals: dict[str, int],
-                        dataset_description: str = "") -> tuple[str, str]:
+                        dataset_description: str = "",
+                        question_texts: dict[str, str] | None = None,
+                        ) -> tuple[str, str]:
     group_of = {lid: g["name"] for g in route["groups"] for lid in g["label_ids"]}
     guidance = ROUTE_GUIDANCE[route["route"]]
+    if len({s["question_id"] for s in evidence["selection"]}) > 1:
+        guidance += (
+            " The evidence spans MORE THAN ONE survey question, each with its"
+            " own denominator — when narrating a count, say which survey"
+            " question it comes from (the counts block names each), and never"
+            " present counts from different questions as one ranking.")
     if route.get("group_by") == "location":
         guidance += (
             " Organize the answer by PLACE, using the per-place counts from "
@@ -795,13 +1090,22 @@ def build_synth_prompts(question: str, route: dict, evidence: dict,
             " crime statistics: describe them as what respondents reported."
             " Never write or imply that the other respondents had nothing"
             " happen to them — they simply did not describe an incident.")
+    if route.get("time_filter") in {"day", "night"}:
+        t = route["time_filter"]
+        guidance += (
+            f" The evidence is restricted to responses explicitly mentioning"
+            f" {t}time — say so, copying the denominator from COMPUTED"
+            f" COUNTS. Never write or imply anything about when the OTHER"
+            f" responses' experiences happened: naming no time of day is not"
+            f" evidence either way.")
     system = SYNTH_SYSTEM.format(
         dataset_context=context_block(dataset_description),
         route_guidance=guidance,
     )
     user = SYNTH_USER.format(
         question=question.strip(),
-        counts_block=render_counts_block(evidence, lex_counts, question_totals),
+        counts_block=render_counts_block(evidence, lex_counts, question_totals,
+                                         question_texts),
         quotes_block=render_quotes_block(evidence, index, group_of or None),
     )
     return system, user
@@ -814,7 +1118,10 @@ def parse_synth_output(raw: str) -> str:
     return str(obj["answer_markdown"]).strip()
 
 
-CITATION_RE = re.compile(r"\[(\d{1,4})\]")
+# One bracket may carry several citations — flash-lite sometimes writes
+# [1, 3, 4] instead of [1][3][4]. Those used to parse as NOTHING: absent from
+# Sources and not counted invalid (found by the 2026-08-03 audit).
+CITATION_RE = re.compile(r"\[(\d{1,4}(?:\s*,\s*\d{1,4})*)\]")
 
 
 def resolve_citations(answer_md: str, evidence: dict) -> tuple[str, list[dict], int]:
@@ -828,13 +1135,14 @@ def resolve_citations(answer_md: str, evidence: dict) -> tuple[str, list[dict], 
     cited, invalid = [], 0
     seen: set[int] = set()
     for m in CITATION_RE.finditer(answer_md):
-        n = int(m.group(1))
-        if n in by_n:
-            if n not in seen:
-                seen.add(n)
-                cited.append(by_n[n])
-        else:
-            invalid += 1
+        for part in m.group(1).split(","):
+            n = int(part)
+            if n in by_n:
+                if n not in seen:
+                    seen.add(n)
+                    cited.append(by_n[n])
+            else:
+                invalid += 1
     answer = answer_md
     if invalid:
         answer += f"\n\n> NOTE: {invalid} citation(s) referenced numbers not in the evidence and could not be resolved."
@@ -875,32 +1183,38 @@ def run_route(client: ModelClient, question: str, summary_text: str,
               valid_locations: set[str] = frozenset(),
               actionability_counts: dict[str, int] | None = None,
               event_counts: tuple[int, int] | None = None,
+              time_counts: dict[str, int] | None = None,
               ) -> tuple[dict, dict]:
     system, user = build_route_prompts(question, summary_text,
                                        dataset_description, actionability_counts,
-                                       event_counts)
+                                       event_counts, time_counts)
     act_available = bool(actionability_counts)
     evt_available = bool(event_counts and event_counts[0])
+    time_available = bool(time_counts and
+                          (time_counts.get("day") or time_counts.get("night")))
     raw = _complete_json(client, system, user)
     try:
         return parse_route_output(raw, valid_ids, valid_concepts,
-                                  valid_locations, act_available, evt_available)
+                                  valid_locations, act_available, evt_available,
+                                  time_available)
     except (ValueError, json.JSONDecodeError):
         raw = client.complete(
             system + "\nYour previous output was not valid JSON. Return ONLY the JSON object.",
             user,
         )
         return parse_route_output(raw, valid_ids, valid_concepts,
-                                  valid_locations, act_available, evt_available)
+                                  valid_locations, act_available, evt_available,
+                                  time_available)
 
 
 def run_synth(client: ModelClient, question: str, route: dict, evidence: dict,
               index: dict[str, dict], lex_counts: list[dict],
               question_totals: dict[str, int],
-              dataset_description: str = "") -> str:
+              dataset_description: str = "",
+              question_texts: dict[str, str] | None = None) -> str:
     system, user = build_synth_prompts(
         question, route, evidence, index, lex_counts, question_totals,
-        dataset_description)
+        dataset_description, question_texts)
     raw = _complete_json(client, system, user)
     try:
         return parse_synth_output(raw)

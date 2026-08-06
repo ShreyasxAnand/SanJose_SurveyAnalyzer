@@ -4,12 +4,64 @@ export interface ColumnPreview {
   non_null_count: number;
 }
 
+export interface DatasetMatch {
+  dataset_id: number;
+  dataset_name: string;
+  matched_rows: number;
+  file_rows: number;
+  dataset_rows: number;
+  exact: boolean;
+  // append is only possible when every question column the target selected
+  // exists in the new file
+  columns_compatible: boolean;
+  missing_columns: string[];
+}
+
+export interface RenamedColumn {
+  stored_name: string;
+  file_name: string;
+}
+
+// Same column contents, different column set — no row can match (a
+// dropped/added/renamed column changes every row hash) but the untouched
+// columns fingerprint identically. Diagnostic only: append is impossible,
+// the point is warning before re-processing data the system already holds.
+export interface ColumnMatch {
+  dataset_id: number;
+  dataset_name: string;
+  upload_filename: string;
+  upload_rows: number;
+  matched_columns: string[];
+  renamed_columns: RenamedColumn[];
+  missing_columns: string[]; // in the stored file, absent from this one
+  added_columns: string[]; // new in this file
+  changed_columns: string[]; // same name, different content
+}
+
+export interface DuplicateCheck {
+  outcome: "none" | "exact" | "partial";
+  best_dataset_id: number | null;
+  matches: DatasetMatch[];
+  // populated only when outcome === "none"
+  column_matches: ColumnMatch[];
+}
+
 export interface UploadResponse {
   dataset_id: number;
   name: string;
   original_filename: string;
   row_count: number;
   columns: ColumnPreview[];
+  duplicate_check: DuplicateCheck;
+}
+
+export interface AppendResponse {
+  dataset: DatasetOut;
+  upload_id: number;
+  appended_rows: number;
+  skipped_duplicates: number;
+  new_responses_per_question: Record<string, number>;
+  warnings: string[];
 }
 
 export interface QuestionColumnOut {
@@ -37,8 +89,41 @@ export interface DatasetOut {
   uploaded_at: string;
   respondent_id_column: string | null;
   description: string | null;
+  // Catalog metadata — never used in analysis prompts (unlike description).
+  department: string | null;
+  notes: string | null;
+  survey_start_date: string | null; // ISO YYYY-MM-DD
+  survey_end_date: string | null;
   questions: QuestionColumnOut[];
   exports: ExportInfo | null;
+}
+
+// Editable catalog metadata. Omitted/null field = leave unchanged, "" =
+// clear. The description is deliberately absent: it feeds every analysis
+// prompt and is part of each run's identity, so it is fixed at ingest.
+export interface DatasetMetadataPatch {
+  name?: string;
+  department?: string;
+  notes?: string;
+  survey_start_date?: string;
+  survey_end_date?: string;
+}
+
+// One source file merged into a dataset — all counts are stored numbers.
+export interface UploadHistoryEntry {
+  upload_id: number;
+  filename: string;
+  uploaded_at: string | null;
+  kind: "created" | "appended";
+  row_count: number;
+  new_row_count: number;
+  duplicate_row_count: number;
+  note: string | null;
+}
+
+export interface DatasetHistoryOut {
+  dataset_id: number;
+  entries: UploadHistoryEntry[];
 }
 
 // --- Phase 5: two-step ask ---
@@ -60,11 +145,38 @@ export interface AskLocation {
   count: number;
 }
 
+export interface AskChild {
+  label_id: string;
+  name: string;
+  count: number;
+  description: string;
+  // whether the router proposed it; relevance and rationale are only
+  // meaningful when it did
+  proposed: boolean;
+  relevance: string;
+  rationale: string;
+}
+
+export interface AskParentGroup {
+  question_id: string;
+  question_text: string;
+  parent_name: string;
+  // a real union over the children's response keys, not the sum of their
+  // counts — a response labelled with two children of one parent is one
+  // response
+  count_unique_responses: number;
+  n_proposed: number;
+  children: AskChild[];
+}
+
 export interface AskRouteResponse {
   answerable: boolean;
   route: string;
   reason: string;
   candidates: AskCandidate[];
+  // the whole taxonomy, so the review screen shows every parent category with
+  // its children rather than only what the router proposed
+  available_categories: AskParentGroup[];
   lexicon_concepts: string[];
   available_lexicon_concepts: string[];
   group_by: string; // "category" | "location"
@@ -80,7 +192,20 @@ export interface AskRouteResponse {
   event_filter: string;
   // { reported, coded }; empty when no labels run carries the field
   available_events: Record<string, number>;
+  // "" | "day" | "night" — classified from verbatim time mentions; no filter
+  // for responses naming no time (that says nothing about when it happened)
+  time_filter: string;
+  // { day, night, mentioned }; empty when nothing classifies
+  available_time: Record<string, number>;
+  // survey question ids this proposal was scoped to; empty = all questions
+  question_scope: string[];
   warnings: string[];
+}
+
+export interface AskQuestionOut {
+  question_id: string;
+  question_text: string;
+  n_responses: number;
 }
 
 export interface AskSelectedCandidate {
@@ -99,6 +224,8 @@ export interface AskAnswerRequest {
   location_filter: string[];
   actionability_filter: string;
   event_filter: string;
+  time_filter: string;
+  question_scope: string[];
   proposed_label_ids: string[];
 }
 
@@ -158,7 +285,70 @@ export interface AskAnswerResponse {
     coded: number;
     matching: number;
   } | null;
+  time_filter: string;
+  time_denominator: {
+    in_scope: number;
+    mentioning: number;
+    matching: number;
+  } | null;
+  // survey questions whose every response counted as mentioning the filtered
+  // place because the question itself asks about it
+  location_filter_implicit_questions: string[];
   invalid_citations: number;
   deselected: string[];
   added: string[];
+}
+
+// --- Pipeline runs (induce -> label -> lexicon -> locations) ---
+
+export interface PipelineEstimateItem {
+  stage: string;
+  question_id: string;
+  question_text: string;
+  detail: string;
+  responses: number;
+  est_cost_usd: number;
+  // "planned"  = from the real chunking and prompt sizes the run will use
+  // "projected" = extrapolated from a measured rate, because the real dry-run
+  //               needs an artifact that doesn't exist yet
+  // The UI must keep these visually distinct.
+  basis: string;
+}
+
+export interface PipelineEstimate {
+  dataset_id: string;
+  dataset_description: string;
+  // "incremental" (post-append) plans only never-labeled rows; all its items
+  // are basis="projected"
+  mode: "full" | "incremental";
+  n_questions: number;
+  n_responses: number;
+  // rows the latest labels runs have never seen (incremental mode only)
+  n_new_responses: number;
+  items: PipelineEstimateItem[];
+  est_total_usd: number;
+  questions_with_existing_taxonomy: string[];
+}
+
+export interface PipelineStage {
+  key: string;
+  label: string;
+  status: string; // pending | running | done | failed | skipped
+  detail: string;
+  cost_usd: number | null;
+  seconds: number | null;
+  error: string;
+}
+
+export interface PipelineJob {
+  job_id: string;
+  dataset_id: string;
+  status: string; // running | done | failed
+  stages: PipelineStage[];
+  created_utc: string;
+  finished_utc: string;
+  error: string;
+  // summed from each stage's own run manifest — real spend, not the estimate
+  cost_usd: number;
+  is_processed: boolean;
 }

@@ -15,14 +15,26 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from . import induction, labeling, llm, locations as locations_mod, router, summary
 from .llm import ModelClient
 
 ANSWERS_DIR = induction.DATA_DIR / "answers"
+
+# Deterministic day/night classification of labeling's verbatim time_context
+# spans. Deliberately coarse: a span matching neither set (e.g. "recently",
+# "for years") stays unclassified, and one matching both ("day and night")
+# counts as both. "every day"/"everyday" are frequency, not time of day.
+TIME_NIGHT_RE = re.compile(
+    r"night|evening|dark|midnight|overnight|dusk", re.IGNORECASE)
+TIME_DAY_RE = re.compile(
+    r"(?<!every )(?<!every)\bday(?:time|light)?\b|morning|afternoon|\bnoon"
+    r"|daylight", re.IGNORECASE)
 
 
 @dataclass
@@ -57,6 +69,31 @@ class AskContext:
     # predicate labeling's own `responses_event_coded` uses.
     events: set[str] = field(default_factory=set)
     event_coded: set[str] = field(default_factory=set)
+    # question_id -> the analyst's question wording, for provenance: a count
+    # shown next to another question's count must say which question it
+    # answers, or two different denominators read as one ranking.
+    question_texts: dict[str, str] = field(default_factory=dict)
+    # concept name -> question_ids whose own wording matches the concept
+    # (e.g. "downtown" matches "changes to improve downtown"). Every response
+    # to such a question is about the place by construction, so a location
+    # filter must not drop it for not re-typing the place name.
+    location_implicit_questions: dict[str, set[str]] = field(default_factory=dict)
+    # Day/night classification of labeling's verbatim time_context spans.
+    # `time_mentioned` = responses whose spans named any time at all; absent
+    # spans mean the respondent named no time, never "it happened at noon".
+    time_day: set[str] = field(default_factory=set)
+    time_night: set[str] = field(default_factory=set)
+    time_mentioned: set[str] = field(default_factory=set)
+    # How long this context took to assemble, and whether the location sweep
+    # was read from its cache or recomputed. Both land in the answer manifest:
+    # the load is the bulk of an ask's wall clock, and a run that reports only
+    # its model time understates what the analyst waited for.
+    load_seconds: float = 0.0
+    location_members_source: str = ""
+    # "computed" or "cache" — which path produced this context. Disclosed in
+    # the answer manifest for the same reason location_members_source is: a
+    # surprising number should be traceable to a stale cache, not guessed at.
+    context_source: str = ""
 
 
 def discover_dataset_id(explicit: str | None = None) -> str:
@@ -69,9 +106,114 @@ def discover_dataset_id(explicit: str | None = None) -> str:
     return ds[0]
 
 
+def dataset_parquet(dataset_id: str, explicit: str | None = None) -> Path:
+    """The corpus belonging to THIS dataset.
+
+    `induction.discover_parquet` picks the most recent export across every
+    dataset. That is right for the single-dataset CLI, and wrong here: it makes
+    an older dataset's asks depend on which dataset was exported last. Uploading
+    a 30-row file as dataset 3 repointed dataset 2's asks at the wrong corpus
+    and turned them into a 500 — the bug this function exists to prevent.
+
+    A missing export raises rather than falling back to another dataset's
+    corpus: answering over the wrong responses is far worse than not answering.
+    ask_api turns it into a 409, the same client-visible "pipeline hasn't run"
+    state as missing labels.
+    """
+    if explicit:
+        return induction.discover_parquet(explicit)
+    ds_dir = induction.DATA_DIR / "exports" / str(dataset_id)
+    for name in ("responses.parquet", "reshaped.parquet"):
+        p = ds_dir / name
+        if p.exists():
+            return p
+    raise FileNotFoundError(
+        f"No export parquet for dataset {dataset_id} under {ds_dir}. "
+        f"Re-export it (POST /datasets/{dataset_id}/export) or pass one "
+        f"explicitly with --parquet.")
+
+
+# --- in-process context cache ---------------------------------------------
+#
+# The stateless two-step flow loads the same context TWICE per analyst question
+# (/ask/route then /ask/answer), and on dataset 2 that is ~1.3s a time — 0.96s
+# of it re-reading the same 29k-row parquet. Nothing between the two calls can
+# change it, so the second load is pure waste, as is every load for the next
+# question about the same dataset.
+#
+# This is a memo, NOT the on-disk correctness cache `locations.members.json` is.
+# That one keys on content fingerprints because a stale hit would persist wrong
+# counts across processes forever; this one lives in one process, expires, and
+# is validated on every hit against:
+#   * which labels run is latest per question — a readdir, and every pipeline /
+#     label / review / incremental run creates a NEW run dir, so a CLI run in
+#     another process invalidates it;
+#   * size + mtime of the export, locations and lexicon files — mtime alone is
+#     not trusted anywhere in this codebase, which is why `_write_exports` also
+#     drops the entry explicitly for the in-process writers (append, re-export,
+#     metadata edit);
+#   * a TTL, so anything both of those miss self-corrects in seconds rather
+#     than lasting until a restart.
+# Any mismatch is a miss, so the cost of being wrong is one second, not a wrong
+# answer.
+_CTX_CACHE: dict[str, tuple[str, float, AskContext]] = {}
+_CTX_TTL_SECONDS = 120.0
+_CTX_LOCK = threading.Lock()
+
+
+def _context_key(dataset_id: str, description: str) -> str:
+    """Cheap staleness key — stat and readdir only. Never reads the corpus,
+    which is the second this cache exists to avoid."""
+    parts = [hashlib.sha256(description.encode("utf-8")).hexdigest()[:8]]
+    ds_dir = summary.LABELS_DIR / str(dataset_id)
+    if ds_dir.is_dir():
+        for qdir in sorted(p for p in ds_dir.iterdir() if p.is_dir()):
+            runs = sorted(d.name for d in qdir.iterdir()
+                          if d.is_dir() and (d / "assignments.json").exists())
+            parts.append(f"{qdir.name}={runs[-1] if runs else '-'}")
+    for p in (induction.DATA_DIR / "exports" / str(dataset_id) / "responses.parquet",
+              summary.LOCATIONS_DIR / str(dataset_id) / "locations.json",
+              summary.LEXICON_DIR / str(dataset_id) / "lexicon.json"):
+        try:
+            st = p.stat()
+            parts.append(f"{p.name}:{st.st_size}:{st.st_mtime_ns}")
+        except OSError:
+            parts.append(f"{p.name}:-")
+    return "|".join(parts)
+
+
+def invalidate_context_cache(dataset_id: str | int | None = None) -> None:
+    """Drop cached contexts. Called by whatever rewrites a dataset's export in
+    this process, so an append or a re-export is never answered around."""
+    with _CTX_LOCK:
+        if dataset_id is None:
+            _CTX_CACHE.clear()
+        else:
+            _CTX_CACHE.pop(str(dataset_id), None)
+
+
 def load_context(dataset_id: str, parquet: str | None = None,
-                 description: str = "") -> AskContext:
-    s = summary.build_summary(dataset_id, description)
+                 description: str = "", use_cache: bool = True) -> AskContext:
+    # An explicit parquet is the CLI steering at a specific file — never serve
+    # that from a cache keyed on the dataset's own export.
+    cacheable = use_cache and parquet is None
+    if cacheable:
+        with _CTX_LOCK:
+            hit = _CTX_CACHE.get(str(dataset_id))
+        if hit is not None:
+            key, cached_at, ctx = hit
+            if (time.time() - cached_at < _CTX_TTL_SECONDS
+                    and key == _context_key(dataset_id, description)):
+                # a shallow copy: the big dicts are shared (nothing mutates
+                # them), but each run reports its own timing honestly
+                return replace(ctx, load_seconds=0.0, context_source="cache")
+
+    t0 = time.time()
+    # the sink hands back the assignment rows build_summary already parsed, so
+    # the actionability/event pass below reads them instead of re-resolving
+    # "latest" and re-parsing every question's file
+    assignments_by_q: dict[str, list[dict]] = {}
+    s = summary.build_summary(dataset_id, description, assignments_by_q)
     summary.write_summary(s)     # keep the Phase 4 artifact on disk current
 
     lexicon: dict = {}
@@ -79,7 +221,7 @@ def load_context(dataset_id: str, parquet: str | None = None,
     if lex_path.exists():
         lexicon = json.loads(lex_path.read_text(encoding="utf-8"))
 
-    parquet_path = induction.discover_parquet(parquet)
+    parquet_path = dataset_parquet(dataset_id, parquet)
     question_ids = [q["question_id"] for q in s["questions"]]
     texts: dict[str, str] = {}
     keys_by_question: dict[str, list[str]] = {}
@@ -94,10 +236,16 @@ def load_context(dataset_id: str, parquet: str | None = None,
     actionability: dict[str, str] = {}
     events: set[str] = set()
     event_coded: set[str] = set()
+    time_day: set[str] = set()
+    time_night: set[str] = set()
+    time_mentioned: set[str] = set()
     for q in question_ids:
-        run = summary.latest_run_dir(summary.LABELS_DIR / dataset_id / q,
-                                     "assignments.json")
-        assignments = json.loads((run / "assignments.json").read_text(encoding="utf-8"))
+        assignments = assignments_by_q.get(q)
+        if assignments is None:      # sink miss shouldn't happen; read rather than skip
+            run = summary.latest_run_dir(summary.LABELS_DIR / dataset_id / q,
+                                         "assignments.json")
+            assignments = json.loads(
+                (run / "assignments.json").read_text(encoding="utf-8"))
         members.update(router.members_by_label(assignments))
         for a in assignments:
             v = a.get("actionability")
@@ -107,20 +255,49 @@ def load_context(dataset_id: str, parquet: str | None = None,
                 event_coded.add(a["response_key"])
                 if a.get("event_occurred"):
                     events.add(a["response_key"])
+            spans = a.get("time_context") or []
+            if spans:
+                k = a["response_key"]
+                time_mentioned.add(k)
+                joined = " ".join(str(s) for s in spans)
+                if TIME_NIGHT_RE.search(joined):
+                    time_night.add(k)
+                if TIME_DAY_RE.search(joined):
+                    time_day.add(k)
     actionability_counts: dict[str, int] = {}
     for v in actionability.values():
         actionability_counts[v] = actionability_counts.get(v, 0) + 1
 
+    question_texts = {q["question_id"]: q.get("question_text", "")
+                      for q in s["questions"]}
+
     locations: dict = {}
     location_members: dict[str, list[str]] = {}
+    location_implicit_questions: dict[str, set[str]] = {}
+    members_source = ""
     loc_path = summary.LOCATIONS_DIR / dataset_id / "locations.json"
     if loc_path.exists():
         locations = json.loads(loc_path.read_text(encoding="utf-8"))
         all_keys = list(texts)
-        location_members = locations_mod.match_locations(
-            locations, all_keys, [texts[k] for k in all_keys])
+        # the sweep is deterministic in (concepts, corpus) and both are on
+        # disk, so it is computed once per change rather than once per
+        # question — the fingerprints inside decide, not a timestamp
+        location_members, members_source = locations_mod.match_locations_cached(
+            locations, all_keys, [texts[k] for k in all_keys], dataset_id)
+        # A concept matching a QUESTION's own wording means every answer to
+        # that question is about the place by construction ("changes to
+        # improve downtown") — the location filter treats those responses as
+        # implicit matches instead of starving the evidence down to the few
+        # that re-typed the place name.
+        from .lexicon import compile_concept
+        for concept in locations.get("concepts", []):
+            pat = compile_concept(concept["spans"])
+            qs = {qid for qid, text in question_texts.items()
+                  if text and pat.search(text)}
+            if qs:
+                location_implicit_questions[concept["name"]] = qs
 
-    return AskContext(
+    ctx = AskContext(
         dataset_id=dataset_id,
         summary=s,
         summary_text=summary.render_summary(s),
@@ -141,18 +318,62 @@ def load_context(dataset_id: str, parquet: str | None = None,
         actionability_counts=actionability_counts,
         events=events,
         event_coded=event_coded,
+        question_texts=question_texts,
+        location_implicit_questions=location_implicit_questions,
+        time_day=time_day,
+        time_night=time_night,
+        time_mentioned=time_mentioned,
+        load_seconds=time.time() - t0,
+        location_members_source=members_source,
+        context_source="computed",
     )
+    if cacheable:
+        # keyed on the state as it is NOW — anything that changed while we were
+        # loading shows up as a mismatch on the next hit, not as a stale serve
+        with _CTX_LOCK:
+            _CTX_CACHE[str(dataset_id)] = (
+                _context_key(dataset_id, description), time.time(), ctx)
+    return ctx
 
 
 def propose(client: ModelClient, question: str, ctx: AskContext,
-            description: str = "") -> tuple[dict, dict]:
+            description: str = "",
+            question_scope: list[str] | None = None) -> tuple[dict, dict]:
     """Step 1: the routing proposal. Returns (route, stats) exactly as
-    router.run_route does — the caller renders it for review."""
-    return router.run_route(client, question, ctx.summary_text,
-                            ctx.valid_ids, ctx.valid_concepts, description,
-                            valid_locations=ctx.valid_locations,
-                            actionability_counts=ctx.actionability_counts,
-                            event_counts=(len(ctx.events), len(ctx.event_coded)))
+    router.run_route does — the caller renders it for review.
+
+    `question_scope` restricts the ask to specific survey questions: the
+    router only ever SEES the scoped questions' summary and only their label
+    ids validate, so an out-of-scope category is structurally impossible in
+    the proposal — the analyst's stated scope is enforced in code, not
+    requested in prose. Unknown question ids raise ValueError (the API's
+    422). An empty scope means all questions, as before."""
+    scope = [str(q).strip() for q in (question_scope or []) if str(q).strip()]
+    summary_text = ctx.summary_text
+    valid_ids = ctx.valid_ids
+    if scope:
+        unknown = [q for q in scope if q not in ctx.question_ids]
+        if unknown:
+            raise ValueError(
+                f"Unknown question ids in scope: {unknown}; "
+                f"this dataset has {ctx.question_ids}")
+        scoped = {**ctx.summary,
+                  "questions": [q for q in ctx.summary["questions"]
+                                if q["question_id"] in scope]}
+        summary_text = summary.render_summary(scoped)
+        valid_ids = {e["label_id"] for q in scoped["questions"]
+                     for e in q["entries"]}
+    route, stats = router.run_route(
+        client, question, summary_text,
+        valid_ids, ctx.valid_concepts, description,
+        valid_locations=ctx.valid_locations,
+        actionability_counts=ctx.actionability_counts,
+        event_counts=(len(ctx.events), len(ctx.event_coded)),
+        time_counts={"day": len(ctx.time_day), "night": len(ctx.time_night),
+                     "mentioned": len(ctx.time_mentioned)}
+                    if ctx.time_mentioned else None)
+    route["question_scope"] = scope
+    return route, stats
 
 
 def usage_block(clients: list[ModelClient], elapsed: float) -> dict:
@@ -235,7 +456,10 @@ def process_note(route: dict, evidence: dict, ctx: AskContext,
     unique = evidence.get("n_unique_responses",
                           len({k for s in sel
                                for k in ctx.members.get(s["label_id"], [])}))
-    # "_"-prefixed keys are budget disclosures, not per-category notes
+    # "_"-prefixed keys are budget disclosures, not per-category notes. A note
+    # now means "the quotes shown are not all of them" — from sampling, or from
+    # a response already quoted under another place — so the wording below says
+    # "disclosed for", not "sampled for".
     n_sampled = sum(1 for k in evidence["sampling_notes"] if not k.startswith("_"))
     budget_notes = [v for k, v in evidence["sampling_notes"].items()
                     if k.startswith("_quote_budget")]
@@ -245,7 +469,7 @@ def process_note(route: dict, evidence: dict, ctx: AskContext,
         f"Searched {len(sel)} of {len(ctx.valid_ids)} categories ({shown}), "
         f"covering {unique} unique responses.",
         f"Showed {len(evidence['quotes'])} verbatims to the answering model"
-        + (f" (sampled for {n_sampled} categor"
+        + (f" (quote coverage disclosed for {n_sampled} categor"
            + ("y" if n_sampled == 1 else "ies")
            + "; counts always cover the full data)" if n_sampled else "")
         + f"; {n_cited} of them are cited in the answer.",
@@ -254,8 +478,20 @@ def process_note(route: dict, evidence: dict, ctx: AskContext,
         parts.append(f"Quote budget: {note}.")
     if evidence.get("location_filter"):
         names = ", ".join(evidence["location_filter"])
-        parts.append(f"Evidence restricted to responses mentioning {names} "
-                     "(deterministic keyword match).")
+        note = (f"Evidence restricted to responses mentioning {names} "
+                "(deterministic keyword match")
+        implicit = evidence.get("location_filter_implicit_questions") or []
+        if implicit:
+            worded = ", ".join(
+                f'"{ctx.question_texts.get(q, q)}"' for q in implicit)
+            note += (f"; every response to {worded} counts as mentioning it — "
+                     "the question itself asks about that place")
+        parts.append(note + ").")
+    scope = route.get("question_scope") or []
+    if scope:
+        worded = ", ".join(f'"{ctx.question_texts.get(q, q)}"' for q in scope)
+        parts.append(f"Scope restricted by the analyst to survey question"
+                     f"{'s' if len(scope) > 1 else ''} {worded}.")
     denom_act = evidence.get("actionability_denominator")
     if denom_act:
         act = evidence.get("actionability_filter", "")
@@ -274,6 +510,15 @@ def process_note(route: dict, evidence: dict, ctx: AskContext,
             f"incident: {denom_evt['matching']} of {denom_evt['in_scope']} "
             f"in-scope responses. The rest did not describe one, which is not "
             f"the same as nothing having happened to them.")
+    denom_time = evidence.get("time_denominator")
+    if denom_time:
+        t = evidence.get("time_filter", "")
+        parts.append(
+            f"Evidence restricted to responses explicitly mentioning "
+            f"{t}time: {denom_time['matching']} of {denom_time['in_scope']} "
+            f"in-scope responses ({denom_time['mentioning']} named any time "
+            f"of day at all). The rest named no time, which says nothing "
+            f"about when their experience happened.")
     denom = evidence.get("location_denominator")
     if denom:
         parts.append(f"Grouped by place: {denom['naming_any']} of "
@@ -322,13 +567,18 @@ def answer(
         location_kinds=ctx.location_kinds or None,
         actionability_of=ctx.actionability or None,
         event_keys=ctx.events or None,
-        event_coded_keys=ctx.event_coded or None)
+        event_coded_keys=ctx.event_coded or None,
+        location_implicit_questions=ctx.location_implicit_questions or None,
+        time_day_keys=ctx.time_day or None,
+        time_night_keys=ctx.time_night or None,
+        time_mentioned_keys=ctx.time_mentioned or None)
     lex_counts = router.lexicon_counts(
         ctx.lexicon, route["lexicon_concepts"], ctx.keys_by_question, ctx.texts
     ) if route["lexicon_concepts"] else []
 
     raw_answer = router.run_synth(synth, question, route, evidence, ctx.index,
-                                  lex_counts, ctx.question_totals, description)
+                                  lex_counts, ctx.question_totals, description,
+                                  ctx.question_texts or None)
     answer_body, cited, n_invalid = router.resolve_citations(raw_answer, evidence)
     # the single-document form (body + Sources) goes to answer.md and the
     # CLI; the API returns the body and the sources as separate fields
@@ -444,10 +694,26 @@ def write_artifacts(*, run_id: str, question: str, ctx: AskContext, route: dict,
             "actionability_denominator": evidence.get("actionability_denominator"),
             "event_filter": evidence.get("event_filter") or "",
             "event_denominator": evidence.get("event_denominator"),
+            "time_filter": evidence.get("time_filter") or "",
+            "time_denominator": evidence.get("time_denominator"),
+            "location_filter_implicit_questions":
+                evidence.get("location_filter_implicit_questions") or [],
         },
         "invalid_citations": n_invalid_citations,
         "usage": usage_block([client] + ([synth_client] if synth_client else []),
                              elapsed),
+        # usage.elapsed_seconds covers the model phase only (it is timed inside
+        # answer(), which receives an already-loaded context). Loading that
+        # context reads every labels run and, on a cold cache, sweeps the whole
+        # corpus for locations — historically the larger half of an ask. Report
+        # both so neither number can be mistaken for the whole wait.
+        "timing": {
+            "context_load_seconds": round(ctx.load_seconds, 2),
+            "answer_seconds": round(elapsed, 2),
+            "total_seconds": round(ctx.load_seconds + elapsed, 2),
+            "location_members_source": ctx.location_members_source,
+            "context_source": ctx.context_source,
+        },
     }
     (out_dir / "manifest.json").write_text(
         json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -459,7 +725,9 @@ def route_from_selection(selected: list[dict], route_name: str, reason: str,
                          group_by: str = "category",
                          location_filter: list[str] | None = None,
                          actionability_filter: str = "",
-                         event_filter: str = "") -> dict:
+                         event_filter: str = "",
+                         time_filter: str = "",
+                         question_scope: list[str] | None = None) -> dict:
     """Rebuild a route dict from an analyst-approved selection (step 2 of the
     stateless flow). Unknown label ids raise ValueError — the server-side
     gate; the caller turns that into a 422. Unknown concepts are dropped."""
@@ -506,6 +774,14 @@ def route_from_selection(selected: list[dict], route_name: str, reason: str,
             f"empty (there is no filter for responses without an incident)")
     if evt and not ctx.events:
         evt = ""
+    t = router.normalize_time(time_filter)
+    if t == "invalid":
+        raise ValueError(
+            f"Unknown time_filter {time_filter!r}; expected \"day\", "
+            f"\"night\", or empty (there is no filter for responses naming "
+            f"no time of day)")
+    if t and not (ctx.time_day if t == "day" else ctx.time_night):
+        t = ""
     return {
         "answerable": True,
         "route": route_name,
@@ -518,4 +794,10 @@ def route_from_selection(selected: list[dict], route_name: str, reason: str,
                             if l in ctx.valid_locations],
         "actionability_filter": act,
         "event_filter": evt,
+        "time_filter": t,
+        # recorded for the manifest; the proposal step is where scope is
+        # ENFORCED — step 2 stays permissive so an analyst's deliberate
+        # out-of-scope addition is not rejected
+        "question_scope": [str(q).strip() for q in (question_scope or [])
+                           if str(q).strip()],
     }

@@ -90,6 +90,39 @@ def test_suggest_edits_covers_mechanical_cases():
     assert all(o["op"] in review.VALID_OPS for o in ops)
 
 
+def test_suggest_edits_output_applies_cleanly():
+    """The whole suggestion list must be something apply_edits accepts.
+
+    Merge candidates are pairwise, so they chain: on the real q6 taxonomy
+    A->B and B->C left a third pair A->C that resolved to from==into and
+    aborted the run. The same trap exists for a zero-count label that an
+    earlier op already merged away (L3 here) — delete would then reference
+    an unknown id. Both must be filtered out of the suggestions.
+    """
+    rep = review.diagnose(_tax(), _asg())
+    ops = review.suggest_edits(rep)
+    review.apply_edits(_tax(), _asg(), ops)   # raises if any op is invalid
+
+
+def test_suggest_edits_drops_transitively_collapsed_pairs():
+    rep = {
+        "duplicate_names": [],
+        "zero_count_labels": [],
+        # A->B and B->C make A and C the same label, so the A/C pair is a
+        # no-op by the time it is reached and must not be emitted.
+        "merge_candidates": [
+            {"label_a": "A", "label_b": "B", "count_a": 10, "count_b": 20,
+             "name_a": "a", "name_b": "b", "overlap": 0.9, "same_parent": True},
+            {"label_a": "B", "label_b": "C", "count_a": 20, "count_b": 30,
+             "name_a": "b", "name_b": "c", "overlap": 0.8, "same_parent": True},
+            {"label_a": "A", "label_b": "C", "count_a": 10, "count_b": 30,
+             "name_a": "a", "name_b": "c", "overlap": 0.7, "same_parent": True},
+        ],
+    }
+    ops = review.suggest_edits(rep)
+    assert [(o["from"], o["into"]) for o in ops] == [("A", "B"), ("B", "C")]
+
+
 def test_render_report_contains_evidence():
     rep = review.diagnose(_tax(), _asg())
     md = review.render_report(_tax(), rep, {"k9": "Homeless", "k10": "thieves"})

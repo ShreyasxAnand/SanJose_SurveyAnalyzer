@@ -9,6 +9,16 @@ __pycache__/
 # Local-first data (uploads, exports, sqlite db) — never commit survey data
 /data/
 
+# Loose spreadsheets dropped at the repo root while testing ingest are survey
+# data too — the /data/ rule doesn't cover them because they never move there.
+/*.xlsx
+/*.xls
+/*.csv
+
+# Throwaway benchmark/scratch scripts — findings get written up in the project notes,
+# the script itself hardcodes a local dataset id and won't run for anyone else.
+backend/ab.py
+
 # Node
 node_modules/
 frontend/dist/

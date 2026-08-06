@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import sys
 import threading
 import time
 import urllib.error
@@ -22,6 +23,17 @@ RETRYABLE_HTTP = {429, 500, 502, 503, 504}
 # hundreds of calls across 8 workers, so 429 bursts are the expected case,
 # not an anomaly.
 MAX_ATTEMPTS = 6
+# Past this, a caller is sitting in front of a screen wondering whether the app
+# has frozen. Retries and slow calls were previously silent, so "slow" and
+# "hung" looked identical from outside — the whole point of these warnings.
+SLOW_CALL_SECONDS = 8.0
+
+
+def _warn(message: str) -> None:
+    """One line to stderr. Not `logging`: these are for whoever is watching the
+    uvicorn console or a pipeline stage's log.txt, and both capture stderr
+    verbatim already."""
+    print(f"  [llm] {message}", file=sys.stderr, flush=True)
 
 # The workhorse for anything whose call count scales with the corpus —
 # induction MAP/ASSIGN/DEDUP and labeling. Hundreds to thousands of calls.
@@ -173,6 +185,8 @@ class GeminiClient:
         timeout_s: int = 240,
         seed: int | None = 7,
         min_interval_s: float = 0.1,
+        max_attempts: int = MAX_ATTEMPTS,
+        timeouts: tuple[int, ...] | None = None,
     ) -> None:
         # Pinned to a concrete version, not a "-latest" alias: the manifest
         # records model_id so a run can be reproduced, which an alias silently
@@ -188,6 +202,20 @@ class GeminiClient:
         self.temperature = temperature
         self.max_output_tokens = max_output_tokens
         self.timeout_s = timeout_s
+        # Batch stages want to ride out a bad patch — re-paying for a 500-row
+        # labeling batch costs more than waiting. An interactive ask wants the
+        # opposite: bound the worst case, because a person is watching. Both
+        # knobs together set that worst case (attempts x timeout + backoff).
+        self.max_attempts = max(1, max_attempts)
+        # Per-attempt timeouts, shortest first. Gemini's observed failure mode
+        # is a response that is SLOW, not one that never comes: a stalled ROUTE
+        # call measured 169.9s and then SUCCEEDED, while the same prompt ran
+        # 1.49s on ten other tries. A flat short timeout is therefore actively
+        # harmful — it aborts a call that was going to work, and retrying hits
+        # the same slow patch (three 30s attempts in a row is a real 502 this
+        # produced). Escalating gives a dead connection a fast retry and a slow
+        # one the time it actually needs.
+        self.timeouts = tuple(timeouts) if timeouts else None
         # Temperature 0 alone does NOT make Gemini deterministic — the API
         # documents seed as the reproducibility knob. Even with it, Google
         # only offers best-effort determinism, so this narrows run-to-run
@@ -211,6 +239,13 @@ class GeminiClient:
             self._next_ok = max(now, self._next_ok) + self.min_interval_s
         if wait > 0:
             time.sleep(wait)
+
+    def _timeout_for(self, attempt: int) -> int:
+        """This attempt's read timeout. Without an explicit schedule every
+        attempt gets timeout_s, which is what the batch stages want."""
+        if not self.timeouts:
+            return self.timeout_s
+        return self.timeouts[min(attempt - 1, len(self.timeouts) - 1)]
 
     def _backoff_delay(self, attempt: int, http_error: urllib.error.HTTPError | None = None) -> float:
         """Exponential backoff with jitter; a 429's Retry-After header, when
@@ -267,7 +302,7 @@ class GeminiClient:
     def _post_with_retries(self, body: dict) -> dict:
         data = json.dumps(body).encode("utf-8")
         last_err: Exception | None = None
-        for attempt in range(1, MAX_ATTEMPTS + 1):
+        for attempt in range(1, self.max_attempts + 1):
             self._throttle()
             req = urllib.request.Request(
                 self._url(),
@@ -276,23 +311,41 @@ class GeminiClient:
                 method="POST",
             )
             try:
-                with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
-                    return json.loads(resp.read().decode("utf-8"))
+                started = time.time()
+                with urllib.request.urlopen(req, timeout=self._timeout_for(attempt)) as resp:
+                    payload = json.loads(resp.read().decode("utf-8"))
+                # A retrying or merely slow call used to be indistinguishable
+                # from a hang: nothing was printed, and timeout_s is 240s across
+                # 6 attempts. Say so once it is past the point where a human
+                # starts wondering whether the app is broken.
+                elapsed = time.time() - started
+                if elapsed >= SLOW_CALL_SECONDS or attempt > 1:
+                    _warn(f"{self.model_id}: {elapsed:.1f}s"
+                          + (f" (attempt {attempt}/{self.max_attempts})"
+                             if attempt > 1 else ""))
+                return payload
             except urllib.error.HTTPError as e:
                 detail = ""
                 try:
                     detail = e.read().decode("utf-8", errors="replace")[:500]
                 except Exception:
                     pass
-                if e.code in RETRYABLE_HTTP and attempt < MAX_ATTEMPTS:
+                if e.code in RETRYABLE_HTTP and attempt < self.max_attempts:
                     last_err = e
-                    time.sleep(self._backoff_delay(attempt, e))
+                    delay = self._backoff_delay(attempt, e)
+                    _warn(f"HTTP {e.code} from {self.model_id}; retrying in "
+                          f"{delay:.1f}s (attempt {attempt}/{self.max_attempts})")
+                    time.sleep(delay)
                     continue
                 raise RuntimeError(f"Gemini HTTP {e.code}: {detail}") from e
             except (urllib.error.URLError, TimeoutError) as e:
-                if attempt < MAX_ATTEMPTS:
+                if attempt < self.max_attempts:
                     last_err = e
-                    time.sleep(self._backoff_delay(attempt))
+                    delay = self._backoff_delay(attempt)
+                    _warn(f"{type(e).__name__} from {self.model_id} "
+                          f"({e}); retrying in {delay:.1f}s "
+                          f"(attempt {attempt}/{self.max_attempts})")
+                    time.sleep(delay)
                     continue
-                raise RuntimeError(f"Gemini request failed after {MAX_ATTEMPTS} attempts: {e}") from e
+                raise RuntimeError(f"Gemini request failed after {self.max_attempts} attempts: {e}") from e
         raise RuntimeError(f"Gemini request failed: {last_err}")

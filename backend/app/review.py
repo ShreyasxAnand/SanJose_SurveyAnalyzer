@@ -174,22 +174,49 @@ def render_report(taxonomy: dict, report: dict, texts: dict[str, str]) -> str:
 
 def suggest_edits(report: dict) -> list[dict]:
     """Ready-to-copy ops for the mechanical cases. Suggestions only — the
-    human promotes them to `edits`; nothing is ever auto-applied."""
+    human promotes them to `edits`; nothing is ever auto-applied.
+
+    Merge candidates are *pairwise*, so a set of them can chain: A->B and
+    B->C make A and C the same label, and a later A->C pair is then a
+    from==into no-op that `apply_edits` rejects outright (correctly — a
+    silent no-op in an approved edits file is worse than a loud failure).
+    Resolving each pair through the merges already suggested keeps the list
+    something the applier will accept as a whole."""
     out = []
+    survivor: dict[str, str] = {}
+
+    def _resolve(lid: str) -> str:
+        seen = set()
+        while lid in survivor:
+            if lid in seen:            # unreachable while we only ever point
+                break                  # a merged id at its survivor, but the
+            seen.add(lid)              # loop must terminate regardless
+            lid = survivor[lid]
+        return lid
+
+    def _merge(src: str, dst: str, evidence: str) -> None:
+        src, dst = _resolve(src), _resolve(dst)
+        if src == dst:                 # already the same label after chaining
+            return
+        survivor[src] = dst
+        out.append({"op": "merge", "from": src, "into": dst,
+                    "_evidence": evidence})
+
     for d in report["duplicate_names"]:
         keep, *rest = d["label_ids"]
         for lid in rest:
-            out.append({"op": "merge", "from": lid, "into": keep,
-                        "_evidence": f"identical name {d['name']!r}"})
+            _merge(lid, keep, f"identical name {d['name']!r}")
     for c in report["merge_candidates"]:
         if c["same_parent"] and c["overlap"] >= 0.60:
             small, big = ((c["label_a"], c["label_b"])
                           if c["count_a"] <= c["count_b"]
                           else (c["label_b"], c["label_a"]))
-            out.append({"op": "merge", "from": small, "into": big,
-                        "_evidence": f"{c['overlap']:.0%} overlap, same parent "
-                                     f"({c['name_a']!r} / {c['name_b']!r})"})
+            _merge(small, big,
+                   f"{c['overlap']:.0%} overlap, same parent "
+                   f"({c['name_a']!r} / {c['name_b']!r})")
     for z in report["zero_count_labels"]:
+        if _resolve(z["label_id"]) != z["label_id"]:
+            continue                   # already merged away by an op above
         out.append({"op": "delete", "label_id": z["label_id"],
                     "_evidence": f"zero responses ({z['name']!r})"})
     return out

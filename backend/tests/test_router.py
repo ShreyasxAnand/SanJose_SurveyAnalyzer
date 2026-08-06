@@ -72,7 +72,7 @@ def test_gather_evidence_counts_full_but_samples_quotes():
                                 max_quotes_per_label=5, seed=1)
     assert ev["selection"][0]["count"] == 30            # count covers everything
     assert len(ev["quotes"]) == 5                       # quotes are sampled
-    assert ev["sampling_notes"]["2_001"] == "showing 5 of 30"
+    assert ev["sampling_notes"]["2_001"].startswith("showing 5 of 30")
     assert [q["n"] for q in ev["quotes"]] == [1, 2, 3, 4, 5]
     # deterministic across runs
     ev2 = router.gather_evidence(route, INDEX, members, texts,
@@ -110,8 +110,10 @@ def _synthetic(n_labels: int, members_per_label):
 def test_quote_budget_caps_total_beyond_min_floor():
     # 45 candidates: the old decrement loop stopped at the floor of 3/label
     # (135 quotes, silently over the 120 budget). Now 120 // 45 = 2 per label.
+    # Budget passed explicitly — this pins the arithmetic, not the default.
     index, members, texts, cands = _synthetic(45, 30)
-    ev = router.gather_evidence(_route(cands), index, members, texts, seed=1)
+    ev = router.gather_evidence(_route(cands), index, members, texts, seed=1,
+                                max_total_quotes=120)
     assert len(ev["quotes"]) <= 120
     assert len(ev["quotes"]) == 45 * 2
     assert "_quote_budget" in ev["sampling_notes"]
@@ -127,7 +129,8 @@ def test_quote_budget_more_candidates_than_budget():
     # categories get a quote (1 each); every count is still reported.
     index, members, texts, cands = _synthetic(
         150, lambda i: 2 if i < 30 else 5)
-    ev = router.gather_evidence(_route(cands), index, members, texts, seed=1)
+    ev = router.gather_evidence(_route(cands), index, members, texts, seed=1,
+                                max_total_quotes=120)
     assert len(ev["quotes"]) == 120
     quoted_lids = {q["label_id"] for q in ev["quotes"]}
     assert quoted_lids == {f"2_{i:03d}" for i in range(30, 150)}  # the largest
@@ -146,9 +149,161 @@ def test_quote_budget_location_mode_caps_total():
     route["group_by"] = "location"
     ev = router.gather_evidence(route, index, members, texts, seed=1,
                                 location_members=location_members,
-                                location_kinds={})
+                                location_kinds={}, max_total_quotes=120)
     assert len(ev["quotes"]) <= 120
     assert "_quote_budget:location" in ev["sampling_notes"]
+
+
+def test_composite_sample_guarantees_rare_signals():
+    # 60 members, budget 10: a uniform draw misses each 1-of-60 signal ~84%
+    # of the time. Coverage picks must include every distinct signal carrier:
+    # the one co-labeled response, the one naming a place, the one marked
+    # specific, and the one recounting an incident.
+    members = {"2_001": [f"1:2:{i:02d}" for i in range(60)],
+               "2_002": ["1:2:59"]}                       # rare co-label
+    texts = {k: "same length text" for k in members["2_001"]}
+    route = _route([{"label_id": "2_001", "relevance": "high", "rationale": ""}])
+    ev = router.gather_evidence(
+        route, INDEX, members, texts,
+        max_quotes_per_label=10, seed=1,
+        location_members={"downtown": ["1:2:58"]},        # rare place mention
+        actionability_of={"1:2:57": "specific"},          # rare concrete ask
+        event_keys={"1:2:56"}, event_coded_keys=set(members["2_001"]))
+    quoted = {q["response_key"] for q in ev["quotes"]}
+    assert {"1:2:56", "1:2:57", "1:2:58", "1:2:59"} <= quoted
+    assert len(ev["quotes"]) == 10
+    note = ev["sampling_notes"]["2_001"]
+    assert note.startswith("showing 10 of 60") and "signal tags" in note
+    # deterministic across runs
+    ev2 = router.gather_evidence(
+        route, INDEX, members, texts,
+        max_quotes_per_label=10, seed=1,
+        location_members={"downtown": ["1:2:58"]},
+        actionability_of={"1:2:57": "specific"},
+        event_keys={"1:2:56"}, event_coded_keys=set(members["2_001"]))
+    assert [q["response_key"] for q in ev2["quotes"]] == \
+           [q["response_key"] for q in ev["quotes"]]
+
+
+def test_composite_sample_no_sampling_below_budget():
+    keys = ["b", "a", "c"]
+    picked, detail = router.composite_sample(
+        keys, 5, __import__("random").Random(1), lambda k: {"len:short"})
+    assert picked == ["a", "b", "c"] and detail is None
+
+
+def test_composite_sample_splits_budget_and_discloses():
+    # 20 keys carrying 4 distinct tags in a 6-key coverage half: coverage
+    # stops once tags are exhausted and the uniform fill takes the rest.
+    tags = {f"k{i:02d}": {f"tag{i % 4}"} for i in range(20)}
+    picked, detail = router.composite_sample(
+        sorted(tags), 12, __import__("random").Random(1), lambda k: tags[k])
+    assert len(picked) == 12
+    assert detail["tags_covered"] == detail["tags_total"] == 4
+    assert detail["coverage_picks"] == 4                  # one per distinct tag
+    assert detail["random_picks"] == 8
+
+
+def test_location_filter_implicit_question_not_starved():
+    # Every response to "changes to improve downtown" is about downtown by
+    # construction — the downtown filter must not drop the ones that didn't
+    # re-type the place name (found live: it cut q8 evidence ~87%).
+    index = {
+        "8_001": {"label_id": "8_001", "name": "Cleanliness", "parent_name": None,
+                  "question_id": "8"},
+        "6_001": {"label_id": "6_001", "name": "Crime", "parent_name": None,
+                  "question_id": "6"},
+    }
+    members = {"8_001": ["1:8:0", "1:8:1", "1:8:2"],
+               "6_001": ["1:6:0", "1:6:1"]}
+    texts = {k: "t" for ks in members.values() for k in ks}
+    route = _route([{"label_id": "8_001", "relevance": "high", "rationale": ""},
+                    {"label_id": "6_001", "relevance": "high", "rationale": ""}])
+    route["location_filter"] = ["downtown"]
+    # only 1:8:0 and 1:6:0 literally mention downtown
+    ev = router.gather_evidence(
+        route, index, members, texts,
+        location_members={"downtown": ["1:8:0", "1:6:0"]},
+        location_implicit_questions={"downtown": {"8"}})
+    # all of q8 survives (implicit); q6 is restricted to the literal mention
+    assert ev["selection"][0]["count"] == 3        # 8_001 whole
+    assert ev["selection"][1]["count"] == 1        # 6_001 filtered
+    assert ev["location_filter_implicit_questions"] == ["8"]
+    # without the implicit map, q8 is starved to its one literal mention
+    ev2 = router.gather_evidence(
+        route, index, members, texts,
+        location_members={"downtown": ["1:8:0", "1:6:0"]})
+    assert ev2["selection"][0]["count"] == 1
+    assert ev2["location_filter_implicit_questions"] == []
+
+
+def test_time_filter_denominators_and_restriction():
+    members = {"2_001": [f"1:2:{i}" for i in range(10)]}
+    texts = {k: "t" for k in members["2_001"]}
+    route = _route([{"label_id": "2_001", "relevance": "high", "rationale": ""}])
+    route["time_filter"] = "night"
+    ev = router.gather_evidence(
+        route, INDEX, members, texts,
+        time_night_keys={"1:2:0", "1:2:1"},
+        time_day_keys={"1:2:2"},
+        time_mentioned_keys={"1:2:0", "1:2:1", "1:2:2"})
+    assert ev["time_denominator"] == {"in_scope": 10, "mentioning": 3,
+                                      "matching": 2}
+    assert ev["selection"][0]["count"] == 2
+    assert {q["response_key"] for q in ev["quotes"]} == {"1:2:0", "1:2:1"}
+    block = router.render_counts_block(ev, [], {})
+    assert "explicitly mentioning nighttime: 2" in block
+    assert "never report it as the other time of day" in block
+
+
+def test_normalize_time_and_availability_guard():
+    assert router.normalize_time("night") == "night"
+    assert router.normalize_time("Daytime") == "day"
+    assert router.normalize_time("") == ""
+    assert router.normalize_time("dawn patrol") == "invalid"
+    raw = json.dumps({"answerable": True, "route": "retrieval", "reason": "",
+                      "candidates": [{"label_id": "2_001", "relevance": "high",
+                                      "rationale": ""}],
+                      "time_filter": "night"})
+    route, stats = router.parse_route_output(raw, VALID_IDS, set(),
+                                             time_available=False)
+    assert route["time_filter"] == ""
+    assert any("time_filter requested" in w for w in stats["warnings"])
+
+
+def test_counts_block_names_the_survey_question():
+    members = {"2_001": ["1:2:0"], "4_001": ["1:4:0"]}
+    texts = {"1:2:0": "a", "1:4:0": "b"}
+    route = _route([{"label_id": "2_001", "relevance": "high", "rationale": ""},
+                    {"label_id": "4_001", "relevance": "high", "rationale": ""}])
+    ev = router.gather_evidence(route, INDEX, members, texts)
+    block = router.render_counts_block(
+        ev, [], {"2": 100, "4": 50},
+        question_texts={"2": "what feels unsafe?", "4": "improve downtown?"})
+    assert 'question 2 ("what feels unsafe?")' in block
+    assert 'question 4 ("improve downtown?")' in block
+    # cross-question evidence also switches on the provenance guidance
+    system, _ = router.build_synth_prompts(
+        "q", route, ev, INDEX, [], {"2": 100, "4": 50},
+        question_texts={"2": "what feels unsafe?", "4": "improve downtown?"})
+    assert "MORE THAN ONE survey question" in system
+
+
+def test_resolve_citations_comma_groups():
+    # flash-lite sometimes writes [1, 3] instead of [1][3]. Those citations
+    # used to parse as NOTHING — absent from Sources AND not counted invalid
+    # (2026-08-03 numeric-integrity audit, ds7 "Top 5 common issues?" run:
+    # 6 comma-grouped citations, Sources listed 2 quotes, invalid said 0).
+    evidence = {"quotes": [
+        {"n": 1, "response_key": "1:2:0", "label_id": "2_001", "text": "a"},
+        {"n": 2, "response_key": "1:2:1", "label_id": "2_001", "text": "b"},
+        {"n": 3, "response_key": "1:2:2", "label_id": "2_001", "text": "c"},
+    ]}
+    answer, cited, invalid = router.resolve_citations(
+        "Issues persist [1, 3], and closures lag [2, 9].", evidence)
+    assert [q["n"] for q in cited] == [1, 3, 2]
+    assert invalid == 1                       # the 9, flagged not dropped
+    assert "1 citation(s)" in answer
 
 
 def test_resolve_citations():
@@ -262,6 +417,51 @@ def test_gather_evidence_group_by_location():
     quotes = router.render_quotes_block(ev, INDEX)
     assert quotes.startswith("downtown (all 2):")
     assert "streets" not in quotes.split("downtown")[0]
+
+
+def test_group_by_location_discloses_quotes_withheld_as_duplicates():
+    """A response naming two places is quoted once, under the higher-count
+    place. The second place's header must NOT then read "all n" — that tells
+    the synth model it has that place's complete evidence when it does not."""
+    members = {"2_001": ["1:2:0", "1:2:1", "1:2:2"]}
+    texts = {"1:2:0": "downtown park", "1:2:1": "downtown", "1:2:2": "park"}
+    location_members = {"downtown": ["1:2:0", "1:2:1"],
+                        "park": ["1:2:0", "1:2:2"]}
+    route = _loc_route([{"label_id": "2_001", "relevance": "high", "rationale": ""}],
+                       group_by="location")
+    ev = router.gather_evidence(route, INDEX, members, texts,
+                                location_members=location_members,
+                                location_kinds={"downtown": "named",
+                                                "park": "type"})
+    # counts still cover the full data — 1:2:0 is in both places
+    assert ev["location_counts"] == [
+        {"name": "downtown", "kind": "named", "count": 2},
+        {"name": "park", "kind": "type", "count": 2}]
+    # ...but only one of park's two responses is quoted here
+    assert [(q["location"], q["response_key"]) for q in ev["quotes"]] == [
+        ("downtown", "1:2:0"), ("downtown", "1:2:1"), ("park", "1:2:2")]
+    assert ev["sampling_notes"]["loc:park"] == \
+        "showing 1 of 2; 1 already quoted under another place"
+    assert "loc:downtown" not in ev["sampling_notes"]   # downtown really is all
+    quotes = router.render_quotes_block(ev, INDEX)
+    assert "park (showing 1 of 2; 1 already quoted under another place):" in quotes
+    assert "park (all 2):" not in quotes
+    assert quotes.startswith("downtown (all 2):")
+
+
+def test_category_quotes_disclose_members_with_no_stored_text():
+    """A member the corpus has no text for is counted but unquotable. Without
+    a note the header claimed "all 3" while showing 2."""
+    members = {"2_001": ["1:2:0", "1:2:1", "1:2:9"]}
+    texts = {"1:2:0": "a", "1:2:1": "b"}          # 1:2:9 dropped by a re-ingest
+    route = _route([{"label_id": "2_001", "relevance": "high", "rationale": ""}])
+    ev = router.gather_evidence(route, INDEX, members, texts)
+    assert ev["selection"][0]["count"] == 3       # the count is unchanged
+    assert ev["sampling_notes"]["2_001"] == \
+        "showing 2 of 3; 1 have no stored response text"
+    quotes = router.render_quotes_block(ev, INDEX)
+    assert "(showing 2 of 3; 1 have no stored response text):" in quotes
+    assert "(all 3)" not in quotes
 
 
 def test_synth_guidance_mentions_location_dimension():

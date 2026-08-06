@@ -1,38 +1,107 @@
 import { useEffect, useState } from "react";
-import { exportDataset, listDatasets, selectColumns, uploadDataset } from "./api";
-import type { DatasetOut, UploadResponse } from "./types";
+import Pipeline from "./Pipeline";
+import {
+  appendToDataset,
+  discardDataset,
+  discardDatasetOnClose,
+  exportDataset,
+  getDataset,
+  selectColumns,
+  uploadDataset,
+} from "./api";
+import type {
+  AppendResponse,
+  DatasetMatch,
+  DatasetOut,
+  UploadResponse,
+} from "./types";
 import Ask from "./Ask";
+import Catalog from "./Catalog";
+
+/* The analyst chose upfront whether this file is a new dataset or an append
+   to a known target; the server's duplicate check still runs either way as a
+   safety net on the "new" path. */
+type IngestMode =
+  | { kind: "new" }
+  | { kind: "append"; targetId: number; targetName: string };
 
 type Step =
-  | { name: "upload" }
+  | { name: "choose-file"; mode: IngestMode }
+  | { name: "match-found"; upload: UploadResponse }
   | { name: "select-columns"; upload: UploadResponse }
-  | { name: "done"; dataset: DatasetOut };
+  | { name: "append-confirm"; upload: UploadResponse; targetId: number; targetName: string }
+  | { name: "done"; dataset: DatasetOut }
+  | { name: "append-done"; result: AppendResponse };
 
-type View = "ingest" | "ask";
+type View =
+  | { name: "catalog" }
+  | { name: "ingest"; step: Step }
+  | { name: "ask"; datasetId: number; datasetName: string };
+
+/* Steps during which a provisional dataset exists server-side (created by
+   upload, not yet consumed by commit/append/discard). */
+function provisionalUploadId(view: View): number | null {
+  if (view.name !== "ingest") return null;
+  const step = view.step;
+  if (
+    step.name === "match-found" ||
+    step.name === "select-columns" ||
+    step.name === "append-confirm"
+  ) {
+    return step.upload.dataset_id;
+  }
+  return null;
+}
 
 export default function App() {
-  const [view, setView] = useState<View>("ingest");
-  const [step, setStep] = useState<Step>({ name: "upload" });
+  const [view, setView] = useState<View>({ name: "catalog" });
   const [error, setError] = useState<string | null>(null);
+
+  const setStep = (step: Step) => setView({ name: "ingest", step });
+
+  /* While a provisional upload is on the server, closing the tab discards it
+     so abandoned uploads don't linger on disk. The server 409s on anything
+     already ingested, so this can only ever remove a provisional. */
+  const provisionalId = provisionalUploadId(view);
+  const step = view.name === "ingest" ? view.step : null;
+  useEffect(() => {
+    if (provisionalId === null) return;
+    const handler = () => discardDatasetOnClose(provisionalId);
+    window.addEventListener("pagehide", handler);
+    return () => window.removeEventListener("pagehide", handler);
+  }, [provisionalId]);
+
+  async function handleBack() {
+    /* Leaving mid-flow with a provisional on the server discards it — the
+       button says so, so no confirm dialog is needed. */
+    if (provisionalId !== null) {
+      try {
+        await discardDataset(provisionalId);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
+        return;
+      }
+    }
+    setView({ name: "catalog" });
+  }
 
   return (
     <main style={{ maxWidth: 720, margin: "2rem auto", fontFamily: "sans-serif" }}>
       <h1>Survey Analyzer</h1>
-      <nav style={{ marginBottom: "1.5rem" }}>
-        {(["ingest", "ask"] as const).map((v) => (
-          <button
-            key={v}
-            onClick={() => setView(v)}
-            style={{
-              marginRight: "0.5rem",
-              fontWeight: view === v ? "bold" : "normal",
-              textDecoration: view === v ? "underline" : "none",
-            }}
-          >
-            {v === "ingest" ? "Ingest" : "Ask"}
+      {view.name !== "catalog" && (
+        <p>
+          <button onClick={handleBack}>
+            {provisionalId !== null
+              ? "← Discard upload & back to datasets"
+              : "← All datasets"}
           </button>
-        ))}
-      </nav>
+          {view.name === "ask" && (
+            <span style={{ marginLeft: "0.75rem", fontWeight: "bold" }}>
+              {view.datasetName}
+            </span>
+          )}
+        </p>
+      )}
       {error && (
         <p style={{ color: "crimson" }}>
           {error}{" "}
@@ -40,16 +109,89 @@ export default function App() {
         </p>
       )}
 
-      {view === "ask" && <AskView onError={setError} />}
-
-      {view === "ingest" && step.name === "upload" && (
-        <UploadStep
-          onUploaded={(upload) => setStep({ name: "select-columns", upload })}
+      {view.name === "catalog" && (
+        <Catalog
+          onOpenDataset={(d) =>
+            setView({ name: "ask", datasetId: d.id, datasetName: d.name })
+          }
+          onStartNewUpload={() => setStep({ name: "choose-file", mode: { kind: "new" } })}
+          onStartAppend={(target) =>
+            setStep({
+              name: "choose-file",
+              mode: { kind: "append", targetId: target.id, targetName: target.name },
+            })
+          }
           onError={setError}
         />
       )}
 
-      {view === "ingest" && step.name === "select-columns" && (
+      {view.name === "ask" && (
+        // key resets in-flight ask state when the dataset changes
+        <Ask key={view.datasetId} datasetId={view.datasetId} onError={setError} />
+      )}
+
+      {/* step is a const so TS narrowing survives into the JSX callbacks
+          below (view.step property access doesn't). */}
+      {step?.name === "choose-file" && (
+        <ChooseFileStep
+          mode={step.mode}
+          onUploaded={(upload, mode) => {
+            if (mode.kind === "append") {
+              /* The target was chosen upfront; even a zero-overlap file goes
+                 to the confirm screen — append recomputes dedup server-side. */
+              setStep({
+                name: "append-confirm",
+                upload,
+                targetId: mode.targetId,
+                targetName: mode.targetName,
+              });
+            } else {
+              setStep(
+                upload.duplicate_check.outcome === "none" &&
+                  upload.duplicate_check.column_matches.length === 0
+                  ? { name: "select-columns", upload }
+                  : { name: "match-found", upload },
+              );
+            }
+          }}
+          onError={setError}
+        />
+      )}
+
+      {step?.name === "match-found" && (
+        <MatchStep
+          upload={step.upload}
+          onAppendChosen={(upload, m) =>
+            setStep({
+              name: "append-confirm",
+              upload,
+              targetId: m.dataset_id,
+              targetName: m.dataset_name,
+            })
+          }
+          onIngestAsNew={() =>
+            setStep({ name: "select-columns", upload: step.upload })
+          }
+          onDiscarded={() => setView({ name: "catalog" })}
+          onError={setError}
+        />
+      )}
+
+      {step?.name === "append-confirm" && (
+        <AppendConfirmStep
+          upload={step.upload}
+          targetId={step.targetId}
+          targetName={step.targetName}
+          onAppendDone={(result) => setStep({ name: "append-done", result })}
+          onIngestAsNew={() =>
+            setStep({ name: "select-columns", upload: step.upload })
+          }
+          onDiscarded={() => setView({ name: "catalog" })}
+          onError={setError}
+        />
+      )}
+
+      {step?.name === "select-columns" && (
         <ColumnSelectStep
           upload={step.upload}
           onDone={(dataset) => setStep({ name: "done", dataset })}
@@ -57,78 +199,43 @@ export default function App() {
         />
       )}
 
-      {view === "ingest" && step.name === "done" && (
+      {step?.name === "done" && (
         <DoneStep
           dataset={step.dataset}
           onDatasetChange={(dataset) => setStep({ name: "done", dataset })}
           onError={setError}
         />
       )}
+
+      {step?.name === "append-done" && (
+        <AppendDoneStep result={step.result} onError={setError} />
+      )}
     </main>
   );
 }
 
-function AskView({ onError }: { onError: (msg: string) => void }) {
-  const [datasets, setDatasets] = useState<DatasetOut[] | null>(null);
-  const [datasetId, setDatasetId] = useState<number | null>(null);
-
-  useEffect(() => {
-    listDatasets()
-      .then((ds) => {
-        setDatasets(ds);
-        if (ds.length > 0) setDatasetId((id) => id ?? ds[0].id);
-      })
-      .catch((err) =>
-        onError(err instanceof Error ? err.message : String(err)),
-      );
-  }, [onError]);
-
-  if (datasets === null) return <p>Loading datasets…</p>;
-  if (datasets.length === 0) {
-    return <p>No datasets yet — ingest a survey file first.</p>;
-  }
-
-  return (
-    <div>
-      {datasets.length > 1 && (
-        <p>
-          Dataset:{" "}
-          <select
-            value={datasetId ?? ""}
-            onChange={(e) => setDatasetId(Number(e.target.value))}
-          >
-            {datasets.map((d) => (
-              <option key={d.id} value={d.id}>
-                {d.name}
-              </option>
-            ))}
-          </select>
-        </p>
-      )}
-      {datasetId !== null && (
-        // key resets in-flight ask state when the dataset changes
-        <Ask key={datasetId} datasetId={datasetId} onError={onError} />
-      )}
-    </div>
-  );
-}
-
-function UploadStep({
-  onUploaded,
+function MatchStep({
+  upload,
+  onAppendChosen,
+  onIngestAsNew,
+  onDiscarded,
   onError,
 }: {
-  onUploaded: (u: UploadResponse) => void;
+  upload: UploadResponse;
+  onAppendChosen: (upload: UploadResponse, m: DatasetMatch) => void;
+  onIngestAsNew: () => void;
+  onDiscarded: () => void;
   onError: (msg: string) => void;
 }) {
   const [busy, setBusy] = useState(false);
+  const check = upload.duplicate_check;
+  const best = check.matches[0];
 
-  async function handleChange(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0];
-    if (!file) return;
+  async function handleDiscard() {
     setBusy(true);
     try {
-      const upload = await uploadDataset(file);
-      onUploaded(upload);
+      await discardDataset(upload.dataset_id);
+      onDiscarded();
     } catch (err) {
       onError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -138,8 +245,371 @@ function UploadStep({
 
   return (
     <section>
+      {check.outcome === "none" ? (
+        /* Column-level match: no row is identical (the column set differs,
+           which changes every row hash) but most columns are byte-identical
+           to a file already ingested. Appending is impossible; the choice is
+           discard vs knowingly re-processing data the system already holds. */
+        <>
+          <p>
+            <strong>{upload.original_filename}</strong> looks like data that is
+            already ingested, with a different column set:
+          </p>
+          <ul>
+            {check.column_matches.map((m) => (
+              <li key={m.dataset_id} style={{ marginBottom: "0.75rem" }}>
+                {m.matched_columns.length + m.renamed_columns.length} column
+                {m.matched_columns.length + m.renamed_columns.length === 1
+                  ? " is"
+                  : "s are"}{" "}
+                identical to <strong>{m.upload_filename}</strong> in{" "}
+                <strong>{m.dataset_name}</strong> (dataset #{m.dataset_id},{" "}
+                {m.upload_rows} rows).
+                {m.missing_columns.length > 0 && (
+                  <div>
+                    Missing from this file: {m.missing_columns.join(", ")}
+                  </div>
+                )}
+                {m.added_columns.length > 0 && (
+                  <div>New in this file: {m.added_columns.join(", ")}</div>
+                )}
+                {m.renamed_columns.length > 0 && (
+                  <div>
+                    Renamed:{" "}
+                    {m.renamed_columns
+                      .map((r) => `${r.stored_name} → ${r.file_name}`)
+                      .join(", ")}
+                  </div>
+                )}
+                {m.changed_columns.length > 0 && (
+                  <div>
+                    Same name but different content:{" "}
+                    {m.changed_columns.join(", ")}
+                  </div>
+                )}
+              </li>
+            ))}
+          </ul>
+          <p style={{ color: "#b45309" }}>
+            Appending isn't possible (no whole row matches when the column set
+            differs). Ingesting as new will run the full pipeline again on
+            responses that were already processed.
+          </p>
+          <p>
+            <button onClick={handleDiscard} disabled={busy}>
+              Discard this upload
+            </button>{" "}
+            <button onClick={onIngestAsNew} disabled={busy}>
+              Ingest as a separate new dataset anyway
+            </button>
+          </p>
+        </>
+      ) : check.outcome === "exact" ? (
+        <>
+          <p>
+            All {best.file_rows} rows of <strong>{upload.original_filename}</strong>{" "}
+            are already ingested as <strong>{best.dataset_name}</strong> (dataset
+            #{best.dataset_id}). Appending would add nothing.
+          </p>
+          <p>
+            <button onClick={handleDiscard} disabled={busy}>
+              Discard this upload
+            </button>{" "}
+            <button onClick={onIngestAsNew} disabled={busy}>
+              Ingest as a separate new dataset anyway
+            </button>
+          </p>
+        </>
+      ) : (
+        <>
+          <p>
+            <strong>{upload.original_filename}</strong> overlaps existing data:
+          </p>
+          <ul>
+            {check.matches.map((m) => (
+              <li key={m.dataset_id} style={{ marginBottom: "0.75rem" }}>
+                <strong>{m.dataset_name}</strong> (dataset #{m.dataset_id}) already
+                holds {m.matched_rows} of this file's {m.file_rows} rows.
+                Appending skips those {m.matched_rows} duplicates and adds the{" "}
+                {m.file_rows - m.matched_rows} new rows — only the new rows get
+                labeled, reusing the existing categories.
+                {!m.columns_compatible && (
+                  <div style={{ color: "#b45309", fontSize: "0.9em" }}>
+                    Can't append: the file is missing this dataset's question
+                    column{m.missing_columns.length === 1 ? "" : "s"}{" "}
+                    {m.missing_columns.join(", ")}.
+                  </div>
+                )}
+                <div style={{ marginTop: "0.25rem" }}>
+                  <button
+                    onClick={() => onAppendChosen(upload, m)}
+                    disabled={busy || !m.columns_compatible}
+                  >
+                    Append to {m.dataset_name}…
+                  </button>
+                </div>
+              </li>
+            ))}
+          </ul>
+          <p>
+            <button onClick={onIngestAsNew} disabled={busy}>
+              Ingest as a separate new dataset
+            </button>{" "}
+            <button onClick={handleDiscard} disabled={busy}>
+              Discard upload
+            </button>
+          </p>
+        </>
+      )}
+    </section>
+  );
+}
+
+function AppendConfirmStep({
+  upload,
+  targetId,
+  targetName,
+  onAppendDone,
+  onIngestAsNew,
+  onDiscarded,
+  onError,
+}: {
+  upload: UploadResponse;
+  targetId: number;
+  targetName: string;
+  onAppendDone: (r: AppendResponse) => void;
+  onIngestAsNew: () => void;
+  onDiscarded: () => void;
+  onError: (msg: string) => void;
+}) {
+  const [target, setTarget] = useState<DatasetOut | null>(null);
+  const [note, setNote] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    getDataset(targetId)
+      .then(setTarget)
+      .catch((err) => onError(err instanceof Error ? err.message : String(err)));
+  }, [targetId, onError]);
+
+  /* Fully knowable from data already in hand, so surface it before submit —
+     the backend 400 remains the real gate. */
+  const uploadColumns = new Set(upload.columns.map((c) => c.column));
+  const missingColumns =
+    target?.questions
+      .map((q) => q.source_column)
+      .filter((col) => !uploadColumns.has(col)) ?? [];
+
+  /* Overlap numbers only if the upload-time duplicate check actually
+     computed them for this target — never invented. */
+  const match = upload.duplicate_check.matches.find(
+    (m) => m.dataset_id === targetId,
+  );
+
+  async function handleAppend() {
+    setBusy(true);
+    try {
+      onAppendDone(
+        await appendToDataset(targetId, upload.dataset_id, note.trim() || null),
+      );
+    } catch (err) {
+      onError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleDiscard() {
+    setBusy(true);
+    try {
+      await discardDataset(upload.dataset_id);
+      onDiscarded();
+    } catch (err) {
+      onError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section>
+      <p>
+        Append <strong>{upload.original_filename}</strong> ({upload.row_count}{" "}
+        rows) to <strong>{targetName}</strong>.
+      </p>
+
+      {target === null ? (
+        <p>Checking column compatibility…</p>
+      ) : missingColumns.length > 0 ? (
+        <p style={{ color: "#b45309" }}>
+          Can't append: the file is missing this dataset's question column
+          {missingColumns.length === 1 ? "" : "s"} {missingColumns.join(", ")}.
+        </p>
+      ) : match ? (
+        <p>
+          <strong>{targetName}</strong> already holds {match.matched_rows} of
+          this file's {match.file_rows} rows. Appending will skip those
+          duplicates and add the {match.file_rows - match.matched_rows} new rows
+          — only new rows get labeled, reusing the existing categories.
+        </p>
+      ) : (
+        <p>
+          No rows of this file matched {targetName} at upload time. The
+          duplicate check runs again at append time; any rows already held will
+          be skipped.
+        </p>
+      )}
+
+      <fieldset style={{ marginBottom: "1rem" }}>
+        <legend>Note for the dataset's history</legend>
+        <textarea
+          value={note}
+          onChange={(e) => setNote(e.target.value)}
+          placeholder='What is this file and why is it being added? e.g. "2026 Q3 wave — late responses"'
+          rows={2}
+          style={{ width: "32rem", maxWidth: "100%" }}
+        />
+        <div style={{ fontSize: "0.85em", color: "#555" }}>
+          Optional — stored with the upload date in this dataset's history.
+        </div>
+      </fieldset>
+
+      <p>
+        <button
+          onClick={handleAppend}
+          disabled={busy || target === null || missingColumns.length > 0}
+        >
+          {busy ? "Appending…" : `Append to ${targetName}`}
+        </button>{" "}
+        <button onClick={onIngestAsNew} disabled={busy}>
+          Ingest as a separate new dataset instead
+        </button>{" "}
+        <button onClick={handleDiscard} disabled={busy}>
+          Discard upload
+        </button>
+      </p>
+    </section>
+  );
+}
+
+function AppendDoneStep({
+  result,
+  onError,
+}: {
+  result: AppendResponse;
+  onError: (msg: string) => void;
+}) {
+  const { dataset } = result;
+  return (
+    <section>
+      <p>
+        Appended <strong>{result.appended_rows}</strong> new row
+        {result.appended_rows === 1 ? "" : "s"} to{" "}
+        <strong>{dataset.name}</strong> — {result.skipped_duplicates} duplicate
+        {result.skipped_duplicates === 1 ? "" : "s"} skipped (their labels
+        already exist).
+      </p>
+      {Object.keys(result.new_responses_per_question).length > 0 && (
+        <ul>
+          {Object.entries(result.new_responses_per_question).map(([label, n]) => (
+            <li key={label}>
+              {label} — {n} new response{n === 1 ? "" : "s"}
+            </li>
+          ))}
+        </ul>
+      )}
+      {result.warnings.length > 0 && (
+        <ul style={{ color: "#b45309" }}>
+          {result.warnings.map((w, i) => (
+            <li key={i}>⚠ {w}</li>
+          ))}
+        </ul>
+      )}
+      {result.appended_rows > 0 ? (
+        /* Only the new rows still need labels; incremental mode plans exactly
+           those, reusing the existing taxonomy. */
+        <Pipeline datasetId={dataset.id} mode="incremental" onError={onError} />
+      ) : (
+        <p>Nothing new to process — the dataset is unchanged.</p>
+      )}
+    </section>
+  );
+}
+
+function formatSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function ChooseFileStep({
+  mode,
+  onUploaded,
+  onError,
+}: {
+  mode: IngestMode;
+  onUploaded: (u: UploadResponse, mode: IngestMode) => void;
+  onError: (msg: string) => void;
+}) {
+  /* Picking a file only stages it in the browser — nothing reaches the
+     server (and nothing is saved to disk) until the analyst confirms.
+     Closing the tab before confirming therefore leaves no trace. */
+  const [pending, setPending] = useState<File | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [inputKey, setInputKey] = useState(0);
+
+  function clearPending() {
+    setPending(null);
+    setInputKey((k) => k + 1); // remount the input so re-picking the same file fires onChange
+  }
+
+  async function handleConfirm() {
+    if (!pending) return;
+    setBusy(true);
+    try {
+      const upload = await uploadDataset(pending);
+      clearPending();
+      onUploaded(upload, mode);
+    } catch (err) {
+      onError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section>
+      <p>
+        {mode.kind === "append" ? (
+          <>
+            This file will be <strong>appended to {mode.targetName}</strong>.
+          </>
+        ) : (
+          <>
+            This file will become a <strong>new dataset</strong>.
+          </>
+        )}
+      </p>
       <p>Upload a wide-format survey export (.csv, .xlsx, .xls).</p>
-      <input type="file" accept=".csv,.xlsx,.xls" onChange={handleChange} disabled={busy} />
+      <input
+        key={inputKey}
+        type="file"
+        accept=".csv,.xlsx,.xls"
+        onChange={(e) => setPending(e.target.files?.[0] ?? null)}
+        disabled={busy}
+      />
+      {pending && (
+        <p>
+          <strong>{pending.name}</strong> ({formatSize(pending.size)}) — nothing
+          is uploaded or saved until you confirm.{" "}
+          <button onClick={handleConfirm} disabled={busy}>
+            Upload and check this file
+          </button>{" "}
+          <button onClick={clearPending} disabled={busy}>
+            Cancel
+          </button>
+        </p>
+      )}
       {busy && <p>Uploading…</p>}
     </section>
   );
@@ -158,7 +628,13 @@ function ColumnSelectStep({
   const [selected, setSelected] = useState<Record<string, boolean>>({});
   const [labels, setLabels] = useState<Record<string, string>>({});
   const [description, setDescription] = useState("");
+  const [department, setDepartment] = useState("");
+  const [notes, setNotes] = useState("");
+  const [surveyStart, setSurveyStart] = useState("");
+  const [surveyEnd, setSurveyEnd] = useState("");
   const [busy, setBusy] = useState(false);
+
+  const datesBackwards = !!surveyStart && !!surveyEnd && surveyStart > surveyEnd;
 
   function toggle(column: string) {
     setSelected((s) => ({ ...s, [column]: !s[column] }));
@@ -189,6 +665,11 @@ function ColumnSelectStep({
       return;
     }
 
+    if (datesBackwards) {
+      onError("The survey start date is after the end date.");
+      return;
+    }
+
     const questions = selectedColumns.map((c) => ({
       column: c.column,
       label: labels[c.column].trim(),
@@ -200,7 +681,13 @@ function ColumnSelectStep({
         upload.dataset_id,
         respondentIdColumn || null,
         questions,
-        description.trim() || null,
+        {
+          description: description.trim() || null,
+          department: department.trim() || null,
+          notes: notes.trim() || null,
+          surveyStartDate: surveyStart || null,
+          surveyEndDate: surveyEnd || null,
+        },
       );
       onDone(dataset);
     } catch (err) {
@@ -226,8 +713,57 @@ function ColumnSelectStep({
           style={{ width: "32rem", maxWidth: "100%" }}
         />
         <div style={{ fontSize: "0.85em", color: "#555" }}>
-          Used as context in every analysis prompt. Editing it later re-versions
-          taxonomy and labeling runs.
+          Used as context in every analysis prompt and fixed once ingested —
+          it is part of each run's identity.
+        </div>
+      </fieldset>
+
+      <fieldset style={{ marginBottom: "1rem" }}>
+        <legend>Dataset details (optional)</legend>
+        <div style={{ marginBottom: "0.5rem" }}>
+          <label>
+            Department{" "}
+            <input
+              type="text"
+              value={department}
+              onChange={(e) => setDepartment(e.target.value)}
+              placeholder="e.g. Parks & Recreation"
+              style={{ width: "20rem", maxWidth: "100%" }}
+            />
+          </label>
+        </div>
+        <div style={{ marginBottom: "0.5rem" }}>
+          Survey conducted from{" "}
+          <input
+            type="date"
+            value={surveyStart}
+            onChange={(e) => setSurveyStart(e.target.value)}
+          />{" "}
+          to{" "}
+          <input
+            type="date"
+            value={surveyEnd}
+            onChange={(e) => setSurveyEnd(e.target.value)}
+          />
+          {datesBackwards && (
+            <div style={{ fontSize: "0.85em", color: "#b45309" }}>
+              The start date is after the end date.
+            </div>
+          )}
+        </div>
+        <div style={{ marginBottom: "0.5rem" }}>
+          <textarea
+            value={notes}
+            onChange={(e) => setNotes(e.target.value)}
+            placeholder="Anything a colleague should know about this dataset"
+            rows={2}
+            style={{ width: "32rem", maxWidth: "100%" }}
+          />
+        </div>
+        <div style={{ fontSize: "0.85em", color: "#555" }}>
+          Shown in the catalog and written to the export manifest. Unlike the
+          description, these are never used in analysis prompts, and can be
+          edited later from the catalog.
         </div>
       </fieldset>
 
@@ -354,6 +890,10 @@ function DoneStep({
           </button>
         </div>
       )}
+
+      {/* Ingest alone leaves the dataset unaskable; this is the next step, so
+          it belongs here rather than only behind a 409 on the Ask tab. */}
+      <Pipeline datasetId={dataset.id} onError={onError} />
     </section>
   );
 }

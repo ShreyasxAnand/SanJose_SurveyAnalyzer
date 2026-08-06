@@ -72,11 +72,18 @@ def resolve_taxonomy_path(labels_run: Path, dataset_id: str, question_id: str) -
     return latest / "candidate_taxonomy.json", "latest_taxonomy_fallback"
 
 
-def summarize_question(dataset_id: str, question_id: str) -> dict:
+def summarize_question(dataset_id: str, question_id: str,
+                       assignments_sink: dict[str, list[dict]] | None = None) -> dict:
     """One question's block: taxonomy structure + real counts from the latest
     assignments. Assignment ids not present in the paired taxonomy are counted
     and disclosed rather than silently dropped — a mismatch here means the
-    pairing rule failed and the analyst should know."""
+    pairing rule failed and the analyst should know.
+
+    `assignments_sink`, if given, receives `{question_id: assignments}` for the
+    run this summary actually used. Callers that need the assignment rows
+    themselves (the ask path wants actionability and event flags) can then use
+    the same parse instead of resolving "latest" and re-reading the file — one
+    less chance of the two disagreeing, and one less parse of a 30k-row JSON."""
     labels_run = latest_run_dir(LABELS_DIR / dataset_id / question_id, "assignments.json")
     if labels_run is None:
         raise FileNotFoundError(
@@ -86,6 +93,8 @@ def summarize_question(dataset_id: str, question_id: str) -> dict:
     tax_path, tax_how = resolve_taxonomy_path(labels_run, dataset_id, question_id)
     taxonomy = json.loads(tax_path.read_text(encoding="utf-8"))
     assignments = json.loads((labels_run / "assignments.json").read_text(encoding="utf-8"))
+    if assignments_sink is not None:
+        assignments_sink[question_id] = assignments
 
     counts: dict[str, int] = {lab["label_id"]: 0 for lab in taxonomy["labels"]}
     unknown_ids: dict[str, int] = {}
@@ -130,16 +139,21 @@ def summarize_question(dataset_id: str, question_id: str) -> dict:
     }
 
 
-def build_summary(dataset_id: str, dataset_description: str = "") -> dict:
+def build_summary(dataset_id: str, dataset_description: str = "",
+                  assignments_sink: dict[str, list[dict]] | None = None) -> dict:
     """The whole artifact: every question that has labels, plus the lexicon
     concept list (names only — the router selects concepts, matching stays
-    deterministic in code)."""
+    deterministic in code).
+
+    `assignments_sink` is passed straight through to `summarize_question` —
+    see there for why."""
     ds_dir = LABELS_DIR / dataset_id
     if not ds_dir.is_dir():
         raise FileNotFoundError(f"No labels directory for dataset {dataset_id}")
     question_ids = sorted((d.name for d in ds_dir.iterdir() if d.is_dir()),
                           key=lambda q: (len(q), q))
-    questions = [summarize_question(dataset_id, q) for q in question_ids]
+    questions = [summarize_question(dataset_id, q, assignments_sink)
+                 for q in question_ids]
 
     lexicon_concepts = []
     lex_path = LEXICON_DIR / dataset_id / "lexicon.json"

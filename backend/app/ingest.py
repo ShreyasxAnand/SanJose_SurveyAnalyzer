@@ -15,15 +15,31 @@ from fastapi.responses import FileResponse
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from app import rowhash
 from app.db import DATA_DIR, EXPORTS_DIR, UPLOADS_DIR, get_db
-from app.models import Dataset, QuestionColumn, Response
+from app.models import (
+    ColumnFingerprint,
+    Dataset,
+    QuestionColumn,
+    Response,
+    RowHash,
+    Upload,
+)
 from app.nonanswer import is_nonanswer_text
 from app.schemas import (
+    AppendRequest,
+    AppendResponse,
+    ColumnMatch,
     ColumnPreview,
+    DatasetHistoryOut,
+    DatasetMatch,
+    DatasetMetadataPatch,
     DatasetOut,
+    DuplicateCheck,
     ExportInfo,
     QuestionColumnOut,
     SelectColumnsRequest,
+    UploadHistoryEntry,
     UploadResponse,
 )
 
@@ -112,6 +128,243 @@ def _get_dataset_or_404(db: Session, dataset_id: int) -> Dataset:
     if dataset is None:
         raise HTTPException(status_code=404, detail="Dataset not found")
     return dataset
+
+
+def _ensure_uploads(db: Session, dataset: Dataset) -> list[Upload]:
+    """Return the dataset's uploads ordered by row_offset, lazily synthesizing
+    Upload #1 for a dataset ingested before the uploads table existed (the
+    scripts.backfill_uploads self-heal, so an un-backfilled machine degrades
+    gracefully instead of crashing on re-select)."""
+    uploads = (
+        db.query(Upload)
+        .filter(Upload.dataset_id == dataset.id)
+        .order_by(Upload.row_offset)
+        .all()
+    )
+    if uploads:
+        return uploads
+
+    # The stored original is what the synthesized Upload #1 is derived from. If
+    # it is gone or unreadable, say which file and why — the alternative is an
+    # unhandled traceback out of select_columns / append / history, which tells
+    # the analyst nothing about what to put back.
+    source = REPO_ROOT / (dataset.original_path or "")
+    if not dataset.original_path or not source.exists():
+        raise HTTPException(
+            status_code=409,
+            detail=f"Dataset {dataset.id} has no readable original file "
+            f"({source if dataset.original_path else 'no path recorded'}). It "
+            "predates the uploads table and cannot be back-filled without it; "
+            "restore the file, or re-ingest the dataset.",
+        )
+    try:
+        df = _read_dataframe(source)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Dataset {dataset.id}'s original file could not be parsed "
+            f"({source}): {exc}",
+        ) from exc
+    hashes = rowhash.hash_dataframe(df)
+    upload = Upload(
+        dataset_id=dataset.id,
+        stored_filename=dataset.original_filename,
+        stored_path=dataset.original_path,
+        sheet_name=dataset.sheet_name,
+        row_offset=0,
+        row_count=len(df),
+        new_row_count=len(df),
+        duplicate_row_count=0,
+        uploaded_at=dataset.uploaded_at,
+    )
+    db.add(upload)
+    db.flush()
+    db.bulk_insert_mappings(
+        RowHash,
+        [
+            {
+                "dataset_id": dataset.id,
+                "upload_id": upload.id,
+                "row_index": i,
+                "row_hash": h,
+                "is_duplicate": False,
+            }
+            for i, h in enumerate(hashes)
+        ],
+    )
+    db.query(Response).filter(
+        Response.dataset_id == dataset.id, Response.upload_id.is_(None)
+    ).update({"upload_id": upload.id}, synchronize_session=False)
+    return [upload]
+
+
+def _read_upload_frame(upload: Upload) -> pd.DataFrame:
+    """One upload's stored file, or a 409 naming it. Re-select and append both
+    re-read every file a dataset was built from; a file that has gone missing
+    is an operator-fixable state, not a server fault, and the message has to
+    say which file so it can be put back."""
+    path = REPO_ROOT / upload.stored_path
+    if not path.exists():
+        raise HTTPException(
+            status_code=409,
+            detail=f"Stored file for upload {upload.id} "
+            f"('{upload.stored_filename}') is missing at {path}. Restore it, "
+            "or re-ingest the dataset.",
+        )
+    try:
+        return _read_dataframe(path)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Stored file for upload {upload.id} "
+            f"('{upload.stored_filename}') could not be parsed: {exc}",
+        ) from exc
+
+
+def _insert_column_fingerprints(
+    db: Session, dataset_id: int, upload_id: int, fingerprints: dict[str, str]
+) -> None:
+    db.bulk_insert_mappings(
+        ColumnFingerprint,
+        [
+            {
+                "dataset_id": dataset_id,
+                "upload_id": upload_id,
+                "column_name": col,
+                "fingerprint": fp,
+            }
+            for col, fp in fingerprints.items()
+        ],
+    )
+
+
+def _ensure_column_fingerprints(db: Session) -> None:
+    """Lazily compute column fingerprints for ingested datasets' uploads that
+    predate the column_fingerprints table (same self-heal pattern as
+    _ensure_uploads) — each stored file is read once, ever. An unreadable
+    file is skipped: matching then simply can't see that upload, which
+    degrades to the pre-fingerprint behaviour instead of failing the upload."""
+    uploads = (
+        db.query(Upload)
+        .join(Dataset, Dataset.id == Upload.dataset_id)
+        .outerjoin(ColumnFingerprint, ColumnFingerprint.upload_id == Upload.id)
+        .filter(Dataset.status == "ingested", ColumnFingerprint.id.is_(None))
+        .all()
+    )
+    for upload in uploads:
+        path = REPO_ROOT / upload.stored_path
+        try:
+            df = _read_dataframe(path)
+        except Exception:
+            continue
+        _insert_column_fingerprints(
+            db, upload.dataset_id, upload.id, rowhash.fingerprint_columns(df)
+        )
+    if uploads:
+        db.commit()
+
+
+def _owned_row_indices(db: Session, upload: Upload) -> list[int]:
+    """Global row indices this upload contributed to the dataset (its
+    non-duplicate rows), ascending. Local index into the upload's file is
+    global - row_offset."""
+    rows = (
+        db.query(RowHash.row_index)
+        .filter(RowHash.upload_id == upload.id, RowHash.is_duplicate == False)  # noqa: E712
+        .order_by(RowHash.row_index)
+        .all()
+    )
+    return [r[0] for r in rows]
+
+
+def _upsert_upload_responses(
+    db: Session,
+    dataset: Dataset,
+    upload: Upload,
+    df: pd.DataFrame,
+    questions: dict[str, QuestionColumn],
+    respondent_id_column: str | None,
+) -> dict[int, int]:
+    """Upsert Response rows for one upload's owned rows across the selected
+    questions; delete rows this upload previously contributed that are no
+    longer present. Deletion is scoped to this upload_id — re-reading one
+    file can never delete rows another file contributed. Returns
+    {question_id: inserted_row_count} (new rows only, for append reporting).
+
+    Every cell is re-cleaned on every run so edits to the mojibake repair
+    logic apply retroactively. Bulk mappings instead of per-row ORM objects:
+    at 30k rows x several questions the unit-of-work bookkeeping is minutes,
+    the bulk path is seconds.
+    """
+    owned = _owned_row_indices(db, upload)
+    respondent_ids = (
+        df[respondent_id_column].tolist()
+        if respondent_id_column and respondent_id_column in df.columns
+        else None
+    )
+    inserted_per_question: dict[int, int] = {}
+
+    for column, question in questions.items():
+        texts = df[column].tolist()
+        existing_ids = dict(
+            db.query(Response.source_row_index, Response.id)
+            .filter(
+                Response.dataset_id == dataset.id,
+                Response.question_id == question.id,
+                Response.upload_id == upload.id,
+            )
+            .all()
+        )
+        inserts: list[dict] = []
+        updates: list[dict] = []
+        seen_rows: set[int] = set()
+
+        for global_index in owned:
+            local_index = global_index - upload.row_offset
+            raw_text = texts[local_index]
+            if not raw_text.strip():
+                continue
+            seen_rows.add(global_index)
+
+            cleaned_text, was_repaired = _repair_mojibake(raw_text.strip())
+            fields = {
+                "respondent_id": (
+                    respondent_ids[local_index] if respondent_ids else None
+                ),
+                "raw_text_original": raw_text,
+                "response_text": cleaned_text,
+                "was_encoding_repaired": was_repaired,
+                "is_nonanswer": is_nonanswer_text(cleaned_text),
+            }
+            existing_id = existing_ids.get(global_index)
+            if existing_id is not None:
+                updates.append({"id": existing_id, **fields})
+            else:
+                inserts.append(
+                    {
+                        "dataset_id": dataset.id,
+                        "question_id": question.id,
+                        "upload_id": upload.id,
+                        "source_row_index": global_index,
+                        "response_key": _response_key(
+                            dataset.id, question.id, global_index
+                        ),
+                        **fields,
+                    }
+                )
+
+        db.bulk_insert_mappings(Response, inserts)
+        db.bulk_update_mappings(Response, updates)
+        inserted_per_question[question.id] = len(inserts)
+
+        stale_ids = [rid for idx, rid in existing_ids.items() if idx not in seen_rows]
+        # chunk the IN() list — SQLite's default parameter limit is 999
+        for i in range(0, len(stale_ids), 900):
+            db.query(Response).filter(
+                Response.id.in_(stale_ids[i : i + 900])
+            ).delete(synchronize_session=False)
+
+    return inserted_per_question
 
 
 def _load_label_assignments(dataset_id: int) -> tuple[dict[str, dict], dict[str, str]]:
@@ -250,6 +503,12 @@ def _write_exports(db: Session, dataset: Dataset) -> ExportInfo:
         "ingested_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "respondent_id_column": dataset.respondent_id_column,
         "dataset_description": dataset.description or "",
+        # Catalog metadata — audit record only, never read by any prompt path.
+        "dataset_name": dataset.name,
+        "dataset_department": dataset.department or "",
+        "dataset_notes": dataset.notes or "",
+        "survey_start_date": dataset.survey_start_date or "",
+        "survey_end_date": dataset.survey_end_date or "",
         "column_mapping": [
             {"question_id": q.id, "source_column": q.source_column, "label": q.label}
             for q in questions
@@ -263,11 +522,37 @@ def _write_exports(db: Session, dataset: Dataset) -> ExportInfo:
         # dropped silently
         "labels_runs": labels_runs,
         "labels_unmatched_keys": len(labels_by_key) - matched_keys,
+        # every source file merged into this dataset, with how many of its
+        # rows were new vs already-ingested duplicates that were skipped
+        "uploads": [
+            {
+                "upload_id": u.id,
+                "filename": u.stored_filename,
+                "uploaded_at": u.uploaded_at.isoformat() if u.uploaded_at else None,
+                "row_offset": u.row_offset,
+                "row_count": u.row_count,
+                "new_row_count": u.new_row_count,
+                "duplicate_row_count": u.duplicate_row_count,
+                "note": u.note,
+            }
+            for u in db.query(Upload)
+            .filter(Upload.dataset_id == dataset.id)
+            .order_by(Upload.row_offset)
+            .all()
+        ],
     }
     manifest_path = export_dir / "manifest.json"
     manifest_path.write_text(
         json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
     )
+
+    # The ask layer memoizes a dataset's loaded context; this call is the only
+    # thing in-process that rewrites the corpus underneath it. Its own key
+    # would catch this via the parquet's size/mtime, but mtime is not trusted
+    # anywhere in this codebase — so say so explicitly rather than rely on it.
+    from app import ask_service
+
+    ask_service.invalidate_context_cache(dataset.id)
 
     return ExportInfo(
         csv_path=str(csv_path.relative_to(REPO_ROOT)),
@@ -333,6 +618,10 @@ def _dataset_out(db: Session, dataset: Dataset) -> DatasetOut:
         uploaded_at=dataset.uploaded_at,
         respondent_id_column=dataset.respondent_id_column,
         description=dataset.description,
+        department=dataset.department,
+        notes=dataset.notes,
+        survey_start_date=dataset.survey_start_date,
+        survey_end_date=dataset.survey_end_date,
         questions=questions,
         exports=exports,
     )
@@ -365,6 +654,46 @@ async def upload_dataset(file: UploadFile, db: Session = Depends(get_db)):
 
     safe_filename = Path(file.filename or f"{uuid.uuid4().hex}{suffix}").name
 
+    # Duplicate check BEFORE this file's own hashes are stored (no self-match).
+    # Only ingested datasets participate, so an abandoned provisional upload
+    # can never claim rows as "already ingested".
+    hashes = rowhash.hash_dataframe(df)
+    check = rowhash.find_matches(db, hashes)
+    fingerprints = rowhash.fingerprint_columns(df)
+
+    # Column-level tier: only when row matching found nothing — a re-upload
+    # with a column added/dropped/renamed changes every row hash, but the
+    # untouched columns still fingerprint identically. Diagnostic only.
+    column_matches: list[ColumnMatch] = []
+    if check["outcome"] == "none":
+        _ensure_column_fingerprints(db)
+        column_matches = [
+            ColumnMatch(**m) for m in rowhash.find_column_matches(db, fingerprints)
+        ]
+
+    duplicate_check = DuplicateCheck(
+        outcome=check["outcome"],
+        best_dataset_id=check["best_dataset_id"],
+        matches=[
+            DatasetMatch(
+                dataset_id=m["dataset_id"],
+                dataset_name=m["dataset_name"],
+                matched_rows=m["matched_rows"],
+                file_rows=m["file_rows"],
+                dataset_rows=m["dataset_rows"],
+                exact=m["exact"],
+                columns_compatible=not [
+                    c for c in m["selected_columns"] if c not in df.columns
+                ],
+                missing_columns=[
+                    c for c in m["selected_columns"] if c not in df.columns
+                ],
+            )
+            for m in check["matches"]
+        ],
+        column_matches=column_matches,
+    )
+
     dataset = Dataset(
         name=file.filename or safe_filename,
         original_filename=safe_filename,
@@ -381,6 +710,33 @@ async def upload_dataset(file: UploadFile, db: Session = Depends(get_db)):
     stored_path = dataset_upload_dir / safe_filename
     stored_path.write_bytes(contents)
     dataset.original_path = str(stored_path.relative_to(REPO_ROOT))
+
+    upload = Upload(
+        dataset_id=dataset.id,
+        stored_filename=safe_filename,
+        stored_path=dataset.original_path,
+        sheet_name=sheet_name,
+        row_offset=0,
+        row_count=len(df),
+        new_row_count=len(df),
+        duplicate_row_count=0,
+    )
+    db.add(upload)
+    db.flush()
+    db.bulk_insert_mappings(
+        RowHash,
+        [
+            {
+                "dataset_id": dataset.id,
+                "upload_id": upload.id,
+                "row_index": i,
+                "row_hash": h,
+                "is_duplicate": False,
+            }
+            for i, h in enumerate(hashes)
+        ],
+    )
+    _insert_column_fingerprints(db, dataset.id, upload.id, fingerprints)
     db.commit()
 
     columns = [
@@ -398,6 +754,191 @@ async def upload_dataset(file: UploadFile, db: Session = Depends(get_db)):
         original_filename=dataset.original_filename,
         row_count=len(df),
         columns=columns,
+        duplicate_check=duplicate_check,
+    )
+
+
+@router.delete("/{dataset_id}", status_code=204)
+def discard_dataset(dataset_id: int, db: Session = Depends(get_db)):
+    """Discard a provisional upload. Only allowed before column selection —
+    an ingested dataset has derived artifacts (taxonomies, labels, answers)
+    and deleting it from a button would orphan them silently."""
+    dataset = _get_dataset_or_404(db, dataset_id)
+    if dataset.status != "uploaded":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Dataset {dataset_id} is '{dataset.status}' — only provisional "
+            "(status 'uploaded') datasets can be discarded.",
+        )
+    db.delete(dataset)
+    db.commit()
+    upload_dir = UPLOADS_DIR / str(dataset_id)
+    if upload_dir.exists():
+        shutil.rmtree(upload_dir, ignore_errors=True)
+
+
+@router.post("/{dataset_id}/append", response_model=AppendResponse)
+def append_upload(
+    dataset_id: int, body: AppendRequest, db: Session = Depends(get_db)
+):
+    """Merge a provisional upload into an existing ingested dataset. Rows the
+    dataset already holds (by whole-row hash, multiset semantics) are skipped;
+    only genuinely new rows become Response rows, at global row indices past
+    everything already there, so every existing response_key — and therefore
+    every label — stays valid. The provisional dataset is consumed on success;
+    its file is copied under the target first, byte-for-byte."""
+    target = _get_dataset_or_404(db, dataset_id)
+    provisional = _get_dataset_or_404(db, body.upload_dataset_id)
+    if target.id == provisional.id:
+        raise HTTPException(status_code=400, detail="Cannot append a dataset to itself")
+    if target.status != "ingested":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Target dataset {target.id} is '{target.status}' — appends "
+            "require an ingested dataset.",
+        )
+    if provisional.status != "uploaded":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Dataset {provisional.id} is '{provisional.status}' — only a "
+            "provisional upload (status 'uploaded') can be appended.",
+        )
+
+    # Appending rewrites the export a running pipeline stage may be reading.
+    from app import pipeline as pipeline_module
+
+    job = pipeline_module.latest_job(str(target.id))
+    if job is not None and job.status == "running":
+        raise HTTPException(
+            status_code=409,
+            detail=f"A pipeline job is running for dataset {target.id} — wait for "
+            "it to finish before appending.",
+        )
+
+    source_path = REPO_ROOT / provisional.original_path
+    if not source_path.exists():
+        raise HTTPException(
+            status_code=409,
+            detail=f"The uploaded file for dataset {provisional.id} is missing "
+            f"at {source_path}; re-upload it.",
+        )
+    df = _read_dataframe(source_path)
+
+    questions = (
+        db.query(QuestionColumn)
+        .filter(QuestionColumn.dataset_id == target.id)
+        .order_by(QuestionColumn.position)
+        .all()
+    )
+    missing = [q.source_column for q in questions if q.source_column not in df.columns]
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Appended file is missing the dataset's question columns: "
+            f"{missing}",
+        )
+
+    warnings: list[str] = []
+    if (
+        target.respondent_id_column
+        and target.respondent_id_column not in df.columns
+    ):
+        warnings.append(
+            f"Respondent-id column '{target.respondent_id_column}' is not in the "
+            "appended file; its rows carry no respondent id."
+        )
+    known_columns = {q.source_column for q in questions}
+    if target.respondent_id_column:
+        known_columns.add(target.respondent_id_column)
+    extra = [c for c in df.columns if c not in known_columns]
+    if extra:
+        warnings.append(f"Ignored columns not selected in this dataset: {extra}")
+
+    # Recompute duplicate flags against the target's CURRENT hash multiset —
+    # the upload-time report may be stale by the time the analyst confirms.
+    uploads = _ensure_uploads(db, target)
+    hashes = rowhash.hash_dataframe(df)
+    dup_flags = rowhash.split_new_rows(hashes, rowhash.stored_multiset(db, target.id))
+    n_duplicates = sum(dup_flags)
+    n_new = len(dup_flags) - n_duplicates
+
+    row_offset = max(u.row_offset + u.row_count for u in uploads)
+
+    upload = Upload(
+        dataset_id=target.id,
+        stored_filename=provisional.original_filename,
+        stored_path="",  # finalized below, once we have upload.id
+        sheet_name=provisional.sheet_name,
+        row_offset=row_offset,
+        row_count=len(df),
+        new_row_count=n_new,
+        duplicate_row_count=n_duplicates,
+        note=body.note.strip() or None if body.note is not None else None,
+    )
+    db.add(upload)
+    db.flush()
+
+    # Copy the original bytes under the target (subdir per upload id, so two
+    # files with the same name can't collide) before the provisional dataset
+    # and its copy are deleted — the original stays immutable and auditable.
+    append_dir = UPLOADS_DIR / str(target.id) / str(upload.id)
+    append_dir.mkdir(parents=True, exist_ok=True)
+    stored_path = append_dir / provisional.original_filename
+    stored_path.write_bytes(source_path.read_bytes())
+    upload.stored_path = str(stored_path.relative_to(REPO_ROOT))
+
+    db.bulk_insert_mappings(
+        RowHash,
+        [
+            {
+                "dataset_id": target.id,
+                "upload_id": upload.id,
+                "row_index": row_offset + i,
+                "row_hash": h,
+                "is_duplicate": dup_flags[i],
+            }
+            for i, h in enumerate(hashes)
+        ],
+    )
+    _insert_column_fingerprints(
+        db, target.id, upload.id, rowhash.fingerprint_columns(df)
+    )
+
+    questions_by_column = {q.source_column: q for q in questions}
+    inserted = _upsert_upload_responses(
+        db, target, upload, df, questions_by_column, target.respondent_id_column
+    )
+    labels_by_question = {q.id: q.label for q in questions}
+    new_responses_per_question = {
+        labels_by_question[qid]: n for qid, n in inserted.items()
+    }
+
+    # The provisional dataset served its purpose; its bytes now live under the
+    # target. Cascades take its Upload/RowHash rows with it.
+    provisional_id = provisional.id
+    db.delete(provisional)
+    db.commit()
+    db.refresh(target)
+    provisional_dir = UPLOADS_DIR / str(provisional_id)
+    if provisional_dir.exists():
+        shutil.rmtree(provisional_dir, ignore_errors=True)
+
+    try:
+        _write_exports(db, target)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Append committed to the database but export failed: {exc}. "
+            f"Retry via POST /datasets/{target.id}/export.",
+        ) from exc
+
+    return AppendResponse(
+        dataset=_dataset_out(db, target),
+        upload_id=upload.id,
+        appended_rows=n_new,
+        skipped_duplicates=n_duplicates,
+        new_responses_per_question=new_responses_per_question,
+        warnings=warnings,
     )
 
 
@@ -413,6 +954,94 @@ def get_dataset(dataset_id: int, db: Session = Depends(get_db)):
     return _dataset_out(db, dataset)
 
 
+@router.patch("/{dataset_id}", response_model=DatasetOut)
+def update_dataset_metadata(
+    dataset_id: int, body: DatasetMetadataPatch, db: Session = Depends(get_db)
+):
+    """Edit catalog metadata (name, department, notes, survey dates). The
+    description is deliberately not editable here — it feeds every analysis
+    prompt and is hashed into run ids, so it is fixed at column-select time.
+    A real change on an ingested dataset rewrites the exports so the manifest
+    (the audit record) never disagrees with the DB."""
+    dataset = _get_dataset_or_404(db, dataset_id)
+
+    # Work out what would change BEFORE touching the ORM object, so the 409
+    # below never leaves dirty state in the session (which only stayed harmless
+    # because get_db closes and rolls back).
+    pending: dict[str, str | None] = {}
+    if body.name is not None and body.name.strip() != dataset.name:
+        pending["name"] = body.name.strip()
+    for field, value in (
+        ("department", body.department),
+        ("notes", body.notes),
+        ("survey_start_date", body.survey_start_date),
+        ("survey_end_date", body.survey_end_date),
+    ):
+        if value is None:
+            continue
+        new = value.strip() or None
+        if new != getattr(dataset, field):
+            pending[field] = new
+
+    if not pending:
+        return _dataset_out(db, dataset)
+
+    if dataset.status == "ingested":
+        # Rewriting the export a running pipeline stage may be reading is the
+        # same hazard as appending — refuse rather than race.
+        from app import pipeline as pipeline_module
+
+        job = pipeline_module.latest_job(str(dataset.id))
+        if job is not None and job.status == "running":
+            raise HTTPException(
+                status_code=409,
+                detail=f"A pipeline job is running for dataset {dataset.id} — "
+                "wait for it to finish before editing metadata.",
+            )
+
+    for field, new in pending.items():
+        setattr(dataset, field, new)
+    db.commit()
+    db.refresh(dataset)
+
+    if dataset.status == "ingested":
+        try:
+            _write_exports(db, dataset)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Metadata saved but export refresh failed: {exc}. "
+                f"Retry via POST /datasets/{dataset.id}/export.",
+            ) from exc
+
+    return _dataset_out(db, dataset)
+
+
+@router.get("/{dataset_id}/history", response_model=DatasetHistoryOut)
+def dataset_history(dataset_id: int, db: Session = Depends(get_db)):
+    """Every source file merged into this dataset, oldest first: the file the
+    dataset was created from, then each append with its note and how many of
+    its rows were new vs already-held duplicates. All counts are the stored
+    Upload-row numbers."""
+    dataset = _get_dataset_or_404(db, dataset_id)
+    uploads = _ensure_uploads(db, dataset)
+    db.commit()  # persist any lazily synthesized Upload #1
+    entries = [
+        UploadHistoryEntry(
+            upload_id=u.id,
+            filename=u.stored_filename,
+            uploaded_at=u.uploaded_at,
+            kind="created" if i == 0 else "appended",
+            row_count=u.row_count,
+            new_row_count=u.new_row_count,
+            duplicate_row_count=u.duplicate_row_count,
+            note=u.note,
+        )
+        for i, u in enumerate(sorted(uploads, key=lambda u: u.row_offset))
+    ]
+    return DatasetHistoryOut(dataset_id=dataset.id, entries=entries)
+
+
 @router.post("/{dataset_id}/columns", response_model=DatasetOut)
 def select_columns(
     dataset_id: int, body: SelectColumnsRequest, db: Session = Depends(get_db)
@@ -421,21 +1050,41 @@ def select_columns(
     if not body.questions:
         raise HTTPException(status_code=400, detail="Select at least one question column")
 
-    original_path = REPO_ROOT / dataset.original_path
-    df = _read_dataframe(original_path)
+    uploads = _ensure_uploads(db, dataset)
+    frames: list[tuple[Upload, pd.DataFrame]] = [
+        (u, _read_upload_frame(u)) for u in uploads
+    ]
+    first_df = frames[0][1]
 
     all_selected = [q.column for q in body.questions]
     if body.respondent_id_column:
         all_selected.append(body.respondent_id_column)
-    missing = [c for c in all_selected if c not in df.columns]
+    missing = [c for c in all_selected if c not in first_df.columns]
     if missing:
         raise HTTPException(status_code=400, detail=f"Columns not found in file: {missing}")
 
+    # Question columns must exist in every appended file too — a re-select
+    # reshapes all uploads, and a column one file lacks has no rows to give.
+    # The respondent-id column is lenient past the first file (append allows a
+    # file without it; those rows carry respondent_id=None).
+    question_cols = [q.column for q in body.questions]
+    for upload, upload_df in frames[1:]:
+        missing = [c for c in question_cols if c not in upload_df.columns]
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Columns not found in appended file "
+                f"'{upload.stored_filename}': {missing}",
+            )
+
     # A selected column with zero non-empty cells would silently become a
     # question with zero responses — that is never what the analyst meant.
+    # Checked across the union of all uploads: empty in one file but answered
+    # in another is fine.
     empty_cols = [
-        q.column for q in body.questions
-        if int((df[q.column].str.strip() != "").sum()) == 0
+        q.column
+        for q in body.questions
+        if sum(int((f[q.column].str.strip() != "").sum()) for _, f in frames) == 0
     ]
     if empty_cols:
         raise HTTPException(
@@ -446,6 +1095,16 @@ def select_columns(
     dataset.respondent_id_column = body.respondent_id_column
     if body.dataset_description is not None:
         dataset.description = body.dataset_description.strip() or None
+    # Catalog metadata, same None-preserves / strip-or-None semantics as the
+    # description above.
+    if body.dataset_department is not None:
+        dataset.department = body.dataset_department.strip() or None
+    if body.dataset_notes is not None:
+        dataset.notes = body.dataset_notes.strip() or None
+    if body.survey_start_date is not None:
+        dataset.survey_start_date = body.survey_start_date.strip() or None
+    if body.survey_end_date is not None:
+        dataset.survey_end_date = body.survey_end_date.strip() or None
 
     # Upsert QuestionColumn by (dataset_id, source_column) instead of
     # delete-then-insert, so a column that stays selected across re-runs
@@ -483,64 +1142,15 @@ def select_columns(
             db.delete(existing)
     db.flush()
 
-    # Upsert Response by (dataset_id, question_id, source_row_index) for the
-    # same reason. Every cell is re-cleaned on every run so edits to the
-    # mojibake repair logic apply retroactively. Bulk mappings instead of
-    # per-row ORM objects: at 30k rows x several questions the unit-of-work
-    # bookkeeping is minutes, the bulk path is seconds. enumerate position
-    # equals the old df.iterrows() index — these frames always carry the
-    # default RangeIndex.
-    respondent_ids = (
-        df[body.respondent_id_column].tolist() if body.respondent_id_column else None
-    )
-    for column, question in kept_or_created.items():
-        existing_ids = dict(
-            db.query(Response.source_row_index, Response.id)
-            .filter(
-                Response.dataset_id == dataset.id, Response.question_id == question.id
-            )
-            .all()
+    # Upsert Response rows upload by upload, keyed (dataset_id, question_id,
+    # source_row_index) so a row that survives a re-run keeps its id and
+    # response_key. Stale deletion inside the helper is scoped per upload_id —
+    # re-reading upload #1's file can never delete rows an appended file
+    # contributed.
+    for upload, upload_df in frames:
+        _upsert_upload_responses(
+            db, dataset, upload, upload_df, kept_or_created, body.respondent_id_column
         )
-        inserts: list[dict] = []
-        updates: list[dict] = []
-        seen_rows: set[int] = set()
-
-        for row_index, raw_text in enumerate(df[column].tolist()):
-            if not raw_text.strip():
-                continue
-            seen_rows.add(row_index)
-
-            cleaned_text, was_repaired = _repair_mojibake(raw_text.strip())
-            fields = {
-                "respondent_id": respondent_ids[row_index] if respondent_ids else None,
-                "raw_text_original": raw_text,
-                "response_text": cleaned_text,
-                "was_encoding_repaired": was_repaired,
-                "is_nonanswer": is_nonanswer_text(cleaned_text),
-            }
-            existing_id = existing_ids.get(row_index)
-            if existing_id is not None:
-                updates.append({"id": existing_id, **fields})
-            else:
-                inserts.append(
-                    {
-                        "dataset_id": dataset.id,
-                        "question_id": question.id,
-                        "source_row_index": row_index,
-                        "response_key": _response_key(dataset.id, question.id, row_index),
-                        **fields,
-                    }
-                )
-
-        db.bulk_insert_mappings(Response, inserts)
-        db.bulk_update_mappings(Response, updates)
-
-        stale_ids = [rid for idx, rid in existing_ids.items() if idx not in seen_rows]
-        # chunk the IN() list — SQLite's default parameter limit is 999
-        for i in range(0, len(stale_ids), 900):
-            db.query(Response).filter(
-                Response.id.in_(stale_ids[i : i + 900])
-            ).delete(synchronize_session=False)
 
     dataset.status = "ingested"
     db.commit()

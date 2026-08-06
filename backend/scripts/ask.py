@@ -49,6 +49,11 @@ def print_candidates(route: dict, ctx: ask_service.AskContext) -> None:
         print(f"  actionability filter: {route['actionability_filter']} only")
     if route.get("event_filter"):
         print("  event filter: only responses recounting a first-hand incident")
+    if route.get("time_filter"):
+        print(f"  time filter: only responses explicitly mentioning "
+              f"{route['time_filter']}time")
+    if route.get("question_scope"):
+        print(f"  scoped to survey question(s): {route['question_scope']}")
 
 
 def main() -> None:
@@ -78,6 +83,15 @@ def main() -> None:
                     help="override the router: restrict evidence to responses "
                          "proposing a concrete action (specific), to broad "
                          "concerns (general), or to neither (any)")
+    ap.add_argument("--question-scope", default=None,
+                    help="comma-separated survey question ids to restrict the "
+                         "ask to (e.g. --question-scope 9); the router only "
+                         "sees the scoped questions' categories")
+    ap.add_argument("--time", choices=["any", "day", "night"], default=None,
+                    help="override the router: restrict evidence to responses "
+                         "explicitly mentioning daytime or nighttime. There "
+                         "is no 'no time named' option — naming no time says "
+                         "nothing about when it happened")
     ap.add_argument("--events", choices=["any", "reported"], default=None,
                     help="override the router: restrict evidence to responses "
                          "recounting a first-hand incident (reported), or to "
@@ -115,11 +129,20 @@ def main() -> None:
     print(f'question: "{args.question}"')
     print(f"dataset {dataset_id}: {len(ctx.valid_ids)} categories across "
           f"{len(ctx.question_ids)} questions")
+    if ctx.location_members_source:
+        print(f"context loaded in {ctx.load_seconds:.1f}s "
+              f"(location sweep: {ctx.location_members_source})")
     print(f"model: {client.model_id}" if synth_client is client else
           f"models: route={client.model_id}, answer={synth_client.model_id}")
 
-    route, route_stats = ask_service.propose(client, args.question, ctx,
-                                             args.description)
+    scope = ([s.strip() for s in args.question_scope.split(",") if s.strip()]
+             if args.question_scope else None)
+    try:
+        route, route_stats = ask_service.propose(client, args.question, ctx,
+                                                 args.description,
+                                                 question_scope=scope)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
     if args.actionability is not None:
         chosen = "" if args.actionability == "any" else args.actionability
         if chosen and not ctx.actionability:
@@ -141,6 +164,17 @@ def main() -> None:
             print(f"  --events overrides the router "
                   f"({route['event_filter'] or 'any'} -> {chosen or 'any'})")
         route["event_filter"] = chosen
+    if args.time is not None:
+        chosen = "" if args.time == "any" else args.time
+        available = ctx.time_day if chosen == "day" else ctx.time_night
+        if chosen and not available:
+            print(f"  NOTE: --time ignored — no labelled response classifies "
+                  f"as mentioning {chosen}time")
+            chosen = ""
+        if chosen != route.get("time_filter", ""):
+            print(f"  --time overrides the router "
+                  f"({route.get('time_filter') or 'any'} -> {chosen or 'any'})")
+        route["time_filter"] = chosen
     print_candidates(route, ctx)
     if route_stats["invalid_label_ids"]:
         print(f"  invalid label ids dropped: {route_stats['invalid_label_ids']}")
@@ -206,7 +240,11 @@ def main() -> None:
             print(f"  {c.model_id}: {u.calls} call(s), {u.input_tokens:,} in / "
                   f"{u.output_tokens:,} out{thinking} = ${cost:.4f}")
     suffix = " (partial — some models unpriced)" if unpriced else ""
-    print(f"${total:.4f}{suffix}, {time.time() - t0:.0f}s -> {out_dir}")
+    # t0 starts after the context load, so report both parts — the load is what
+    # the analyst waits through before a single token is generated
+    print(f"${total:.4f}{suffix}, {ctx.load_seconds + time.time() - t0:.1f}s "
+          f"({ctx.load_seconds:.1f}s context + {time.time() - t0:.1f}s ask) "
+          f"-> {out_dir}")
 
 
 if __name__ == "__main__":

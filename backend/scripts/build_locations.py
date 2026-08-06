@@ -62,6 +62,9 @@ def main() -> None:
 
     hits = loc.match_locations(locations, keys, texts)
     covered = {k for ks in hits.values() for k in ks}
+    # this sweep is exactly what the ask path needs — persist it here so the
+    # first question after a rebuild doesn't pay for it again
+    loc.write_members(hits, dataset_id, locations, keys, texts)
 
     manifest = {
         "created_utc": induction.utc_now(),
@@ -77,6 +80,7 @@ def main() -> None:
         "responses_matching_any_concept": len(covered),
         "labeled_location_coverage": coverage,
         "concept_counts": {name: len(ks) for name, ks in hits.items()},
+        "members_cache": str(loc.members_path(dataset_id)),
         "warnings": warnings,
         "usage": {"calls": client.usage.calls, "est_cost_usd": round(cost, 4),
                   "elapsed_seconds": round(elapsed, 1)},

@@ -21,10 +21,23 @@ turns those raw spans into something the query router can use:
 Coverage honesty: only responses that volunteered a place are localizable.
 Every consumer of this layer must carry that denominator — "75 of 222
 responses named a place" — rather than implying full coverage.
+
+Step 3 is the platform's hottest loop: one compiled pattern per concept swept
+over every response is O(concepts x responses) regex calls — 3.06M of them on
+the 30k dataset's 106 concepts, ~8.4s, and the stateless two-step ask pays it
+twice per analyst question. It is also *purely* a function of the concept
+spans and the corpus text, both of which are on-disk artifacts that change
+only when `build_locations` or ingest runs. So the result is cached to
+`members.json` next to `locations.json`, keyed on fingerprints of both
+inputs (see `match_locations_cached`). `match_locations` stays the pure
+reference implementation the cache is checked against — never bypass it as
+the definition of correctness.
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
 from collections import Counter
 from pathlib import Path
@@ -35,6 +48,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 LOCATIONS_DIR = REPO_ROOT / "data" / "locations"
 
 SCHEMA_VERSION = 1
+MEMBERS_SCHEMA_VERSION = 1
 MIN_SPAN_COUNT = 2      # a span seen once ("the park by my house") is not a
                         # groupable place; singletons are counted and disclosed
 # Hard cap on spans in the grouping prompt, lexicon-style (MAX_CANDIDATES).
@@ -249,6 +263,118 @@ def match_locations(locations: dict, keys: list[str],
 
 def concept_kinds(locations: dict) -> dict[str, str]:
     return {c["name"]: c["kind"] for c in locations.get("concepts", [])}
+
+
+# ---------------------------------------------------------------------------
+# 3b. Caching the sweep — same numbers, computed once instead of per question
+# ---------------------------------------------------------------------------
+#
+# The cache is keyed on both of the sweep's only inputs. A stale hit here
+# would mean wrong counts in an answer, which is worse than a slow answer —
+# so the key is a content fingerprint of each input, never an mtime (a
+# re-export that rewrites identical bytes must not invalidate, and a rewrite
+# that changes bytes must, whatever the clock says).
+
+
+def concepts_fingerprint(locations: dict) -> str:
+    """Hash of what the sweep actually reads: each concept's name and spans.
+    Editing `note` or bumping a counter in locations.json does not invalidate."""
+    payload = json.dumps(
+        [[c.get("name", ""), sorted(c.get("spans") or [])]
+         for c in locations.get("concepts", [])],
+        sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def corpus_fingerprint(keys: list[str], texts: list[str]) -> str:
+    """Hash of the (key, text) pairs in order. ~10ms on 30k rows — cheap
+    enough to verify on every load, which is the point: the cache is checked,
+    not trusted."""
+    h = hashlib.sha256()
+    for k, t in zip(keys, texts):
+        h.update(str(k).encode("utf-8", "replace"))
+        h.update(b"\x00")
+        h.update(str(t).encode("utf-8", "replace"))
+        h.update(b"\x01")
+    return h.hexdigest()
+
+
+def members_path(dataset_id: str) -> Path:
+    return LOCATIONS_DIR / str(dataset_id) / "members.json"
+
+
+def write_members(members: dict[str, list[str]], dataset_id: str,
+                  locations: dict, keys: list[str], texts: list[str]) -> Path:
+    """Persist the sweep with the fingerprints that make it verifiable.
+    Written via a temp file + replace so a reader can never see half a cache
+    (the CLI and the server can both be sweeping the same dataset)."""
+    from .induction import utc_now
+
+    path = members_path(dataset_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": MEMBERS_SCHEMA_VERSION,
+        "created_utc": utc_now(),
+        "note": ("Cached output of locations.match_locations — derived, "
+                 "safe to delete, regenerated on the next ask. Reused only "
+                 "when both fingerprints below still match."),
+        "concepts_fingerprint": concepts_fingerprint(locations),
+        "corpus_fingerprint": corpus_fingerprint(keys, texts),
+        "n_responses": len(keys),
+        "n_concepts": len(members),
+        "members": members,
+    }
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, path)
+    return path
+
+
+def read_members(dataset_id: str, locations: dict, keys: list[str],
+                 texts: list[str]) -> dict[str, list[str]] | None:
+    """The cached sweep if it is still valid for these exact inputs, else
+    None. Any mismatch, missing file or unreadable file is a miss — the
+    caller recomputes, so a corrupt cache costs 8 seconds, not correctness."""
+    path = members_path(dataset_id)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return None
+    if payload.get("schema_version") != MEMBERS_SCHEMA_VERSION:
+        return None
+    if payload.get("concepts_fingerprint") != concepts_fingerprint(locations):
+        return None
+    if payload.get("corpus_fingerprint") != corpus_fingerprint(keys, texts):
+        return None
+    members = payload.get("members")
+    if not isinstance(members, dict):
+        return None
+    # a concept added to locations.json without a matching cache entry would
+    # otherwise read as "mentioned by nobody" — the fingerprint should have
+    # caught it, so treat a shape mismatch as corruption
+    if {c["name"] for c in locations.get("concepts", [])} != set(members):
+        return None
+    return {name: list(ks) for name, ks in members.items()}
+
+
+def match_locations_cached(locations: dict, keys: list[str], texts: list[str],
+                           dataset_id: str, write: bool = True
+                           ) -> tuple[dict[str, list[str]], str]:
+    """(members, source) where source is "cache" or "computed" — the caller
+    discloses which ran, so a wrong count can be traced to a stale cache
+    rather than guessed at."""
+    cached = read_members(dataset_id, locations, keys, texts)
+    if cached is not None:
+        return cached, "cache"
+    members = match_locations(locations, keys, texts)
+    if write:
+        try:
+            write_members(members, dataset_id, locations, keys, texts)
+        except OSError:
+            pass          # a read-only data dir slows asks; it must not fail one
+    return members, "computed"
 
 
 def write_locations(locations: dict, manifest: dict, dataset_id: str) -> Path:

@@ -1,9 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { askAnswer, askRoute } from "./api";
+import { askAnswer, askQuestions, askRoute } from "./api";
+import Pipeline from "./Pipeline";
 import type {
   AskAnswerResponse,
-  AskCandidate,
+  AskParentGroup,
+  AskQuestionOut,
   AskRouteResponse,
+  AskSelectedCandidate,
   AskSource,
 } from "./types";
 import "./ask.css";
@@ -16,6 +19,10 @@ import "./ask.css";
 type Phase =
   | { name: "question" }
   | { name: "routing"; question: string }
+  // the dataset was ingested but never processed — a 409 from /ask/route. Not
+  // an error to dump on the analyst: it is a missing step, with the button
+  // that performs it.
+  | { name: "unprocessed"; question: string; detail: string }
   | { name: "review"; question: string; proposal: AskRouteResponse }
   | { name: "answering"; question: string; proposal: AskRouteResponse }
   | {
@@ -46,11 +53,66 @@ const ACTIONABILITY_CHOICES = [
   },
 ];
 
+// Day/night classification of verbatim time mentions. Like the event filter,
+// deliberately one-directional per value: a response naming no time of day
+// says nothing about when its experience happened, so there is no such option.
+const TIME_CHOICES = [
+  { value: "", label: "Any time", help: "no filter on time of day" },
+  {
+    value: "night",
+    label: "Nighttime mentions only",
+    help: 'responses explicitly saying "at night", "after dark", …',
+  },
+  {
+    value: "day",
+    label: "Daytime mentions only",
+    help: 'responses explicitly saying "during the day", "morning", …',
+  },
+];
+
 const RELEVANCE_COLOR: Record<string, string> = {
   high: "#166534",
   medium: "#92400e",
   low: "#6b7280",
 };
+
+// Words that carry no topic meaning, so two category names differing only by
+// these are the same topic. Kept deliberately short: over-eager stripping would
+// fuse categories that genuinely differ, and a wrong grouping is worse than an
+// ungrouped list.
+const TOPIC_STOPWORDS = new Set([
+  "a", "an", "and", "at", "by", "for", "general", "in", "of", "on", "or",
+  "other", "the", "to", "with",
+  "concern", "concerns", "issue", "issues",
+]);
+
+function topicTokens(name: string): Set<string> {
+  return new Set(
+    name
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, " ")
+      .split(/\s+/)
+      .filter((w) => w && !TOPIC_STOPWORDS.has(w)),
+  );
+}
+
+function tokenOverlap(a: Set<string>, b: Set<string>): number {
+  if (!a.size || !b.size) return 0;
+  let shared = 0;
+  for (const w of a) if (b.has(w)) shared += 1;
+  return shared / (a.size + b.size - shared);
+}
+
+/** How alike two category names must be to be shown as one topic. Measured
+ *  against dataset 2's 297 categories: 0.6 groups 15 topics (31 categories) and
+ *  every one is a real restatement — "Police Staffing, Funding, Presence, and
+ *  Response Times" with "Police Staffing, Presence, and Response Times". 0.5
+ *  starts fusing "Park and Public Space Cleanliness" with "Park and Public
+ *  Space Safety", which are different things. Requiring an exact word-set match
+ *  catches only 3. Grouping is purely presentational — it never merges label
+ *  ids or counts, and every variant keeps its own checkbox — but a wrong
+ *  grouping still misleads, so it errs toward leaving names apart. */
+const TOPIC_SIMILARITY = 0.6;
 
 export default function Ask({
   datasetId,
@@ -60,14 +122,75 @@ export default function Ask({
   onError: (msg: string) => void;
 }) {
   const [phase, setPhase] = useState<Phase>({ name: "question" });
+  // the dataset's survey questions, for the scope selector; null while loading
+  const [questions, setQuestions] = useState<AskQuestionOut[] | null>(null);
+  const [scope, setScope] = useState<string>("");   // "" = all questions
+  // Debug mode surfaces the category-review step between routing and the
+  // answer. Off by default: the router's proposal is accepted as-is and the
+  // answer appears in one step ("Adjust and re-answer" on the answer screen
+  // still reaches the review). Persisted so the choice survives reloads.
+  const [debug, setDebug] = useState(
+    () => localStorage.getItem("ask_debug") === "1",
+  );
+
+  function toggleDebug() {
+    setDebug((v) => {
+      localStorage.setItem("ask_debug", v ? "0" : "1");
+      return !v;
+    });
+  }
+
+  useEffect(() => {
+    let cancelled = false;
+    askQuestions(datasetId)
+      .then((qs) => {
+        if (!cancelled) setQuestions(qs);
+      })
+      .catch(() => {
+        // 409 (unprocessed) or transient failure — the selector just stays
+        // hidden; asking still works and routes to the unprocessed screen
+        if (!cancelled) setQuestions([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [datasetId]);
 
   async function handleAsk(question: string) {
     setPhase({ name: "routing", question });
     try {
-      const proposal = await askRoute(datasetId, question);
+      const proposal = await askRoute(datasetId, question,
+                                      scope ? [scope] : []);
+      if (!debug && proposal.answerable) {
+        // accept the router's proposal as-is and answer in one step; the
+        // unanswerable screen still shows (there is nothing to auto-accept)
+        void handleConfirm(
+          question,
+          proposal,
+          proposal.candidates.map((c) => ({
+            label_id: c.label_id,
+            relevance: c.relevance,
+            rationale: c.rationale,
+          })),
+          new Set(proposal.lexicon_concepts),
+          new Set(proposal.location_filter),
+          proposal.group_by === "location",
+          proposal.actionability_filter,
+          proposal.event_filter === "reported",
+          proposal.time_filter,
+        );
+        return;
+      }
       setPhase({ name: "review", question, proposal });
     } catch (err) {
-      onError(err instanceof Error ? err.message : String(err));
+      const msg = err instanceof Error ? err.message : String(err);
+      // 409 means "the pipeline hasn't run for this dataset" — a state the
+      // analyst can fix in place, so route to the runner instead of an error
+      if (msg.startsWith("409")) {
+        setPhase({ name: "unprocessed", question, detail: msg });
+        return;
+      }
+      onError(msg);
       setPhase({ name: "question" });
     }
   }
@@ -75,12 +198,15 @@ export default function Ask({
   async function handleConfirm(
     question: string,
     proposal: AskRouteResponse,
-    selectedIds: Set<string>,
+    // built from the whole taxonomy, not just the proposal — the review
+    // screen can now add categories the router never suggested
+    selected: AskSelectedCandidate[],
     concepts: Set<string>,
     places: Set<string>,
     groupByLocation: boolean,
     actionability: string,
     eventsOnly: boolean,
+    timeOfDay: string,
   ) {
     setPhase({ name: "answering", question, proposal });
     try {
@@ -88,18 +214,14 @@ export default function Ask({
         question,
         route: proposal.route,
         reason: proposal.reason,
-        selected: proposal.candidates
-          .filter((c) => selectedIds.has(c.label_id))
-          .map((c) => ({
-            label_id: c.label_id,
-            relevance: c.relevance,
-            rationale: c.rationale,
-          })),
+        selected,
         lexicon_concepts: [...concepts],
         group_by: groupByLocation ? "location" : "category",
         location_filter: [...places],
         actionability_filter: actionability,
         event_filter: eventsOnly ? "reported" : "",
+        time_filter: timeOfDay,
+        question_scope: proposal.question_scope,
         proposed_label_ids: proposal.candidates.map((c) => c.label_id),
       });
       setPhase({ name: "answer", question, proposal, result });
@@ -115,31 +237,80 @@ export default function Ask({
         <QuestionForm
           busy={phase.name === "routing"}
           onAsk={handleAsk}
+          questions={questions ?? []}
+          scope={scope}
+          onScope={setScope}
+          debug={debug}
+          onToggleDebug={toggleDebug}
         />
       )}
 
-      {(phase.name === "review" || phase.name === "answering") && (
+      {phase.name === "unprocessed" && (
+        <div>
+          <p>
+            <strong>“{phase.question}”</strong>
+          </p>
+          <div className="ask-unprocessed">
+            <strong>This dataset hasn't been processed yet.</strong>
+            <p>
+              It has been ingested, but there is no taxonomy and nothing is
+              labeled, so there is no coded data to answer from. Run the
+              pipeline below, then ask again.
+            </p>
+          </div>
+          <Pipeline
+            datasetId={datasetId}
+            onError={onError}
+            onProcessed={() => handleAsk(phase.question)}
+          />
+          <div style={{ marginTop: "1rem" }}>
+            <button onClick={() => handleAsk(phase.question)}>
+              Try this question again
+            </button>{" "}
+            <button onClick={() => setPhase({ name: "question" })}>
+              Ask a different question
+            </button>
+          </div>
+        </div>
+      )}
+
+      {phase.name === "answering" && !debug && (
+        <div className="ask-progress">
+          <p className="ask-eyebrow">Answering</p>
+          <h2 className="ask-progress-q">“{phase.question}”</h2>
+          <p className="ask-progress-note">
+            {phase.proposal.candidates.length} categor
+            {phase.proposal.candidates.length === 1 ? "y" : "ies"} matched ·
+            computing counts and writing the answer…
+          </p>
+          <div className="ask-progress-bar" />
+        </div>
+      )}
+
+      {(phase.name === "review" || (phase.name === "answering" && debug)) && (
         <ReviewPanel
           question={phase.question}
           proposal={phase.proposal}
           busy={phase.name === "answering"}
           onConfirm={(
-            ids,
+            selected,
             concepts,
             places,
             groupByLocation,
             actionability,
             eventsOnly,
+            timeOfDay,
           ) =>
             handleConfirm(
               phase.question,
               phase.proposal,
-              ids,
+              selected,
               concepts,
               places,
               groupByLocation,
               actionability,
               eventsOnly,
+              timeOfDay,
             )
           }
           onBack={() => setPhase({ name: "question" })}
@@ -152,41 +323,111 @@ export default function Ask({
           proposal={phase.proposal}
           result={phase.result}
           onReset={() => setPhase({ name: "question" })}
+          onRefine={() =>
+            setPhase({
+              name: "review",
+              question: phase.question,
+              proposal: phase.proposal,
+            })
+          }
         />
       )}
     </section>
   );
 }
 
+const EXAMPLE_QUESTIONS = [
+  "When residents mention affordability, what specific costs are they referring to?",
+  "What makes residents feel unsafe at night?",
+  "What concrete changes do residents propose for downtown?",
+];
+
 function QuestionForm({
   busy,
   onAsk,
+  questions,
+  scope,
+  onScope,
+  debug,
+  onToggleDebug,
 }: {
   busy: boolean;
   onAsk: (q: string) => void;
+  questions: AskQuestionOut[];
+  scope: string;
+  onScope: (s: string) => void;
+  debug: boolean;
+  onToggleDebug: () => void;
 }) {
   const [question, setQuestion] = useState("");
+  const canAsk = !busy && question.trim().length > 0;
 
   return (
-    <div>
-      <p>
-        Ask a question about what respondents said — e.g.{" "}
-        <em>"when residents mention affordability, what specific costs are they
-        referring to?"</em>
-      </p>
-      <textarea
-        value={question}
-        onChange={(e) => setQuestion(e.target.value)}
-        rows={3}
-        style={{ width: "100%", fontFamily: "inherit", fontSize: "1em" }}
-        placeholder="Your question…"
-        disabled={busy}
-      />
-      <div style={{ marginTop: "0.5rem" }}>
-        <button onClick={() => onAsk(question)} disabled={busy || !question.trim()}>
-          {busy ? "Finding relevant categories…" : "Ask"}
-        </button>
+    <div className="ask-home">
+      <div className="ask-home-card">
+        <textarea
+          className="ask-home-input"
+          value={question}
+          onChange={(e) => setQuestion(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && !e.shiftKey && canAsk) {
+              e.preventDefault();
+              onAsk(question);
+            }
+          }}
+          rows={3}
+          placeholder="e.g. what are the most common cleanliness complaints?"
+          disabled={busy}
+          autoFocus
+        />
+        <div className="ask-home-row">
+          {questions.length > 1 ? (
+            <label className="ask-home-scope">
+              Answer from{" "}
+              <select
+                value={scope}
+                onChange={(e) => onScope(e.target.value)}
+                disabled={busy}
+              >
+                <option value="">all survey questions</option>
+                {questions.map((q) => (
+                  <option key={q.question_id} value={q.question_id}>
+                    “{q.question_text}” ({q.n_responses})
+                  </option>
+                ))}
+              </select>
+            </label>
+          ) : (
+            <span />
+          )}
+          <button
+            className="ask-home-go"
+            onClick={() => onAsk(question)}
+            disabled={!canAsk}
+          >
+            {busy ? "Finding relevant categories…" : "Ask"}
+          </button>
+        </div>
       </div>
+      <div className="ask-home-examples">
+        <span className="ask-home-try">Try:</span>
+        {EXAMPLE_QUESTIONS.map((q) => (
+          <button
+            key={q}
+            className="ask-home-example"
+            onClick={() => setQuestion(q)}
+            disabled={busy}
+          >
+            {q}
+          </button>
+        ))}
+      </div>
+      <label className="ask-home-debug">
+        <input type="checkbox" checked={debug} onChange={onToggleDebug} />{" "}
+        Review the matched categories before answering (debug) — otherwise the
+        router's selection is used as-is, and you can still adjust it from the
+        answer screen
+      </label>
     </div>
   );
 }
@@ -202,12 +443,13 @@ function ReviewPanel({
   proposal: AskRouteResponse;
   busy: boolean;
   onConfirm: (
-    ids: Set<string>,
+    selected: AskSelectedCandidate[],
     concepts: Set<string>,
     places: Set<string>,
     groupByLocation: boolean,
     actionability: string,
     eventsOnly: boolean,
+    timeOfDay: string,
   ) => void;
   onBack: () => void;
 }) {
@@ -229,16 +471,228 @@ function ReviewPanel({
   const [eventsOnly, setEventsOnly] = useState(
     proposal.event_filter === "reported",
   );
+  const [timeOfDay, setTimeOfDay] = useState(proposal.time_filter);
+
+  // The full taxonomy as the server ordered it (parents holding a proposed
+  // category first). If a server predating available_categories answers, fall
+  // back to synthesizing groups from the proposal — a blank category list
+  // would be a worse failure than a shorter one.
+  const groups: AskParentGroup[] = useMemo(() => {
+    if (proposal.available_categories.length > 0) {
+      return proposal.available_categories;
+    }
+    const byKey = new Map<string, AskParentGroup>();
+    for (const c of proposal.candidates) {
+      const parent = c.parent_name ?? "Ungrouped";
+      const key = `${c.question_id}::${parent}`;
+      const g =
+        byKey.get(key) ??
+        {
+          question_id: c.question_id,
+          question_text: c.question_text,
+          parent_name: parent,
+          count_unique_responses: 0, // unknown without the tree; not shown
+          n_proposed: 0,
+          children: [],
+        };
+      g.children.push({
+        label_id: c.label_id,
+        name: c.name,
+        count: c.count,
+        description: "",
+        proposed: true,
+        relevance: c.relevance,
+        rationale: c.rationale,
+      });
+      g.n_proposed += 1;
+      byKey.set(key, g);
+    }
+    return [...byKey.values()];
+  }, [proposal.available_categories, proposal.candidates]);
+
+  const hasTree = proposal.available_categories.length > 0;
+
+  // question_id -> its parent groups, preserving the server's parent order
+  /* The analyst's scope restricts what the ROUTER was allowed to propose, but
+     the tree deliberately still shows everything — step 2 stays permissive so
+     a deliberate out-of-scope addition isn't rejected. That only works if the
+     screen is honest about it: in-scope questions come first, and anything
+     outside the scope is labelled rather than silently mixed in. */
+  const scopeSet = useMemo(
+    () => new Set(proposal.question_scope),
+    [proposal.question_scope],
+  );
 
   const byQuestion = useMemo(() => {
-    const groups = new Map<string, AskCandidate[]>();
-    for (const c of proposal.candidates) {
-      const list = groups.get(c.question_id) ?? [];
-      list.push(c);
-      groups.set(c.question_id, list);
+    const out = new Map<string, AskParentGroup[]>();
+    for (const g of groups) {
+      const list = out.get(g.question_id) ?? [];
+      list.push(g);
+      out.set(g.question_id, list);
     }
-    return groups;
-  }, [proposal.candidates]);
+    if (scopeSet.size === 0) return out;
+    return new Map(
+      [...out.entries()].sort(
+        (a, b) => Number(!scopeSet.has(a[0])) - Number(!scopeSet.has(b[0])),
+      ),
+    );
+  }, [groups, scopeSet]);
+
+  // label_id -> the router's relevance/rationale, so a ticked category carries
+  // them into the manifest and an added one is honestly blank
+  const childById = useMemo(() => {
+    const m = new Map<string, { relevance: string; rationale: string }>();
+    for (const g of groups) {
+      for (const c of g.children) {
+        m.set(c.label_id, { relevance: c.relevance, rationale: c.rationale });
+      }
+    }
+    return m;
+  }, [groups]);
+
+  const nCategories = childById.size;
+
+  // Search. 39 parent dropdowns over 297 categories is unusable by scrolling:
+  // an analyst thinks "graffiti", not "question 7 > cleanliness and
+  // infrastructure". Matching happens over the child name, its description and
+  // its parent's name, across every question at once.
+  const [query, setQuery] = useState("");
+  const q = query.trim().toLowerCase();
+
+  // A flat result list, deliberately not the tree: rendering matches inside
+  // <details> would mean forcing them open, and a computed `open` prop is the
+  // one thing this screen must not do (see the openParents note above). Flat
+  // also means the matches are visible without a click, which is the point.
+  const matches = useMemo(() => {
+    if (!q) return [];
+    const out = [];
+    for (const g of groups) {
+      const parentHit = g.parent_name.toLowerCase().includes(q);
+      for (const c of g.children) {
+        const nameHit = c.name.toLowerCase().includes(q);
+        if (nameHit || parentHit || (c.description ?? "").toLowerCase().includes(q)) {
+          out.push({
+            ...c,
+            question_id: g.question_id,
+            parent_name: g.parent_name,
+            nameHit,
+          });
+        }
+      }
+    }
+    // Name matches lead. Searching "graffiti" otherwise opens with "Trash,
+    // Litter, and Street Cleanliness" — a correct hit on its description, but
+    // it reads as a bad match. Description hits still follow, since dropping
+    // them would silently narrow recall.
+    return out.sort(
+      (a, b) =>
+        Number(b.nameHit) - Number(a.nameHit) ||
+        Number(b.proposed) - Number(a.proposed) ||
+        b.count - a.count,
+    );
+  }, [groups, q]);
+
+  // Each question induced its own taxonomy, so the same topic exists once per
+  // question ("Graffiti and vandalism" q7 / "Graffiti and Vandalism" q9 /
+  // "Vandalism and Graffiti" q6). Listed as siblings they read as duplicated
+  // data. They are not: they are three different survey questions, and a
+  // response only ever belongs to one of them. Grouping them under one topic
+  // row says that, where three near-identical rows imply the opposite.
+  const matchTopics = useMemo(() => {
+    // `matches` is already ranked, so the anchor of each cluster is its most
+    // prominent variant and gets to name the topic — inventing a name would
+    // put a category on screen that no taxonomy contains.
+    const toks = matches.map((m) => topicTokens(m.name));
+    const taken = matches.map(() => false);
+    const out = [];
+    for (let i = 0; i < matches.length; i += 1) {
+      if (taken[i]) continue;
+      taken[i] = true;
+      const items = [matches[i]];
+      for (let j = i + 1; j < matches.length; j += 1) {
+        if (!taken[j] && tokenOverlap(toks[i], toks[j]) >= TOPIC_SIMILARITY) {
+          taken[j] = true;
+          items.push(matches[j]);
+        }
+      }
+      out.push({
+        key: items.map((m) => m.label_id).join("+"),
+        name: items[0].name,
+        items,
+        // a sum over *different questions* — distinct response rows, so a real
+        // total. NOT distinct respondents: one person answers several
+        // questions, which is why this is never worded as people.
+        total: items.reduce((s, m) => s + m.count, 0),
+        proposed: items.some((m) => m.proposed),
+        nQuestions: new Set(items.map((m) => m.question_id)).size,
+      });
+    }
+    return out;
+  }, [matches]);
+
+  const nGrouped = matches.length - matchTopics.length;
+
+  // Nothing may be both selected and invisible. A search that hides ticked
+  // categories has to say so, or the analyst submits a selection they can't see.
+  const hiddenSelected = useMemo(() => {
+    if (!q) return 0;
+    const shown = new Set(matches.map((m) => m.label_id));
+    return [...selected].filter((id) => !shown.has(id)).length;
+  }, [q, matches, selected]);
+
+  function setMany(ids: string[], on: boolean) {
+    setSelected((s) => {
+      const next = new Set(s);
+      for (const id of ids) {
+        if (on) next.add(id);
+        else next.delete(id);
+      }
+      return next;
+    });
+  }
+
+  // <details> open state has to live in React: passing `open` as a plain prop
+  // would snap a parent shut on the next re-render (every checkbox tick).
+  // Parents holding a proposal start open — the proposal stays the thing the
+  // analyst reads first; everything else is one click away.
+  const [openParents, setOpenParents] = useState<Set<string>>(
+    () =>
+      new Set(
+        groups
+          .filter((g) => g.n_proposed > 0)
+          .map((g) => `${g.question_id}::${g.parent_name}`),
+      ),
+  );
+  // Keyword concepts and the place list stay collapsed until asked for; what
+  // is selected is named in the summary line, so nothing is both active and
+  // invisible.
+  const [conceptsOpen, setConceptsOpen] = useState(false);
+  const [placesOpen, setPlacesOpen] = useState(false);
+
+  function toggleParent(key: string, open: boolean) {
+    setOpenParents((s) => {
+      const next = new Set(s);
+      if (open) next.add(key);
+      else next.delete(key);
+      return next;
+    });
+  }
+
+  function submit() {
+    onConfirm(
+      [...selected].map((id) => ({
+        label_id: id,
+        relevance: childById.get(id)?.relevance || "medium",
+        rationale: childById.get(id)?.rationale || "",
+      })),
+      concepts,
+      places,
+      groupByLocation,
+      actionability,
+      eventsOnly,
+      timeOfDay,
+    );
+  }
 
   function toggle(id: string) {
     setSelected((s) => {
@@ -288,7 +742,7 @@ function ReviewPanel({
   }
 
   return (
-    <div>
+    <div className="ask-review">
       <p>
         <strong>“{question}”</strong>
       </p>
@@ -301,105 +755,378 @@ function ReviewPanel({
         </p>
       ))}
 
-      <fieldset>
+      <fieldset className="ask-fs">
         <legend>
-          Categories the answer will search — untick anything that doesn't
-          belong
+          Categories the answer will search —{" "}
+          <strong>
+            {selected.size} of {nCategories}
+          </strong>{" "}
+          selected
         </legend>
-        {[...byQuestion.entries()].map(([qid, candidates]) => (
-          <div key={qid} style={{ marginBottom: "0.75rem" }}>
-            <div style={{ fontSize: "0.85em", color: "#555", marginBottom: "0.25rem" }}>
-              Survey question {qid}: “{candidates[0].question_text}”
-            </div>
-            {candidates.map((c) => (
-              <div key={c.label_id} style={{ marginLeft: "1rem", marginBottom: "0.4rem" }}>
-                <label>
-                  <input
-                    type="checkbox"
-                    checked={selected.has(c.label_id)}
-                    onChange={() => toggle(c.label_id)}
-                    disabled={busy}
-                  />{" "}
-                  <strong>{c.name}</strong>
-                  {c.parent_name && (
-                    <span style={{ color: "#555" }}> · {c.parent_name}</span>
-                  )}{" "}
-                  <span style={{ fontFamily: "monospace" }}>n={c.count}</span>{" "}
-                  <span
-                    style={{
-                      color: RELEVANCE_COLOR[c.relevance] ?? "#6b7280",
-                      fontSize: "0.85em",
-                    }}
+        <p className="ask-fs-hint">
+          The {proposal.candidates.length} the router proposed are ticked, and
+          their parent categories are open. Every other category is here too —
+          search for one, open a parent to add one, or untick anything that
+          doesn't belong.
+        </p>
+
+        <div className="ask-search">
+          <input
+            type="search"
+            className="ask-search-input"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder={`Search all ${nCategories} categories — e.g. graffiti, parking, rent`}
+            aria-label="Search categories"
+          />
+          {q && (
+            <button
+              type="button"
+              className="ask-search-clear"
+              onClick={() => setQuery("")}
+            >
+              Clear
+            </button>
+          )}
+        </div>
+
+        {q ? (
+          <div className="ask-search-results">
+            <p className="ask-fs-hint">
+              {matches.length === 0
+                ? `No category matches “${query}”.`
+                : `${matchTopics.length} topic${matchTopics.length === 1 ? "" : "s"} match “${query}”.`}
+              {nGrouped > 0 &&
+                " Each survey question was coded separately and words the same topic differently, so those are shown as one row — different questions, not repeated responses."}
+              {hiddenSelected > 0 &&
+                ` ${hiddenSelected} selected categor${hiddenSelected === 1 ? "y is" : "ies are"} hidden by this search — still included in the answer.`}
+            </p>
+            {matchTopics.map((t) => {
+              // one question only: nothing to consolidate, render it plainly
+              if (t.items.length === 1) {
+                const m = t.items[0];
+                return (
+                  <label
+                    key={m.label_id}
+                    className={`ask-child${m.proposed ? " ask-child-proposed" : ""}`}
                   >
-                    {c.relevance}
-                  </span>
-                </label>
-                <div style={{ fontSize: "0.85em", color: "#555", marginLeft: "1.5rem" }}>
-                  {c.rationale}
+                    <input
+                      type="checkbox"
+                      checked={selected.has(m.label_id)}
+                      onChange={() => toggle(m.label_id)}
+                      disabled={busy}
+                    />
+                    <span className="ask-child-body">
+                      <span className="ask-child-head">
+                        <strong>{m.name}</strong>
+                        <span className="ask-child-n">n={m.count}</span>
+                        {m.proposed && (
+                          <span
+                            className="ask-rel"
+                            style={{
+                              color: RELEVANCE_COLOR[m.relevance] ?? "#6b7280",
+                            }}
+                          >
+                            {m.relevance}
+                          </span>
+                        )}
+                      </span>
+                      <span className="ask-child-crumb">
+                        question {m.question_id} · {m.parent_name}
+                      </span>
+                      {(m.proposed ? m.rationale : m.description) && (
+                        <span className="ask-child-sub">
+                          {m.proposed ? m.rationale : m.description}
+                        </span>
+                      )}
+                    </span>
+                  </label>
+                );
+              }
+              const ids = t.items.map((i) => i.label_id);
+              const nSel = ids.filter((id) => selected.has(id)).length;
+              return (
+                <div
+                  key={t.key}
+                  className={`ask-topic${t.proposed ? " ask-child-proposed" : ""}`}
+                >
+                  <label className="ask-topic-head">
+                    <input
+                      type="checkbox"
+                      checked={nSel === ids.length}
+                      ref={(el) => {
+                        // partial selection reads as neither on nor off
+                        if (el) el.indeterminate = nSel > 0 && nSel < ids.length;
+                      }}
+                      onChange={() => setMany(ids, nSel < ids.length)}
+                      disabled={busy}
+                    />
+                    <span className="ask-child-head">
+                      <strong>{t.name}</strong>
+                      <span className="ask-child-n">n={t.total}</span>
+                      <span className="ask-topic-note">
+                        {t.nQuestions > 1
+                          ? `worded ${t.items.length} ways across ${t.nQuestions} survey questions`
+                          : `${t.items.length} near-identical categories in one question`}
+                      </span>
+                    </span>
+                  </label>
+                  <div className="ask-topic-items">
+                    {t.items.map((m) => (
+                      <label key={m.label_id} className="ask-child">
+                        <input
+                          type="checkbox"
+                          checked={selected.has(m.label_id)}
+                          onChange={() => toggle(m.label_id)}
+                          disabled={busy}
+                        />
+                        <span className="ask-child-body">
+                          <span className="ask-child-head">
+                            <span className="ask-child-crumb">
+                              question {m.question_id} · {m.parent_name}
+                            </span>
+                            <span className="ask-child-n">n={m.count}</span>
+                            {m.proposed && (
+                              <span
+                                className="ask-rel"
+                                style={{
+                                  color:
+                                    RELEVANCE_COLOR[m.relevance] ?? "#6b7280",
+                                }}
+                              >
+                                {m.relevance}
+                              </span>
+                            )}
+                          </span>
+                          {m.name !== t.name && (
+                            <span className="ask-child-sub">
+                              worded here as “{m.name}”
+                            </span>
+                          )}
+                        </span>
+                      </label>
+                    ))}
+                  </div>
                 </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
-        ))}
+        ) : (
+          [...byQuestion.entries()].map(([qid, parents]) => (
+          <div key={qid} className="ask-qblock">
+            <div className="ask-qhead">
+              Survey question {qid}: “{parents[0].question_text}”
+              {scopeSet.size > 0 && !scopeSet.has(qid) && (
+                <span className="ask-qhead-outside">
+                  outside your scope — nothing here was proposed, but ticking it
+                  still adds it to the answer
+                </span>
+              )}
+            </div>
+            {parents.map((g) => {
+              const key = `${qid}::${g.parent_name}`;
+              const nSel = g.children.filter((c) =>
+                selected.has(c.label_id),
+              ).length;
+              return (
+                <details
+                  key={key}
+                  className="ask-parent"
+                  open={openParents.has(key)}
+                  onToggle={(e) =>
+                    toggleParent(key, (e.currentTarget as HTMLDetailsElement).open)
+                  }
+                >
+                  <summary>
+                    <span className="ask-parent-name">{g.parent_name}</span>
+                    <span className="ask-parent-meta">
+                      {nSel > 0 && (
+                        <span className="ask-sel-badge">{nSel} selected</span>
+                      )}
+                      <span>
+                        {g.children.length} categor
+                        {g.children.length === 1 ? "y" : "ies"}
+                      </span>
+                      {hasTree && (
+                        <span
+                          className="ask-parent-n"
+                          title="Responses labelled with at least one category under this parent — a union, not the sum of the child counts"
+                        >
+                          n={g.count_unique_responses}
+                        </span>
+                      )}
+                    </span>
+                  </summary>
+                  <div className="ask-children">
+                    {g.children.map((c) => (
+                      <label
+                        key={c.label_id}
+                        className={`ask-child${c.proposed ? " ask-child-proposed" : ""}`}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={selected.has(c.label_id)}
+                          onChange={() => toggle(c.label_id)}
+                          disabled={busy}
+                        />
+                        <span className="ask-child-body">
+                          <span className="ask-child-head">
+                            <strong>{c.name}</strong>
+                            <span className="ask-child-n">n={c.count}</span>
+                            {c.proposed && (
+                              <span
+                                className="ask-rel"
+                                style={{
+                                  color:
+                                    RELEVANCE_COLOR[c.relevance] ?? "#6b7280",
+                                }}
+                              >
+                                {c.relevance}
+                              </span>
+                            )}
+                          </span>
+                          {(c.proposed ? c.rationale : c.description) && (
+                            <span className="ask-child-sub">
+                              {c.proposed ? c.rationale : c.description}
+                            </span>
+                          )}
+                        </span>
+                      </label>
+                    ))}
+                  </div>
+                </details>
+              );
+            })}
+          </div>
+          ))
+        )}
       </fieldset>
 
       {proposal.available_lexicon_concepts.length > 0 && (
-        <fieldset style={{ marginTop: "1rem" }}>
-          <legend>
-            Keyword concepts — exact-match mention counts added to the answer
-          </legend>
-          {proposal.available_lexicon_concepts.map((name) => (
-            <label key={name} style={{ display: "inline-block", marginRight: "1rem" }}>
-              <input
-                type="checkbox"
-                checked={concepts.has(name)}
-                onChange={() => toggleConcept(name)}
-                disabled={busy}
-              />{" "}
-              {name}
-            </label>
-          ))}
+        <fieldset className="ask-fs">
+          <legend>Keyword concepts — optional</legend>
+          <details
+            className="ask-drop"
+            open={conceptsOpen}
+            onToggle={(e) =>
+              setConceptsOpen((e.currentTarget as HTMLDetailsElement).open)
+            }
+          >
+            <summary>
+              {concepts.size > 0 ? (
+                <>
+                  <span className="ask-sel-badge">{concepts.size} selected</span>
+                  <span className="ask-drop-names">
+                    {[...concepts].join(", ")}
+                  </span>
+                </>
+              ) : (
+                <span className="ask-drop-names">
+                  No keyword concepts — {proposal.available_lexicon_concepts.length}{" "}
+                  available
+                </span>
+              )}
+            </summary>
+            <p className="ask-fs-hint">
+              A deterministic exact-match sweep, separate from the categories:
+              ticking one adds its mention count to the answer. Recall is a
+              floor — paraphrase that avoids the terms is not matched.
+            </p>
+            <div className="ask-chipbox">
+              {proposal.available_lexicon_concepts.map((name) => (
+                <label key={name} className="ask-inline-check">
+                  <input
+                    type="checkbox"
+                    checked={concepts.has(name)}
+                    onChange={() => toggleConcept(name)}
+                    disabled={busy}
+                  />{" "}
+                  {name}
+                </label>
+              ))}
+            </div>
+          </details>
         </fieldset>
       )}
 
       {proposal.available_locations.length > 0 && (
-        <fieldset style={{ marginTop: "1rem" }}>
-          <legend>
-            Places — restrict the evidence to responses mentioning a place, or
-            organize the whole answer by place
-          </legend>
-          <label style={{ display: "block", marginBottom: "0.5rem" }}>
-            <input
-              type="checkbox"
-              checked={groupByLocation}
-              onChange={() => setGroupByLocation((v) => !v)}
+        <fieldset className="ask-fs">
+          <legend>Places</legend>
+          <div className="ask-toggle-row">
+            <button
+              type="button"
+              className={`ask-toggle${groupByLocation ? " ask-toggle-on" : ""}`}
+              aria-pressed={groupByLocation}
+              onClick={() => setGroupByLocation((v) => !v)}
               disabled={busy}
-            />{" "}
-            <strong>Organize the answer by place</strong> (for "where…"
-            questions — counts and quotes grouped per place)
-          </label>
-          {places.size > 0 && (
-            <p style={{ margin: "0 0 0.5rem", fontSize: "0.85em", color: "#555" }}>
-              Only responses mentioning a ticked place will be used as evidence.
-            </p>
-          )}
-          {proposal.available_locations.map((l) => (
-            <label
-              key={l.name}
-              style={{ display: "inline-block", marginRight: "1rem" }}
             >
-              <input
-                type="checkbox"
-                checked={places.has(l.name)}
-                onChange={() => togglePlace(l.name)}
-                disabled={busy}
-              />{" "}
-              {l.name}{" "}
-              <span style={{ color: "#555", fontFamily: "monospace" }}>
-                n={l.count}
-              </span>
-            </label>
-          ))}
+              {groupByLocation ? "✓ Sorting by place" : "Sort by place"}
+            </button>
+            <span className="ask-fs-hint">
+              For “where…” questions — counts and quotes grouped per place.
+              Only responses that volunteered a place are localizable, and the
+              answer discloses that denominator.
+            </span>
+          </div>
+          <details
+            className="ask-drop"
+            open={placesOpen}
+            onToggle={(e) =>
+              setPlacesOpen((e.currentTarget as HTMLDetailsElement).open)
+            }
+          >
+            <summary>
+              {places.size > 0 ? (
+                <>
+                  <span className="ask-sel-badge">
+                    {places.size} place{places.size === 1 ? "" : "s"}
+                  </span>
+                  <span className="ask-drop-names">{[...places].join(", ")}</span>
+                </>
+              ) : (
+                <span className="ask-drop-names">
+                  No place filter — {proposal.available_locations.length} places
+                  available
+                </span>
+              )}
+            </summary>
+            {places.size > 0 && (
+              <p className="ask-fs-hint">
+                Only responses mentioning a ticked place will be used as
+                evidence.
+              </p>
+            )}
+            {(
+              [
+                ["named", "Named places"],
+                ["type", "Kinds of place"],
+              ] as const
+            ).map(([kind, label]) => {
+              const items = proposal.available_locations.filter(
+                (l) => l.kind === kind,
+              );
+              if (items.length === 0) return null;
+              return (
+                <div key={kind} className="ask-place-group">
+                  <div className="ask-place-head">{label}</div>
+                  <div className="ask-chipbox">
+                    {items.map((l) => (
+                      <label key={l.name} className="ask-inline-check">
+                        <input
+                          type="checkbox"
+                          checked={places.has(l.name)}
+                          onChange={() => togglePlace(l.name)}
+                          disabled={busy}
+                        />{" "}
+                        {l.name}{" "}
+                        <span className="ask-child-n">n={l.count}</span>
+                      </label>
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
+          </details>
         </fieldset>
       )}
 
@@ -473,6 +1200,46 @@ function ReviewPanel({
         </fieldset>
       )}
 
+      {((proposal.available_time.day ?? 0) > 0 ||
+        (proposal.available_time.night ?? 0) > 0) && (
+        <fieldset style={{ marginTop: "1rem" }}>
+          <legend>
+            Time of day — answer only from responses that name one
+          </legend>
+          {TIME_CHOICES.map((choice) => {
+            const n = proposal.available_time[choice.value];
+            if (choice.value && !n) return null;
+            return (
+              <label
+                key={choice.value || "any"}
+                style={{ display: "block", marginBottom: "0.35rem" }}
+              >
+                <input
+                  type="radio"
+                  name="timeOfDay"
+                  checked={timeOfDay === choice.value}
+                  onChange={() => setTimeOfDay(choice.value)}
+                  disabled={busy}
+                />{" "}
+                <strong>{choice.label}</strong>
+                {choice.value !== "" && n != null && (
+                  <span style={{ color: "#555", fontFamily: "monospace" }}>
+                    {" "}
+                    n={n}
+                  </span>
+                )}
+                <span style={{ color: "#555" }}> — {choice.help}</span>
+              </label>
+            );
+          })}
+          <p style={{ margin: "0.4rem 0 0", fontSize: "0.85em", color: "#555" }}>
+            Classified from verbatim time mentions. Responses naming no time of
+            day are excluded when a filter is on — naming none says nothing
+            about when their experience happened, and the answer will say so.
+          </p>
+        </fieldset>
+      )}
+
       <fieldset style={{ marginTop: "1rem", color: "#999" }}>
         <legend style={{ color: "#999" }}>Respondent filters</legend>
         <p style={{ margin: 0, fontSize: "0.9em" }}>
@@ -482,19 +1249,7 @@ function ReviewPanel({
       </fieldset>
 
       <div style={{ marginTop: "1rem" }}>
-        <button
-          onClick={() =>
-            onConfirm(
-              selected,
-              concepts,
-              places,
-              groupByLocation,
-              actionability,
-              eventsOnly,
-            )
-          }
-          disabled={busy || selected.size === 0}
-        >
+        <button onClick={submit} disabled={busy || selected.size === 0}>
           {busy
             ? "Writing answer…"
             : `Answer from ${selected.size} categor${selected.size === 1 ? "y" : "ies"}`}
@@ -537,6 +1292,9 @@ function filterPhrase(result: AskAnswerResponse): string {
   if (result.event_filter === "reported") {
     parts.push("recounting a first-hand incident");
   }
+  if (result.time_filter === "night" || result.time_filter === "day") {
+    parts.push(`explicitly mentioning ${result.time_filter}time`);
+  }
   return parts.join(" and ");
 }
 
@@ -545,11 +1303,13 @@ function AnswerView({
   proposal,
   result,
   onReset,
+  onRefine,
 }: {
   question: string;
   proposal: AskRouteResponse;
   result: AskAnswerResponse;
   onReset: () => void;
+  onRefine: () => void;
 }) {
   const nameOf = useMemo(() => {
     const m = new Map<string, string>();
@@ -580,6 +1340,7 @@ function AnswerView({
 
   const articleRef = useRef<HTMLDivElement>(null);
   const sourcesRef = useRef<HTMLDetailsElement>(null);
+
   const [pop, setPop] = useState<{ n: number; top: number; left: number } | null>(null);
   const [flashN, setFlashN] = useState<number | null>(null);
   const [allPlaces, setAllPlaces] = useState(false);
@@ -691,6 +1452,16 @@ function AnswerView({
             Only first-hand incidents
           </span>
         )}
+        {(result.time_filter === "night" || result.time_filter === "day") && (
+          <span className="ask-chip ask-chip-route">
+            Only {result.time_filter}time mentions
+          </span>
+        )}
+        {proposal.question_scope.length > 0 && (
+          <span className="ask-chip ask-chip-route">
+            Scoped to question {proposal.question_scope.join(", ")}
+          </span>
+        )}
         {result.deselected.length > 0 && (
           <span className="ask-chip">
             {result.deselected.length} proposed categor
@@ -739,6 +1510,17 @@ function AnswerView({
               {result.event_denominator.matching}{" "}
               <span className="ask-sub">
                 of {result.event_denominator.in_scope}
+              </span>
+            </dd>
+          </div>
+        )}
+        {result.time_denominator && (
+          <div>
+            <dt>Mentioned {result.time_filter}time</dt>
+            <dd>
+              {result.time_denominator.matching}{" "}
+              <span className="ask-sub">
+                of {result.time_denominator.in_scope}
               </span>
             </dd>
           </div>
@@ -888,10 +1670,14 @@ function AnswerView({
             ))}
             {nSampled > 0 && (
               <div className="ask-sampling-note">
-                Quotes shown to the model were sampled for {nSampled}{" "}
+                {/* a note now means "these quotes are not all of them" from
+                    any cause — sampling, or a response already quoted under
+                    another place — so this no longer says "sampled" */}
+                {nSampled}{" "}
                 {byLocation ? "place" : "categor"}
-                {nSampled === 1 ? (byLocation ? "" : "y") : byLocation ? "s" : "ies"}
-                ; counts always cover the full data.
+                {nSampled === 1 ? (byLocation ? "" : "y") : byLocation ? "s" : "ies"}{" "}
+                showed the model only some of their responses; counts always
+                cover the full data.
               </div>
             )}
           </div>
@@ -990,8 +1776,9 @@ function AnswerView({
         <span>
           Saved as run <code>{result.run_id}</code> under <code>data/answers/</code>
         </span>
-        <span className="ask-actions">
+        <span className="ask-actions ask-no-print">
           <button onClick={copyAnswer}>{copied ? "Copied ✓" : "Copy answer"}</button>
+          <button onClick={onRefine}>Adjust categories &amp; re-answer</button>
           <button onClick={onReset}>Ask another question</button>
         </span>
       </div>
@@ -1102,27 +1889,36 @@ function InlineMd({
   activeN: number | null;
   onCite: (n: number, el: HTMLElement) => void;
 }) {
-  // split on **bold** and [n] citations, keeping the delimiters
-  const parts = text.split(/(\*\*[^*]+\*\*|\[\d{1,4}\])/g);
+  // split on **bold** and [n]/[n, m] citations, keeping the delimiters —
+  // one bracket may carry several citations (the model sometimes writes
+  // [1, 3] for [1][3]; the backend resolves both, so both must render)
+  const parts = text.split(/(\*\*[^*]+\*\*|\[\d{1,4}(?:\s*,\s*\d{1,4})*\])/g);
   return (
     <>
       {parts.map((part, i) => {
         if (/^\*\*[^*]+\*\*$/.test(part)) {
           return <strong key={i}>{part.slice(2, -2)}</strong>;
         }
-        const cite = part.match(/^\[(\d{1,4})\]$/);
+        const cite = part.match(/^\[(\d{1,4}(?:\s*,\s*\d{1,4})*)\]$/);
         if (cite) {
-          const n = Number(cite[1]);
-          if (!sourceNs.has(n)) return <sup key={i}>{part}</sup>;
+          const ns = cite[1].split(",").map((s) => Number(s.trim()));
           return (
-            <button
-              key={i}
-              className={`ask-cite${activeN === n ? " ask-cite-active" : ""}`}
-              title="Show the cited response"
-              onClick={(e) => onCite(n, e.currentTarget)}
-            >
-              {n}
-            </button>
+            <span key={i}>
+              {ns.map((n, j) =>
+                sourceNs.has(n) ? (
+                  <button
+                    key={j}
+                    className={`ask-cite${activeN === n ? " ask-cite-active" : ""}`}
+                    title="Show the cited response"
+                    onClick={(e) => onCite(n, e.currentTarget)}
+                  >
+                    {n}
+                  </button>
+                ) : (
+                  <sup key={j}>[{n}]</sup>
+                )
+              )}
+            </span>
           );
         }
         return <span key={i}>{part}</span>;

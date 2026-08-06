@@ -25,13 +25,21 @@ from .schemas import (
     AskAnswerResponse,
     AskAnswerStats,
     AskCandidateOut,
+    AskChildOut,
     AskGroupCountOut,
     AskLexiconCountOut,
     AskLocationOut,
+    AskParentGroupOut,
+    AskQuestionOut,
     AskRouteRequest,
     AskRouteResponse,
     AskSourceOut,
 )
+
+# Matches summary.MAX_DESC_CHARS — the review screen shows a category's
+# description so an analyst can judge an unproposed one, and a 350-category
+# tree does not need full descriptions on the wire.
+MAX_DESC_CHARS = 200
 
 router = APIRouter(prefix="/datasets/{dataset_id}/ask", tags=["ask"])
 
@@ -67,6 +75,19 @@ def _load_context(dataset_id: str, description: str) -> ask_service.AskContext:
         raise HTTPException(status_code=409, detail=str(exc))
 
 
+# The ask path uses llm.py's defaults (240s, 6 attempts) — deliberately, after
+# trying twice to be clever and making it worse both times.
+#
+# Gemini's failure mode here is a response that is SLOW, not one that never
+# arrives: a ROUTE call measured 169.9s and then SUCCEEDED, against a ~1.5s
+# median. Under the 240s default that call simply completed, and the analyst
+# waited. Shortening the timeout turned those successes into failures:
+#   * flat 30s x 3 -> three aborted attempts and a 502 the analyst actually hit;
+#   * escalating 35/90/120 -> a "TimeoutError ... attempt 1/3" on every slow
+#     call, because a 35s first attempt cuts off the common slow case.
+# A short timeout only helps when the connection is DEAD, which is not what
+# happens. Waiting is the correct behaviour; the logging below is what makes
+# waiting tolerable, because now it says so instead of looking frozen.
 def _client() -> GeminiClient:
     try:
         return GeminiClient()
@@ -101,6 +122,70 @@ def _candidate_out(c: dict, ctx: ask_service.AskContext) -> AskCandidateOut:
     )
 
 
+NO_PARENT = "Ungrouped"
+
+
+def _available_categories(route: dict,
+                          ctx: ask_service.AskContext) -> list[AskParentGroupOut]:
+    """The full taxonomy as question > parent > child, with the router's
+    proposal marked in place.
+
+    Ordering is what makes a 350-category tree usable: parents holding a
+    proposed category come first (the proposal stays the thing the analyst
+    reads), then the largest parents. Children sort proposed-first then by
+    count. Nothing is hidden — the analyst can reach every category.
+    """
+    proposed = {c["label_id"]: c for c in route["candidates"]}
+    groups: list[AskParentGroupOut] = []
+    for q in ctx.summary["questions"]:
+        by_parent: dict[str, list[dict]] = {}
+        for e in q["entries"]:
+            by_parent.setdefault(e.get("parent_name") or NO_PARENT, []).append(e)
+        for parent_name, entries in by_parent.items():
+            children = []
+            keys: set[str] = set()
+            for e in sorted(entries, key=lambda e: (e["label_id"] not in proposed,
+                                                    -e["count"],
+                                                    e["name"].lower())):
+                p = proposed.get(e["label_id"])
+                desc = e.get("description") or ""
+                children.append(AskChildOut(
+                    label_id=e["label_id"],
+                    name=e["name"],
+                    count=len(ctx.members.get(e["label_id"], [])),
+                    description=(desc[:MAX_DESC_CHARS] + "…"
+                                 if len(desc) > MAX_DESC_CHARS else desc),
+                    proposed=p is not None,
+                    relevance=p["relevance"] if p else "",
+                    rationale=p["rationale"] if p else "",
+                ))
+                # union, not a sum: one response carrying two children of the
+                # same parent is one response
+                keys.update(ctx.members.get(e["label_id"], []))
+            groups.append(AskParentGroupOut(
+                question_id=q["question_id"],
+                question_text=q["question_text"],
+                parent_name=parent_name,
+                count_unique_responses=len(keys),
+                n_proposed=sum(1 for c in children if c.proposed),
+                children=children,
+            ))
+    groups.sort(key=lambda g: (g.n_proposed == 0, -g.n_proposed,
+                               -g.count_unique_responses, g.parent_name.lower()))
+    return groups
+
+
+@router.get("/questions", response_model=list[AskQuestionOut])
+def ask_questions(dataset_id: str) -> list[AskQuestionOut]:
+    """The dataset's survey questions, for the scope selector on the ask
+    form — asked before any routing happens."""
+    ctx = _load_context(dataset_id, _dataset_description(dataset_id))
+    return [AskQuestionOut(question_id=q["question_id"],
+                           question_text=q.get("question_text", ""),
+                           n_responses=q["n_responses"])
+            for q in ctx.summary["questions"]]
+
+
 @router.post("/route", response_model=AskRouteResponse)
 def ask_route(dataset_id: str, req: AskRouteRequest) -> AskRouteResponse:
     """Step 1: propose categories. One model call. An unanswerable question
@@ -109,7 +194,11 @@ def ask_route(dataset_id: str, req: AskRouteRequest) -> AskRouteResponse:
     ctx = _load_context(dataset_id, description)
     client = _client()
     try:
-        route, stats = ask_service.propose(client, req.question, ctx, description)
+        route, stats = ask_service.propose(client, req.question, ctx,
+                                           description,
+                                           question_scope=req.question_scope)
+    except ValueError as exc:        # unknown question ids in the scope
+        raise HTTPException(status_code=422, detail=str(exc))
     except RuntimeError as exc:      # Gemini failure after retries
         raise HTTPException(status_code=502, detail=str(exc))
 
@@ -122,6 +211,7 @@ def ask_route(dataset_id: str, req: AskRouteRequest) -> AskRouteResponse:
         route=route["route"],
         reason=route["reason"],
         candidates=[_candidate_out(c, ctx) for c in route["candidates"]],
+        available_categories=_available_categories(route, ctx),
         lexicon_concepts=route["lexicon_concepts"],
         available_lexicon_concepts=sorted(ctx.valid_concepts),
         group_by=route["group_by"],
@@ -138,6 +228,12 @@ def ask_route(dataset_id: str, req: AskRouteRequest) -> AskRouteResponse:
         available_events=({"reported": len(ctx.events),
                            "coded": len(ctx.event_coded)}
                           if ctx.events else {}),
+        time_filter=route.get("time_filter", ""),
+        available_time=({"day": len(ctx.time_day),
+                         "night": len(ctx.time_night),
+                         "mentioned": len(ctx.time_mentioned)}
+                        if (ctx.time_day or ctx.time_night) else {}),
+        question_scope=route.get("question_scope", []),
         warnings=warnings,
     )
 
@@ -155,7 +251,9 @@ def ask_answer(dataset_id: str, req: AskAnswerRequest) -> AskAnswerResponse:
             req.route, req.reason, req.lexicon_concepts, ctx,
             group_by=req.group_by, location_filter=req.location_filter,
             actionability_filter=req.actionability_filter,
-            event_filter=req.event_filter)
+            event_filter=req.event_filter,
+            time_filter=req.time_filter,
+            question_scope=req.question_scope)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
@@ -195,7 +293,12 @@ def ask_answer(dataset_id: str, req: AskAnswerRequest) -> AskAnswerResponse:
         actionability_denominator=result["evidence"].get("actionability_denominator"),
         event_filter=result["evidence"].get("event_filter") or "",
         event_denominator=result["evidence"].get("event_denominator"),
+        time_filter=result["evidence"].get("time_filter") or "",
+        time_denominator=result["evidence"].get("time_denominator"),
+        location_filter_implicit_questions=result["evidence"].get(
+            "location_filter_implicit_questions") or [],
         invalid_citations=result["invalid_citations"],
         deselected=selection["deselected"],
         added=selection["added"],
     )
+

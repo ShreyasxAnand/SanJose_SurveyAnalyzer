@@ -1717,13 +1717,16 @@ def print_diagnostics(taxonomy: dict, report: dict, usage_line: str) -> None:
     print(usage_line)
 
 
-def estimate_dry_run(rows: list[ResponseRow], meta: dict, chunk_size: int, seed: int,
-                     price_in: float, price_out: float,
-                     dataset_description: str = "") -> None:
-    """Plan + cost estimate mirroring the real call structure (MAP fan-out,
-    VOCAB, batched ASSIGN, two-round DEDUP, CROSS) — the old flat
-    '+4000 in / +2000 out for consolidation' guess under-reported the exact
-    stages that dominate at production scale."""
+def plan_dry_run(rows: list[ResponseRow], meta: dict, chunk_size: int, seed: int,
+                 price_in: float, price_out: float,
+                 dataset_description: str = "") -> dict:
+    """The dry-run plan as data: call counts, token estimates and cost.
+
+    Split out from `estimate_dry_run` (which now just prints this) so the
+    pipeline API can show a real plan before spending anything, instead of
+    scraping it back out of stdout. The chunking and prompt sizes here are the
+    actual ones the run will use; only the consolidation stages are modelled,
+    since their size depends on how many candidates MAP returns."""
     chunks = make_chunks(rows, chunk_size, seed)
     est_in = est_out = 0
     for chunk in chunks:
@@ -1758,17 +1761,38 @@ def estimate_dry_run(rows: list[ResponseRow], meta: dict, chunk_size: int, seed:
         est_out += 500
 
     cost = est_in / 1e6 * price_in + est_out / 1e6 * price_out
-    total_calls = sum(n_calls.values())
+    return {
+        "question_id": meta["question_id"],
+        "question_text": meta["question_text"],
+        "responses_usable": len(rows),
+        "responses_sentinel_filtered": meta["rows_sentinel_filtered"],
+        "responses_empty": meta["rows_empty"],
+        "n_chunks": len(chunks),
+        "calls": n_calls,
+        "total_calls": sum(n_calls.values()),
+        "est_input_tokens": est_in,
+        "est_output_tokens": est_out,
+        "est_cost_usd": round(cost, 4),
+    }
+
+
+def estimate_dry_run(rows: list[ResponseRow], meta: dict, chunk_size: int, seed: int,
+                     price_in: float, price_out: float,
+                     dataset_description: str = "") -> None:
+    """Print the plan `plan_dry_run` computes. Output format unchanged."""
+    p = plan_dry_run(rows, meta, chunk_size, seed, price_in, price_out,
+                     dataset_description)
+    n_calls, est_in, est_out = p["calls"], p["est_input_tokens"], p["est_output_tokens"]
     print(f"DRY RUN — no API calls made, nothing written.")
-    print(f"  responses: {len(rows)} usable "
-          f"({meta['rows_sentinel_filtered']} sentinel non-answers filtered, "
-          f"{meta['rows_empty']} empty)")
+    print(f"  responses: {p['responses_usable']} usable "
+          f"({p['responses_sentinel_filtered']} sentinel non-answers filtered, "
+          f"{p['responses_empty']} empty)")
     print(f"  plan: {n_calls['map']} map + {n_calls['vocab']} vocab + "
           f"{n_calls['assign']} assign + ~{n_calls['dedup']} dedup + "
-          f"{n_calls['cross']} cross = ~{total_calls} calls")
+          f"{n_calls['cross']} cross = ~{p['total_calls']} calls")
     print(f"  est tokens: ~{est_in:,} in / ~{est_out:,} out "
           f"(consolidation modeled at {EST_CANDIDATES_PER_RESPONSE} candidates/response)")
-    print(f"  est cost at ${price_in}/M in, ${price_out}/M out: ~${cost:.3f}")
+    print(f"  est cost at ${price_in}/M in, ${price_out}/M out: ~${p['est_cost_usd']:.3f}")
 
 
 def utc_now() -> str:

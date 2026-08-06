@@ -9,6 +9,10 @@ from app import ask_api, ask_service
 from app.llm import Usage
 from app.main import app
 
+# Captured before any fixture monkeypatches the module attribute, so the cache
+# tests below can exercise the REAL loader rather than ask_ctx's stub.
+_REAL_LOAD_CONTEXT = ask_service.load_context
+
 
 class FakeClient:
     """Returns canned JSON per call, in order, and records usage the way a
@@ -147,7 +151,7 @@ def _fake_gemini(monkeypatch, *replies):
 
 def test_route_returns_enriched_candidates(client, monkeypatch):
     _fake_gemini(monkeypatch, ROUTE_REPLY)
-    r = client.post("/datasets/1/ask/route", json={"question": "what about theft?"})
+    r = client.post("/api/datasets/1/ask/route", json={"question": "what about theft?"})
     assert r.status_code == 200
     body = r.json()
     assert body["answerable"] is True
@@ -158,11 +162,83 @@ def test_route_returns_enriched_candidates(client, monkeypatch):
     assert c["question_text"] == "what feels unsafe?"
 
 
+def test_route_exposes_the_whole_taxonomy_tree(client, monkeypatch):
+    """The review screen shows every parent category, not only the proposed
+    ones, so the analyst can add as well as remove."""
+    _fake_gemini(monkeypatch, json.dumps({
+        "answerable": True, "route": "retrieval", "reason": "r",
+        "candidates": [{"label_id": "2_001", "relevance": "high",
+                        "rationale": "direct match"}],
+        "groups": [], "lexicon_concepts": [],
+    }))
+    r = client.post("/api/datasets/1/ask/route", json={"question": "theft?"})
+    groups = r.json()["available_categories"]
+    assert {c["label_id"] for g in groups for c in g["children"]} == {"2_001", "2_002"}
+    # the parent holding the proposal comes first — the proposal stays the
+    # thing the analyst reads, with the rest of the taxonomy behind it
+    assert groups[0]["parent_name"] == "safety"
+    assert groups[0]["n_proposed"] == 1
+    theft = groups[0]["children"][0]
+    assert theft["proposed"] is True
+    assert theft["relevance"] == "high" and theft["rationale"] == "direct match"
+    assert theft["count"] == 2                     # real count, computed
+    assert theft["description"] == "stolen things"
+    # a category the router did not pick carries no relevance or rationale —
+    # nothing invented to make it look endorsed
+    other = next(c for g in groups for c in g["children"]
+                 if c["label_id"] == "2_002")
+    assert other["proposed"] is False
+    assert other["relevance"] == "" and other["rationale"] == ""
+    assert groups[-1]["n_proposed"] == 0
+
+
+def test_parent_count_is_a_union_not_a_sum_of_children():
+    """Summing child counts would double-count every multi-label response and
+    put a number on screen that no operation over the data produced."""
+    ctx = ask_service.AskContext(
+        dataset_id="1",
+        summary={"questions": [{
+            "question_id": "2", "question_text": "q",
+            "entries": [
+                {"label_id": "2_001", "name": "A", "parent_name": "safety",
+                 "description": "", "count": 2},
+                {"label_id": "2_002", "name": "B", "parent_name": "safety",
+                 "description": "", "count": 2},
+            ]}]},
+        summary_text="", index={}, valid_ids={"2_001", "2_002"},
+        question_ids=["2"], question_totals={"2": 3},
+        lexicon={}, valid_concepts=set(), texts={}, keys_by_question={},
+        members={"2_001": ["r1", "r2"], "2_002": ["r2", "r3"]},
+    )
+    groups = ask_api._available_categories({"candidates": []}, ctx)
+    assert len(groups) == 1
+    # r2 carries both children: 3 responses, not 2 + 2
+    assert groups[0].count_unique_responses == 3
+
+
+def test_answer_logs_a_category_the_router_never_proposed(client, monkeypatch,
+                                                          ask_ctx):
+    """Additions are the mirror of deselections: one signals bad recall in the
+    router, the other a miscoded category. Both belong in the log."""
+    _fake_gemini(monkeypatch, SYNTH_REPLY)
+    r = client.post("/api/datasets/1/ask/answer", json={
+        "question": "q?", "route": "retrieval",
+        "selected": [{"label_id": "2_001"}, {"label_id": "2_002"}],
+        "proposed_label_ids": ["2_001"],
+    })
+    assert r.status_code == 200
+    body = r.json()
+    assert body["added"] == ["2_002"]
+    assert body["deselected"] == []
+    log = (ask_ctx / "answers/1/selection_log.jsonl").read_text(encoding="utf-8")
+    assert json.loads(log.splitlines()[0])["added"] == ["2_002"]
+
+
 def test_route_unanswerable_is_200(client, monkeypatch):
     _fake_gemini(monkeypatch, json.dumps(
         {"answerable": False, "route": "retrieval", "reason": "wrong domain",
          "candidates": [], "groups": [], "lexicon_concepts": []}))
-    r = client.post("/datasets/1/ask/route", json={"question": "irrelevant?"})
+    r = client.post("/api/datasets/1/ask/route", json={"question": "irrelevant?"})
     assert r.status_code == 200
     assert r.json()["answerable"] is False
     assert r.json()["candidates"] == []
@@ -170,7 +246,7 @@ def test_route_unanswerable_is_200(client, monkeypatch):
 
 def test_answer_happy_path_and_artifacts(client, monkeypatch, ask_ctx):
     _fake_gemini(monkeypatch, SYNTH_REPLY)
-    r = client.post("/datasets/1/ask/answer", json={
+    r = client.post("/api/datasets/1/ask/answer", json={
         "question": "what about theft?", "route": "retrieval", "reason": "r",
         "selected": [{"label_id": "2_001", "relevance": "high", "rationale": "x"}],
         "proposed_label_ids": ["2_001", "2_002"],
@@ -205,7 +281,7 @@ def test_answer_happy_path_and_artifacts(client, monkeypatch, ask_ctx):
 
 def test_answer_rejects_unknown_label_id(client, monkeypatch):
     _fake_gemini(monkeypatch, SYNTH_REPLY)
-    r = client.post("/datasets/1/ask/answer", json={
+    r = client.post("/api/datasets/1/ask/answer", json={
         "question": "q?", "route": "retrieval",
         "selected": [{"label_id": "9_999"}],
     })
@@ -214,7 +290,7 @@ def test_answer_rejects_unknown_label_id(client, monkeypatch):
 
 
 def test_answer_requires_selection(client):
-    r = client.post("/datasets/1/ask/answer", json={
+    r = client.post("/api/datasets/1/ask/answer", json={
         "question": "q?", "route": "retrieval", "selected": [],
     })
     assert r.status_code == 422
@@ -224,7 +300,7 @@ def test_answer_location_args_ignored_without_location_layer(client, monkeypatch
     """group_by/location_filter are guarded server-side: with no location
     artifact they fall back to category grouping instead of erroring."""
     _fake_gemini(monkeypatch, SYNTH_REPLY)
-    r = client.post("/datasets/1/ask/answer", json={
+    r = client.post("/api/datasets/1/ask/answer", json={
         "question": "where?", "route": "aggregate",
         "selected": [{"label_id": "2_001"}],
         "group_by": "location", "location_filter": ["downtown"],
@@ -242,7 +318,7 @@ def test_route_exposes_actionability_availability(client, monkeypatch):
     """The review screen can only offer the filter if it knows the corpus
     carries the field — and what ticking it would cost."""
     _fake_gemini(monkeypatch, ROUTE_REPLY)
-    r = client.post("/datasets/1/ask/route", json={"question": "what about theft?"})
+    r = client.post("/api/datasets/1/ask/route", json={"question": "what about theft?"})
     body = r.json()
     assert body["available_actionability"] == {"general": 1, "specific": 1}
     assert body["actionability_filter"] == ""      # this reply asked for none
@@ -252,7 +328,7 @@ def test_answer_actionability_filter_restricts_evidence(client, monkeypatch,
                                                         ask_ctx):
     _fake_gemini(monkeypatch, json.dumps(
         {"answer_markdown": "One concrete ask: better lighting [1]."}))
-    r = client.post("/datasets/1/ask/answer", json={
+    r = client.post("/api/datasets/1/ask/answer", json={
         "question": "what should the city do?", "route": "retrieval",
         "selected": [{"label_id": "2_001"}],
         "actionability_filter": "specific",
@@ -276,7 +352,7 @@ def test_answer_actionability_filter_restricts_evidence(client, monkeypatch,
 
 def test_answer_rejects_unknown_actionability_filter(client, monkeypatch):
     _fake_gemini(monkeypatch, SYNTH_REPLY)
-    r = client.post("/datasets/1/ask/answer", json={
+    r = client.post("/api/datasets/1/ask/answer", json={
         "question": "q?", "route": "retrieval",
         "selected": [{"label_id": "2_001"}],
         "actionability_filter": "somewhat",
@@ -299,7 +375,7 @@ def test_answer_actionability_ignored_when_labels_lack_the_field(
 
     monkeypatch.setattr(ask_service, "load_context", uncoded)
     _fake_gemini(monkeypatch, SYNTH_REPLY)
-    r = client.post("/datasets/1/ask/answer", json={
+    r = client.post("/api/datasets/1/ask/answer", json={
         "question": "q?", "route": "retrieval",
         "selected": [{"label_id": "2_001"}],
         "actionability_filter": "specific",
@@ -316,7 +392,7 @@ def test_answer_event_filter_restricts_to_first_hand_incidents(
         client, monkeypatch, ask_ctx):
     _fake_gemini(monkeypatch, json.dumps(
         {"answer_markdown": "One respondent had their car broken into [1]."}))
-    r = client.post("/datasets/1/ask/answer", json={
+    r = client.post("/api/datasets/1/ask/answer", json={
         "question": "what have people actually experienced?",
         "route": "retrieval", "selected": [{"label_id": "2_001"}],
         "event_filter": "reported",
@@ -335,7 +411,7 @@ def test_answer_rejects_negative_event_filter(client, monkeypatch):
     """There is no 'responses without an incident' filter — asking for one is
     a 422, not a silent inversion."""
     _fake_gemini(monkeypatch, SYNTH_REPLY)
-    r = client.post("/datasets/1/ask/answer", json={
+    r = client.post("/api/datasets/1/ask/answer", json={
         "question": "q?", "route": "retrieval",
         "selected": [{"label_id": "2_001"}], "event_filter": "not_reported",
     })
@@ -356,7 +432,7 @@ def test_event_denominator_excludes_failed_batch_rows(client, monkeypatch,
 
     monkeypatch.setattr(ask_service, "load_context", with_failed_row)
     _fake_gemini(monkeypatch, json.dumps({"answer_markdown": "An incident [1]."}))
-    r = client.post("/datasets/1/ask/answer", json={
+    r = client.post("/api/datasets/1/ask/answer", json={
         "question": "what happened to people?", "route": "retrieval",
         "selected": [{"label_id": "2_001"}], "event_filter": "reported",
     })
@@ -374,7 +450,7 @@ def test_answer_uses_synth_client_and_records_both_models(client, monkeypatch,
     monkeypatch.setattr(ask_api, "_client", lambda: route_fake)
     monkeypatch.setattr(ask_api, "_synth_client", lambda: synth_fake)
 
-    r = client.post("/datasets/1/ask/answer", json={
+    r = client.post("/api/datasets/1/ask/answer", json={
         "question": "q?", "route": "retrieval",
         "selected": [{"label_id": "2_001"}]})
     assert r.status_code == 200
@@ -422,9 +498,191 @@ def test_usage_block_prices_known_models_at_published_rates():
     assert "unpriced_models" not in block
 
 
+def test_dataset_parquet_ignores_a_newer_other_dataset(tmp_path, monkeypatch):
+    """Regression: discover_parquet returns the most recent export across all
+    datasets, so uploading dataset 3 silently repointed dataset 2's asks at a
+    30-row corpus and 500'd them. Resolution must be by dataset id."""
+    from app import induction
+
+    monkeypatch.setattr(induction, "DATA_DIR", tmp_path)
+    for ds in ("2", "3"):
+        d = tmp_path / "exports" / ds
+        d.mkdir(parents=True)
+        (d / "responses.parquet").write_bytes(b"x")
+    # make dataset 3 the most recent, the way a fresh upload would
+    import os
+    os.utime(tmp_path / "exports/2/responses.parquet", (1, 1))
+
+    assert ask_service.dataset_parquet("2") == tmp_path / "exports/2/responses.parquet"
+    assert ask_service.dataset_parquet("3") == tmp_path / "exports/3/responses.parquet"
+
+
+def test_dataset_parquet_missing_export_raises_not_another_corpus(tmp_path,
+                                                                  monkeypatch):
+    """A dataset with no export must fail, never silently borrow another
+    dataset's responses — a wrong answer beats no answer only never."""
+    from app import induction
+
+    monkeypatch.setattr(induction, "DATA_DIR", tmp_path)
+    d = tmp_path / "exports" / "2"
+    d.mkdir(parents=True)
+    (d / "responses.parquet").write_bytes(b"x")
+
+    with pytest.raises(FileNotFoundError, match="dataset 4"):
+        ask_service.dataset_parquet("4")
+
+
 def test_route_no_pipeline_state_is_409(client, monkeypatch):
     def boom(dataset_id, parquet=None, description=""):
         raise FileNotFoundError("no labels for dataset 99")
     monkeypatch.setattr(ask_service, "load_context", boom)
-    r = client.post("/datasets/99/ask/route", json={"question": "q?"})
+    r = client.post("/api/datasets/99/ask/route", json={"question": "q?"})
     assert r.status_code == 409
+
+
+def _two_question_ctx():
+    """Minimal in-memory context with two survey questions, for scope tests."""
+    from app import summary
+
+    s = {"dataset_description": "d", "lexicon_concepts": [],
+         "generated_utc": "2026-01-01T00:00:00Z",
+         "questions": [
+             {"question_id": "2", "question_text": "what feels unsafe?",
+              "n_responses": 3, "n_uncategorized": 0, "labels_run": "r",
+              "entries": [{"label_id": "2_001", "parent_name": "safety",
+                           "name": "Theft", "description": "d", "count": 2}]},
+             {"question_id": "3", "question_text": "what feels unclean?",
+              "n_responses": 3, "n_uncategorized": 0, "labels_run": "r",
+              "entries": [{"label_id": "3_001", "parent_name": "clean",
+                           "name": "Litter", "description": "d", "count": 2}]},
+         ]}
+    return ask_service.AskContext(
+        dataset_id="1", summary=s, summary_text=summary.render_summary(s),
+        index=summary.label_index(s), valid_ids=summary.valid_label_ids(s),
+        question_ids=["2", "3"], question_totals={"2": 3, "3": 3},
+        lexicon={}, valid_concepts=set(), texts={}, keys_by_question={},
+        members={"2_001": ["1:2:0"], "3_001": ["1:3:0"]})
+
+
+class _RecordingClient(FakeClient):
+    def complete(self, system: str, user: str) -> str:
+        self.last_system = system
+        return super().complete(system, user)
+
+
+def test_propose_question_scope_enforced_in_code():
+    """A scoped proposal cannot contain an out-of-scope category: the router
+    never sees the other questions' summary, and an id it invents anyway is
+    dropped by validation — the scope is enforced in code, not prose."""
+    ctx = _two_question_ctx()
+    reply = json.dumps({
+        "answerable": True, "route": "retrieval", "reason": "",
+        "candidates": [
+            {"label_id": "2_001", "relevance": "high", "rationale": ""},
+            {"label_id": "3_001", "relevance": "high", "rationale": "out of scope"},
+        ]})
+    client = _RecordingClient(reply)
+    route, stats = ask_service.propose(client, "q?", ctx,
+                                       question_scope=["2"])
+    assert [c["label_id"] for c in route["candidates"]] == ["2_001"]
+    assert stats["invalid_label_ids"] == 1
+    assert route["question_scope"] == ["2"]
+    assert "what feels unsafe?" in client.last_system
+    assert "what feels unclean?" not in client.last_system   # never shown
+
+
+def test_propose_unknown_scope_raises():
+    ctx = _two_question_ctx()
+    with pytest.raises(ValueError, match="Unknown question ids"):
+        ask_service.propose(FakeClient("{}"), "q?", ctx, question_scope=["9"])
+
+
+# --- context cache: the same load must not be paid twice per question ------
+
+
+@pytest.fixture
+def real_ctx(ask_ctx, monkeypatch):
+    """ask_ctx's stub replaces load_context wholesale; these tests need the
+    real one. Restore it and stub only the corpus read underneath."""
+    from app import induction
+
+    monkeypatch.setattr(ask_service, "load_context", _REAL_LOAD_CONTEXT)
+    monkeypatch.setattr(ask_service, "dataset_parquet",
+                        lambda ds, explicit=None: ask_ctx / "export.parquet")
+    rows = [induction.ResponseRow(response_key=k, text=t) for k, t in
+            {"1:2:0": "my car got stolen",
+             "1:2:1": "break-ins and it is dark",
+             "1:2:2": "nothing"}.items()]
+    monkeypatch.setattr(
+        induction, "load_questions_bulk",
+        lambda pq, qs: {q: (rows, {"question_id": q, "question_text": "t"}, [])
+                        for q in qs})
+    ask_service.invalidate_context_cache()
+    yield ask_ctx
+    ask_service.invalidate_context_cache()
+
+
+def _load(**kw):
+    return _REAL_LOAD_CONTEXT("1", **kw)
+
+
+def test_context_cache_serves_the_second_load_and_discloses_it(
+        real_ctx, monkeypatch):
+    """The stateless two-step flow loads context for /route and again for
+    /answer. Nothing between them can change it, so the second must be free —
+    and must say it came from the cache rather than quietly looking fast."""
+    import app.summary as summary_module
+    calls = {"n": 0}
+    orig = summary_module.build_summary
+
+    def counting(*a, **kw):
+        calls["n"] += 1
+        return orig(*a, **kw)
+
+    monkeypatch.setattr(summary_module, "build_summary", counting)
+
+    a = _load(description="d")
+    b = _load(description="d")
+    assert calls["n"] == 1                    # the corpus was read once
+    assert a.context_source == "computed"
+    assert b.context_source == "cache"
+    assert b.load_seconds == 0.0
+    assert b.members == a.members             # same evidence, not a rebuild
+
+
+def test_context_cache_misses_when_a_new_labels_run_appears(real_ctx):
+    """A CLI label/review/incremental run in another process writes a NEW run
+    dir; the key is a readdir, so it cannot be answered around."""
+    import app.summary as summary_module
+    _load(description="d")
+    assert _load(description="d").context_source == "cache"
+
+    newer = summary_module.LABELS_DIR / "1" / "2" / "2026-06-06T00-00-00Z_zzzz"
+    newer.mkdir(parents=True)
+    (newer / "assignments.json").write_text(json.dumps(ASSIGNMENTS),
+                                            encoding="utf-8")
+    assert _load(description="d").context_source == "computed"
+
+
+def test_context_cache_misses_on_a_different_description(real_ctx):
+    """The description feeds the summary the router reads, so it is part of
+    the key — a cached context must never be served under another one."""
+    _load(description="one")
+    assert _load(description="two").context_source == "computed"
+
+
+def test_explicit_parquet_never_served_from_cache(real_ctx):
+    """`--parquet` is the CLI steering at a specific file; a cache keyed on the
+    dataset's own export must not answer for it."""
+    _load(description="d")
+    assert _load(parquet=str(real_ctx / "other.parquet"),
+                 description="d").context_source == "computed"
+
+
+def test_invalidate_drops_the_entry(real_ctx):
+    """_write_exports calls this: an append or re-export must never be
+    answered around, whatever the clock says about mtime."""
+    _load(description="d")
+    assert _load(description="d").context_source == "cache"
+    ask_service.invalidate_context_cache("1")
+    assert _load(description="d").context_source == "computed"
