@@ -19,13 +19,17 @@ for ~$6.75, answers at ~$0.01 each.
 
 ## Setup
 
-Backend runs in a conda env named `surveyanalyzer` (Python 3.12 — the system
-Python is too new for prebuilt pandas/pyarrow wheels, and there's no compiler
-here to build from source).
+Full version: [`docs/INSTALL.md`](docs/INSTALL.md).
+
+Backend runs in a conda env named `surveyanalyzer` (Python
+3.12 — a newer Python has no prebuilt pandas/pyarrow wheels and tries to compile
+them from source, which needs a toolchain most machines lack):
 
 ```
-cd frontend && npm install       # once
-conda activate surveyanalyzer    # env built from requirements.txt
+conda create -n surveyanalyzer python=3.12 -y
+conda activate surveyanalyzer
+pip install -r backend/requirements.txt      # or requirements-dev.txt for tests
+cd frontend && npm install
 ```
 
 Model calls need `GEMINI_API_KEY` in the environment or in a `.env` at the repo
@@ -142,10 +146,14 @@ npm run build
 
 ## Resetting
 
-Drops and recreates the tables and clears `./data` — including every taxonomy,
-label run, and answer:
-
 ```
 cd backend
 python -m scripts.reset
 ```
+
+Drops and recreates every table, and deletes `data/uploads/` and
+`data/exports/`. It leaves the rest of `./data/` alone — taxonomies, labels,
+answers, and job logs survive, now orphaned. Dataset ids restart at 1, so a
+fresh upload can inherit a previous dataset's leftover artifacts. Delete
+`./data/` outright if you want a genuinely clean slate; it's recreated on the
+next start.
