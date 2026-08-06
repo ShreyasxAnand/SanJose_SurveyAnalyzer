@@ -4,9 +4,9 @@ Ask plain-language questions about open-ended survey responses and get answers
 grounded in the actual text — with real counts and quotes that trace back to
 source rows.
 
-The docs are the reference: full architecture, design
-principles, measured costs, and the reasoning behind decisions that look
-arbitrary. This file is just how to run it.
+[`docs/PRODUCT_GUIDE.md`](docs/PRODUCT_GUIDE.md) explains what the system does
+and how to read its output; [`docs/INSTALL.md`](docs/INSTALL.md) covers setup.
+This file is the short version of both.
 
 ## Status
 

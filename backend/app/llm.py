@@ -171,9 +171,9 @@ class GeminiClient:
     """Gemini generateContent over plain HTTPS. Temperature 0, JSON output.
 
     Key comes from GEMINI_API_KEY (or GOOGLE_API_KEY), looked up in the
-    environment first and then in the repo-root .env — which is gitignored and
-    gitignored, so it never reaches a commit or a transcript. Model id is a
-    plain string so new releases need no code change.
+    environment first and then in the repo-root .env — which is gitignored, so
+    it never reaches a commit. Model id is a plain string so new releases need
+    no code change.
     """
 
     def __init__(

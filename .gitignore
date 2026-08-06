@@ -15,8 +15,8 @@ __pycache__/
 /*.xls
 /*.csv
 
-# Throwaway benchmark/scratch scripts — findings get written up in the project notes,
-# the script itself hardcodes a local dataset id and won't run for anyone else.
+# Throwaway benchmark/scratch scripts — they hardcode a local dataset id and
+# won't run for anyone else.
 backend/ab.py
 
 # Node
