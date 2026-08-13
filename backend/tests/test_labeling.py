@@ -55,6 +55,67 @@ def test_invalid_ids_dropped_and_omitted_response_recorded():
         assert a["not_returned"] and a["uncategorized"] and a["locations"] == []
 
 
+PREFIXED = {"9_001", "9_002", "9_013", "9_063"}
+
+
+def test_bare_numeric_id_recovered_to_full_id():
+    """The model drops the `9_` prefix that is identical on every id in the
+    taxonomy. A bare number is that question's id, not an invented one —
+    dropping it recorded a coded response as "nothing fits"."""
+    raw = _raw([{"n": 1, "l": ["002", "13"], "f": 3}])
+    asg, stats = labeling.parse_label_output(raw, BATCH, PREFIXED)
+    assert asg[0]["label_ids"] == ["9_002", "9_013"]
+    assert stats["invalid_ids"] == 0
+    assert not asg[0]["uncategorized"]
+
+
+def test_bare_number_with_no_matching_id_is_still_invalid():
+    raw = _raw([{"n": 1, "l": ["999"], "f": 3}])
+    asg, stats = labeling.parse_label_output(raw, BATCH, PREFIXED)
+    assert asg[0]["label_ids"] == []
+    assert stats["invalid_ids"] == 1
+    assert asg[0]["uncategorized"]
+
+
+def test_ambiguous_bare_suffix_is_not_guessed():
+    """Two ids sharing a numeric suffix make the bare form ambiguous. It must
+    fail validation rather than resolve to whichever landed first."""
+    raw = _raw([{"n": 1, "l": ["002"], "f": 3}])
+    asg, stats = labeling.parse_label_output(raw, BATCH, {"9_002", "10_002"})
+    assert asg[0]["label_ids"] == []
+    assert stats["invalid_ids"] == 1
+
+
+def test_recovered_and_full_forms_dedupe_together():
+    raw = _raw([{"n": 1, "l": ["9_002", "002", "2"], "f": 3}])
+    asg, stats = labeling.parse_label_output(raw, BATCH, PREFIXED)
+    assert asg[0]["label_ids"] == ["9_002"]
+    assert stats["invalid_ids"] == 0
+
+
+def test_taxonomy_without_numeric_suffixes_is_unaffected():
+    """No {prefix}_{digits} ids means no recovery map — bare numbers stay
+    invalid, exactly as before."""
+    raw = _raw([{"n": 1, "l": ["L1", "FAKE", "7"], "f": 3}])
+    asg, stats = labeling.parse_label_output(raw, BATCH, VALID)
+    assert asg[0]["label_ids"] == ["L1"]
+    assert stats["invalid_ids"] == 2
+
+
+def test_prompt_example_uses_a_real_taxonomy_id():
+    """The worked example must not teach an id shape the taxonomy doesn't use.
+    A `q_001` placeholder shown against `9_001` ids is what taught the model to
+    drop the prefix in the first place."""
+    tax = {"question_text": "q", "labels": [
+        {"label_id": "9_001", "name": "n", "description": "d"},
+        {"label_id": "9_002", "name": "n2", "description": "d2"}]}
+    system, _ = labeling.build_label_prompts(tax, BATCH)
+    example = json.loads(system[system.index('{"responses"'):].strip())
+    # first worked row demonstrates MULTI-label with two real ids
+    assert example["responses"][0]["l"] == ["9_001", "9_002"]
+    assert "q_001" not in system
+
+
 def test_bare_array_output_normalized():
     raw = json.dumps([{"n": 1, "label_ids": ["L1"], "fit": 3,
                        "sentiment": "negative"}])
@@ -79,10 +140,13 @@ def test_prompt_declares_compact_keys_and_rules():
     # the example must render as real JSON, not leftover .format() braces
     example = system[system.index('{"responses"'):].strip()
     parsed = json.loads(example)
-    assert [r["n"] for r in parsed["responses"]] == [1, 2]
-    # second example object teaches omit-when-empty and the empty-label case
+    assert [r["n"] for r in parsed["responses"]] == [1, 2, 3]
+    # row 1: multi-label first-hand incident with a place; row 2 teaches
+    # omit-when-empty; row 3 the empty-label + f:1 (real-but-uncovered) case
+    assert parsed["responses"][0]["e"] == 1 and parsed["responses"][0]["p"]
     assert "p" not in parsed["responses"][1] and "t" not in parsed["responses"][1]
-    assert parsed["responses"][1]["l"] == []
+    assert parsed["responses"][2]["l"] == []
+    assert parsed["responses"][2]["f"] == 1
 
 
 def test_compact_wire_format_parsed():

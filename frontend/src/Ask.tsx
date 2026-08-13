@@ -223,6 +223,7 @@ export default function Ask({
         time_filter: timeOfDay,
         question_scope: proposal.question_scope,
         proposed_label_ids: proposal.candidates.map((c) => c.label_id),
+        aggregate_target: proposal.aggregate_target ?? "",
       });
       setPhase({ name: "answer", question, proposal, result });
     } catch (err) {
@@ -1249,17 +1250,36 @@ function ReviewPanel({
       </fieldset>
 
       <div style={{ marginTop: "1rem" }}>
-        <button onClick={submit} disabled={busy || selected.size === 0}>
+        {/* a tally route needs no categories — selecting some only narrows
+            the tally to their responses */}
+        <button
+          onClick={submit}
+          disabled={
+            busy ||
+            (selected.size === 0 && proposal.route !== "aggregate_direct")
+          }
+        >
           {busy
-            ? "Writing answer…"
-            : `Answer from ${selected.size} categor${selected.size === 1 ? "y" : "ies"}`}
+            ? proposal.route === "aggregate_direct"
+              ? "Computing tally…"
+              : "Writing answer…"
+            : proposal.route === "aggregate_direct"
+              ? selected.size === 0
+                ? "Compute tally over every response in scope"
+                : `Compute tally over ${selected.size} categor${selected.size === 1 ? "y" : "ies"}`
+              : `Answer from ${selected.size} categor${selected.size === 1 ? "y" : "ies"}`}
         </button>{" "}
         <button onClick={onBack} disabled={busy}>
           Back
         </button>
-        {selected.size === 0 && (
+        {selected.size === 0 && proposal.route !== "aggregate_direct" && (
           <span style={{ marginLeft: "0.75rem", color: "#b45309", fontSize: "0.9em" }}>
             Select at least one category.
+          </span>
+        )}
+        {proposal.route === "aggregate_direct" && (
+          <span style={{ marginLeft: "0.75rem", color: "#666", fontSize: "0.9em" }}>
+            Counted directly from the coded data — no AI writes this answer.
           </span>
         )}
       </div>
@@ -1272,6 +1292,7 @@ const ROUTE_DISPLAY: Record<string, string> = {
   aggregate: "Aggregate — computed counts",
   comparative: "Comparative — contrast groups",
   hybrid: "Hybrid — counts first, then reasons",
+  aggregate_direct: "Direct tally — counted, not written by AI",
 };
 
 const PLACES_SHOWN = 10;
@@ -1412,6 +1433,59 @@ function AnswerView({
   }
 
   const { stats } = result;
+
+  // Per-section breakdown charts: match a model-written "### " heading back
+  // to the category (or sub-theme) it narrates, by token overlap, so the
+  // heading can offer the FULL sub-theme distribution as a chart — the prose
+  // deliberately covers only the top sub-themes.
+  const chartFor = useMemo(() => {
+    const tok = (s: string) =>
+      new Set(
+        (s.toLowerCase().match(/[a-z]+/g) ?? []).filter(
+          (w) => !CHART_STOPWORDS.has(w),
+        ),
+      );
+    const entries: { tokens: Set<string>; data: SectionChartData }[] = [];
+    for (const [lid, b] of Object.entries(result.sub_breakdowns ?? {})) {
+      if (!b.sub_counts.length) continue;
+      const catName = nameOf.get(lid) ?? lid;
+      const rows = [
+        ...b.sub_counts.map((sc) => ({
+          name: sc.name,
+          count: sc.count,
+          id: sc.sub_label_id,
+        })),
+        ...(b.generic > 0
+          ? [{ name: "No specific sub-theme named", count: b.generic, generic: true }]
+          : []),
+      ];
+      const base = { category: catName, rows, coded: b.coded };
+      entries.push({ tokens: tok(catName), data: base });
+      for (const sc of b.sub_counts) {
+        entries.push({
+          tokens: tok(sc.name),
+          data: { ...base, highlight: sc.sub_label_id },
+        });
+      }
+    }
+    return (heading: string): SectionChartData | null => {
+      const h = tok(heading);
+      if (!h.size) return null;
+      let best: SectionChartData | null = null;
+      let bestScore = 0.34; // below this, the heading isn't about that unit
+      for (const e of entries) {
+        if (!e.tokens.size) continue;
+        const inter = [...h].filter((w) => e.tokens.has(w)).length;
+        const score = inter / (h.size + e.tokens.size - inter);
+        if (score > bestScore) {
+          bestScore = score;
+          best = e.data;
+        }
+      }
+      return best;
+    };
+  }, [result, nameOf]);
+
   const countRows = Object.entries(result.counts).sort(([, a], [, b]) => b - a);
   const countMax = Math.max(...countRows.map(([, n]) => n), 1);
   const placeRows = allPlaces
@@ -1468,6 +1542,49 @@ function AnswerView({
             {result.deselected.length === 1 ? "y" : "ies"} deselected
           </span>
         )}
+        {stats.scope_coverage != null && (
+          <span
+            className={`ask-chip${stats.scope_coverage < 0.6 ? " ask-chip-warn" : ""}`}
+            title={`The searched categories cover ${stats.unique_responses} of the ${stats.scope_total} coded responses in scope`}
+          >
+            Covers {Math.round(stats.scope_coverage * 100)}% of responses in
+            scope
+          </span>
+        )}
+        {stats.small_base && (
+          <span className="ask-chip ask-chip-warn">
+            ⚠ Small base — only {stats.unique_responses} responses
+          </span>
+        )}
+        {result.cached && (
+          <span
+            className="ask-chip"
+            title="This exact question was already answered against the current data — showing the stored answer. It refreshes automatically when the data changes."
+          >
+            ↺ Saved answer — identical every time until the data changes
+          </span>
+        )}
+        {(result.verification?.residual.length ?? 0) > 0 && (
+          <span
+            className="ask-chip ask-chip-warn"
+            title={result.verification!.residual
+              .map((v) => `${v.value}: ${v.detail}`)
+              .join("\n")}
+          >
+            ⚠ {result.verification!.residual.length} statement
+            {result.verification!.residual.length === 1 ? "" : "s"} could not
+            be verified against the data
+          </span>
+        )}
+        {result.verification?.repaired &&
+          result.verification.residual.length === 0 && (
+            <span
+              className="ask-chip"
+              title="A draft statement didn't match the computed counts or quoted sources; it was corrected before you saw it."
+            >
+              ✓ auto-corrected against the data
+            </span>
+          )}
         {result.invalid_citations > 0 && (
           <span className="ask-chip ask-chip-warn">
             ⚠ {result.invalid_citations} unresolved citation
@@ -1486,7 +1603,15 @@ function AnswerView({
         </div>
         <div>
           <dt>Responses covered</dt>
-          <dd>{stats.unique_responses}</dd>
+          <dd>
+            {stats.unique_responses}
+            {stats.scope_coverage != null && (
+              <span className="ask-sub">
+                {" "}
+                of {stats.scope_total} in scope
+              </span>
+            )}
+          </dd>
         </div>
         {result.actionability_denominator && (
           <div>
@@ -1563,6 +1688,16 @@ function AnswerView({
           same as nothing having happened to those respondents.
         </p>
       )}
+      {stats.small_base && (
+        <p className="ask-caveat">
+          Small base: this answer rests on only {stats.unique_responses}{" "}
+          responses{stats.scope_total > 0 && (
+            <> of the {stats.scope_total} coded responses in scope</>
+          )}
+          . Read it as a description of that small group, not of respondents
+          overall.
+        </p>
+      )}
       <details className="ask-method-full">
         <summary>How this answer was computed</summary>
         <p>{result.process_note}</p>
@@ -1575,6 +1710,7 @@ function AnswerView({
             sourceNs={sourceByN}
             activeN={pop?.n ?? null}
             onCite={handleCite}
+            chartFor={chartFor}
           />
 
           <details className="ask-sources" ref={sourcesRef}>
@@ -1641,33 +1777,60 @@ function AnswerView({
                 ? `Responses in each category ${filterPhrase(result)} — “of N” is the category's full size.`
                 : "Real counts from the coded data, never estimated."}
             </p>
-            {countRows.map(([lid, n]) => (
-              <div
-                key={lid}
-                className="ask-bar-row"
-                title={
-                  result.sampling_notes[lid]
-                    ? `${nameOf.get(lid) ?? lid} — answer quoted a sample (${result.sampling_notes[lid]})`
-                    : (nameOf.get(lid) ?? lid)
-                }
-              >
-                <div className="ask-bar-label">
-                  <span className="ask-nm">{nameOf.get(lid) ?? lid}</span>
-                  <span className="ask-ct">
-                    {n}
-                    {result.counts_unfiltered[lid] != null && (
-                      <span className="ask-sub"> of {result.counts_unfiltered[lid]}</span>
-                    )}
-                  </span>
-                </div>
-                <div className="ask-bar-track">
+            {countRows.map(([lid, n]) => {
+              const breakdown = result.sub_breakdowns?.[lid];
+              return (
+                <div key={lid}>
                   <div
-                    className="ask-bar-fill"
-                    style={{ width: `${Math.max((n / countMax) * 100, 2)}%` }}
-                  />
+                    className="ask-bar-row"
+                    title={
+                      result.sampling_notes[lid]
+                        ? `${nameOf.get(lid) ?? lid} — answer quoted a sample (${result.sampling_notes[lid]})`
+                        : (nameOf.get(lid) ?? lid)
+                    }
+                  >
+                    <div className="ask-bar-label">
+                      <span className="ask-nm">{nameOf.get(lid) ?? lid}</span>
+                      <span className="ask-ct">
+                        {n}
+                        {result.counts_unfiltered[lid] != null && (
+                          <span className="ask-sub"> of {result.counts_unfiltered[lid]}</span>
+                        )}
+                      </span>
+                    </div>
+                    <div className="ask-bar-track">
+                      <div
+                        className="ask-bar-fill"
+                        style={{ width: `${Math.max((n / countMax) * 100, 2)}%` }}
+                      />
+                    </div>
+                  </div>
+                  {breakdown && breakdown.sub_counts.length > 0 && (
+                    /* the full-coverage composition the answer's sections are
+                       built from — every member of the category was coded, so
+                       these are counts, not a sample */
+                    <div className="ask-subthemes">
+                      {breakdown.sub_counts.map((sc) => (
+                        <div key={sc.sub_label_id} className="ask-subtheme-row">
+                          <span className="ask-subtheme-ct">{sc.count}</span>
+                          <span className="ask-subtheme-nm">{sc.name}</span>
+                        </div>
+                      ))}
+                      {breakdown.generic > 0 && (
+                        <div className="ask-subtheme-row ask-subtheme-generic">
+                          <span className="ask-subtheme-ct">
+                            {breakdown.generic}
+                          </span>
+                          <span className="ask-subtheme-nm">
+                            raise it only generically — no specific sub-theme
+                          </span>
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
-              </div>
-            ))}
+              );
+            })}
             {nSampled > 0 && (
               <div className="ask-sampling-note">
                 {/* a note now means "these quotes are not all of them" from
@@ -1681,6 +1844,27 @@ function AnswerView({
               </div>
             )}
           </div>
+
+          {(result.uncovered_categories?.length ?? 0) > 0 && (
+            <div className="ask-panel">
+              <h5>Not covered by this answer</h5>
+              <p className="ask-hint">
+                The searched categories cover{" "}
+                {stats.scope_coverage != null
+                  ? `${Math.round(stats.scope_coverage * 100)}%`
+                  : "a minority"}{" "}
+                of responses in scope. The largest categories left out:
+              </p>
+              {result.uncovered_categories.map((u) => (
+                <div key={u.label_id} className="ask-bar-row">
+                  <div className="ask-bar-label">
+                    <span className="ask-nm">{u.name}</span>
+                    <span className="ask-ct">{u.count}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
 
           {result.location_counts.length > 0 && (
             <div className="ask-panel">
@@ -1791,17 +1975,66 @@ function AnswerView({
 // **bold**. The first paragraph is the takeaway and gets lede styling.
 // Citations like [12] become buttons opening the source popover. Kept
 // dependency-free on purpose.
+// words too common in category/sub-theme names to signal a match
+const CHART_STOPWORDS = new Set([
+  "and", "the", "of", "to", "in", "for", "a", "on", "with", "general",
+  "specific", "other", "more",
+]);
+
+interface SectionChartData {
+  category: string;
+  rows: { name: string; count: number; id?: string; generic?: boolean }[];
+  coded: number;
+  highlight?: string;
+}
+
+function SectionChart({ data }: { data: SectionChartData }) {
+  const max = Math.max(...data.rows.map((r) => r.count), 1);
+  return (
+    <div className="ask-sec-chart">
+      <div className="ask-sec-chart-head">
+        Full breakdown of “{data.category}” — {data.coded.toLocaleString()}{" "}
+        coded responses; one response can raise several sub-themes
+      </div>
+      {data.rows.map((r) => (
+        <div
+          key={r.id ?? r.name}
+          className={
+            "ask-chart-row" +
+            (r.generic ? " ask-chart-generic" : "") +
+            (data.highlight && r.id === data.highlight ? " ask-chart-hl" : "")
+          }
+        >
+          <span className="ask-chart-ct">{r.count.toLocaleString()}</span>
+          <div className="ask-chart-body">
+            <span className="ask-chart-nm">{r.name}</span>
+            <div className="ask-chart-track">
+              <div
+                className="ask-chart-fill"
+                style={{ width: `${Math.max((r.count / max) * 100, 2)}%` }}
+              />
+            </div>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function AnswerMarkdown({
   text,
   sourceNs,
   activeN,
   onCite,
+  chartFor,
 }: {
   text: string;
   sourceNs: Map<number, AskSource>;
   activeN: number | null;
   onCite: (n: number, el: HTMLElement) => void;
+  chartFor?: (heading: string) => SectionChartData | null;
 }) {
+  const [openCharts, setOpenCharts] = useState<Set<number>>(new Set());
   // split into homogeneous segments: a heading, a run of bullets, a run of
   // "> " note lines, or a run of plain lines each become their own segment,
   // even when the model omits blank lines between them (it often writes a
@@ -1810,6 +2043,7 @@ function AnswerMarkdown({
     /^#{1,4}\s/.test(l) ? "heading"
     : l.startsWith("- ") ? "bullet"
     : l.startsWith("> ") ? "note"
+    : l.startsWith("|") ? "table"
     : "plain";
   const segments = text
     .split(/\n{2,}/)
@@ -1847,7 +2081,34 @@ function AnswerMarkdown({
     <div>
       {segments.map((block, i) => {
         const heading = block.match(/^(#{1,4})\s+(.*)$/);
-        if (heading) return <h4 key={i}>{inline(heading[2])}</h4>;
+        if (heading) {
+          const chart = chartFor?.(heading[2]) ?? null;
+          if (!chart) return <h4 key={i}>{inline(heading[2])}</h4>;
+          const open = openCharts.has(i);
+          return (
+            <div key={i}>
+              <h4>
+                {inline(heading[2])}{" "}
+                <button
+                  className={"ask-chart-btn" + (open ? " ask-chart-btn-on" : "")}
+                  title="Full sub-theme breakdown for this section"
+                  aria-expanded={open}
+                  onClick={() =>
+                    setOpenCharts((prev) => {
+                      const next = new Set(prev);
+                      if (next.has(i)) next.delete(i);
+                      else next.add(i);
+                      return next;
+                    })
+                  }
+                >
+                  ▤ breakdown
+                </button>
+              </h4>
+              {open && <SectionChart data={chart} />}
+            </div>
+          );
+        }
         if (block.trim() === "---") return <hr key={i} />;
         const lines = block.split("\n");
         if (lines[0].startsWith("> ")) {
@@ -1865,6 +2126,40 @@ function AnswerMarkdown({
               ))}
             </ul>
           );
+        }
+        if (lines[0].startsWith("|")) {
+          // pipe table — tally answers (route "aggregate_direct") arrive as
+          // one. Row 2 is the |---|---| separator; drop it, first row heads.
+          const rows = lines
+            .filter((l) => !/^\|[\s|:-]+\|$/.test(l))
+            .map((l) =>
+              l.replace(/^\|/, "").replace(/\|$/, "").split("|").map((c) => c.trim()),
+            );
+          if (rows.length > 1) {
+            const [head, ...body] = rows;
+            return (
+              <div key={i} className="ask-md-table-wrap">
+                <table className="ask-md-table">
+                  <thead>
+                    <tr>
+                      {head.map((c, j) => (
+                        <th key={j}>{inline(c)}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {body.map((r, j) => (
+                      <tr key={j}>
+                        {r.map((c, k) => (
+                          <td key={k}>{inline(c)}</td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            );
+          }
         }
         const isLede = !sawParagraph;
         sawParagraph = true;

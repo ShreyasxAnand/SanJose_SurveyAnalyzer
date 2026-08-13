@@ -21,10 +21,21 @@ import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from . import induction, labeling, llm, locations as locations_mod, router, summary
+from . import induction, labeling, llm, locations as locations_mod, router, subthemes, summary, verify
 from .llm import ModelClient
 
 ANSWERS_DIR = induction.DATA_DIR / "answers"
+
+# Coverage guardrails. SMALL_BASE_N follows the ~200-comment threshold the
+# Key Point Analysis literature uses for "a human could have just read
+# these": below it the answer must say its base is small, prominently.
+# COVERAGE_FLOOR is the share of in-scope coded responses the selected
+# categories must cover before the answer stops having to name what it
+# leaves out (the q15_04 case: 84 of 5,894 covered, disclosed only in a
+# footnote nobody read).
+SMALL_BASE_N = 200
+COVERAGE_FLOOR = 0.60
+MAX_UNCOVERED_SHOWN = 5
 
 # Deterministic day/night classification of labeling's verbatim time_context
 # spans. Deliberately coarse: a span matching neither set (e.g. "recently",
@@ -84,6 +95,18 @@ class AskContext:
     time_day: set[str] = field(default_factory=set)
     time_night: set[str] = field(default_factory=set)
     time_mentioned: set[str] = field(default_factory=set)
+    # Sub-theme layer (app.subthemes): full-coverage sub-code membership
+    # within large categories, so answers get real intra-category
+    # denominators instead of inferring structure from sampled quotes.
+    # Empty when no sub-themes run exists — everything downstream degrades
+    # to exactly the pre-sub-theme behavior.
+    sub_members: dict[str, dict[str, list[str]]] = field(default_factory=dict)
+    sub_names: dict[str, str] = field(default_factory=dict)
+    sub_coded: dict[str, set[str]] = field(default_factory=dict)
+    sub_runs: dict[str, str] = field(default_factory=dict)
+    # label_id -> its sub-theme names, for the routing summary — the router
+    # sees NAMES only (selection stays at category level)
+    sub_names_by_label: dict[str, list[str]] = field(default_factory=dict)
     # How long this context took to assemble, and whether the location sweep
     # was read from its cache or recomputed. Both land in the answer manifest:
     # the load is the bulk of an ask's wall clock, and a run that reports only
@@ -171,7 +194,37 @@ def _context_key(dataset_id: str, description: str) -> str:
             runs = sorted(d.name for d in qdir.iterdir()
                           if d.is_dir() and (d / "assignments.json").exists())
             parts.append(f"{qdir.name}={runs[-1] if runs else '-'}")
+    sub_dir = subthemes.SUBTHEMES_DIR / str(dataset_id)
+    if sub_dir.is_dir():
+        for qdir in sorted(p for p in sub_dir.iterdir() if p.is_dir()):
+            runs = sorted(d.name for d in qdir.iterdir()
+                          if d.is_dir() and (d / "sub_taxonomy.json").exists())
+            parts.append(f"sub:{qdir.name}={runs[-1] if runs else '-'}")
+    # Run-dir NAMES are not enough: taxonomies and sub-taxonomies invite
+    # in-place hand edits (their review_instructions say so), and those
+    # change answers without creating a run dir. Stat every artifact file so
+    # an edit — any run, any question — changes the key. Stats only, no
+    # reads; a few dozen files, well under a millisecond.
+    for root, pattern in (
+        (summary.TAXONOMY_DIR / str(dataset_id), "*/*/candidate_taxonomy.json"),
+        (summary.LABELS_DIR / str(dataset_id), "*/*/assignments.json"),
+        (subthemes.SUBTHEMES_DIR / str(dataset_id), "*/*/sub_taxonomy.json"),
+        (subthemes.SUBTHEMES_DIR / str(dataset_id), "*/*/sub_assignments.json"),
+    ):
+        n, size, mtime = 0, 0, 0
+        for f in root.glob(pattern) if root.is_dir() else ():
+            try:
+                st = f.stat()
+            except OSError:
+                continue
+            n += 1
+            size += st.st_size
+            mtime = max(mtime, st.st_mtime_ns)
+        parts.append(f"{pattern}:{n}:{size}:{mtime}")
+    # both export forms: dataset_parquet() serves whichever exists, so both
+    # must be watched — a reshaped-only dataset re-exported must invalidate
     for p in (induction.DATA_DIR / "exports" / str(dataset_id) / "responses.parquet",
+              induction.DATA_DIR / "exports" / str(dataset_id) / "reshaped.parquet",
               summary.LOCATIONS_DIR / str(dataset_id) / "locations.json",
               summary.LEXICON_DIR / str(dataset_id) / "lexicon.json"):
         try:
@@ -180,6 +233,24 @@ def _context_key(dataset_id: str, description: str) -> str:
         except OSError:
             parts.append(f"{p.name}:-")
     return "|".join(parts)
+
+
+def ask_logic_hash() -> str:
+    """Fingerprint of this module's answer-shaping behavior, for the
+    persistent ask cache: coverage guardrail thresholds and the day/night
+    classification regexes all change what an answer says without touching
+    any prompt text. Tuning one must invalidate stored answers."""
+    blob = repr((SMALL_BASE_N, COVERAGE_FLOOR, MAX_UNCOVERED_SHOWN,
+                 TIME_NIGHT_RE.pattern, TIME_DAY_RE.pattern)).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()[:16]
+
+
+def context_cache_key(dataset_id: str | int, description: str = "") -> str:
+    """The dataset's current data-state fingerprint, for the persistent ask
+    cache (app.ask_cache). Same key the in-process context cache validates
+    against — a cached answer can never be more stale than the context the
+    live pipeline would answer from. Cheap: stat + readdir only."""
+    return _context_key(str(dataset_id), description or "")
 
 
 def invalidate_context_cache(dataset_id: str | int | None = None) -> None:
@@ -271,6 +342,12 @@ def load_context(dataset_id: str, parquet: str | None = None,
     question_texts = {q["question_id"]: q.get("question_text", "")
                       for q in s["questions"]}
 
+    sub_members, sub_names, sub_coded, sub_runs = subthemes.load_sub_context(
+        dataset_id, question_ids)
+    sub_names_by_label = {
+        lid: [sub_names[sid] for sid in sorted(subs) if sid in sub_names]
+        for lid, subs in sub_members.items()}
+
     locations: dict = {}
     location_members: dict[str, list[str]] = {}
     location_implicit_questions: dict[str, set[str]] = {}
@@ -300,7 +377,7 @@ def load_context(dataset_id: str, parquet: str | None = None,
     ctx = AskContext(
         dataset_id=dataset_id,
         summary=s,
-        summary_text=summary.render_summary(s),
+        summary_text=summary.render_summary(s, sub_names_by_label),
         index=summary.label_index(s),
         valid_ids=summary.valid_label_ids(s),
         question_ids=question_ids,
@@ -323,6 +400,11 @@ def load_context(dataset_id: str, parquet: str | None = None,
         time_day=time_day,
         time_night=time_night,
         time_mentioned=time_mentioned,
+        sub_members=sub_members,
+        sub_names=sub_names,
+        sub_coded=sub_coded,
+        sub_runs=sub_runs,
+        sub_names_by_label=sub_names_by_label,
         load_seconds=time.time() - t0,
         location_members_source=members_source,
         context_source="computed",
@@ -360,7 +442,7 @@ def propose(client: ModelClient, question: str, ctx: AskContext,
         scoped = {**ctx.summary,
                   "questions": [q for q in ctx.summary["questions"]
                                 if q["question_id"] in scope]}
-        summary_text = summary.render_summary(scoped)
+        summary_text = summary.render_summary(scoped, ctx.sub_names_by_label)
         valid_ids = {e["label_id"] for q in scoped["questions"]
                      for e in q["entries"]}
     route, stats = router.run_route(
@@ -373,6 +455,31 @@ def propose(client: ModelClient, question: str, ctx: AskContext,
                      "mentioned": len(ctx.time_mentioned)}
                     if ctx.time_mentioned else None)
     route["question_scope"] = scope
+
+    # Add-only completeness ratification: code finds unselected categories
+    # sharing meaningful terms with the question; one cheap call rules on
+    # exactly those. Fires only when the net catches something, and can only
+    # ADD low-relevance lines the analyst can untick — a correct selection
+    # cannot be damaged (observed miss it exists for: the violent-vs-QoL ask
+    # that excluded the two biggest quality-of-life categories).
+    if route.get("answerable") and route.get("route") != "aggregate_direct":
+        questions_src = (ctx.summary["questions"] if not scope else
+                         [q for q in ctx.summary["questions"]
+                          if q["question_id"] in scope])
+        entries = [e for q in questions_src for e in q["entries"]]
+        selected = {c["label_id"] for c in route["candidates"]}
+        missed = router.candidate_misses(question, entries, selected,
+                                         route_name=route.get("route", ""))
+        if missed:
+            added = router.run_ratify(
+                client, question, missed, description,
+                selected=[e for e in entries if e["label_id"] in selected])
+            for lid in added:
+                route["candidates"].append({
+                    "label_id": lid, "relevance": "low",
+                    "rationale": "added by completeness check"})
+            stats["completeness"] = {
+                "scanned": len(missed), "added": added}
     return route, stats
 
 
@@ -467,13 +574,24 @@ def process_note(route: dict, evidence: dict, ctx: AskContext,
         f"Routed as {ROUTE_LABEL.get(route['route'], route['route'])}"
         + (f" — {route['reason'].rstrip('.')}" if route["reason"] else "") + ".",
         f"Searched {len(sel)} of {len(ctx.valid_ids)} categories ({shown}), "
-        f"covering {unique} unique responses.",
+        f"covering {unique} unique responses"
+        + (f" — {round(100 * (evidence.get('scope_coverage') or {}).get('ratio', 0) or 0)}% "
+           f"of the {(evidence.get('scope_coverage') or {}).get('scope_total')} "
+           f"coded responses in scope"
+           if (evidence.get("scope_coverage") or {}).get("ratio") is not None
+           else "") + ".",
         f"Showed {len(evidence['quotes'])} verbatims to the answering model"
         + (f" (quote coverage disclosed for {n_sampled} categor"
            + ("y" if n_sampled == 1 else "ies")
            + "; counts always cover the full data)" if n_sampled else "")
         + f"; {n_cited} of them are cited in the answer.",
     ]
+    if evidence.get("small_base"):
+        parts.append(f"CAUTION: small base — only {unique} responses underlie "
+                     f"this answer.")
+    if evidence.get("uncovered_categories"):
+        top_un = ", ".join(u["name"] for u in evidence["uncovered_categories"][:3])
+        parts.append(f"Largest in-scope categories NOT searched: {top_un}.")
     for note in budget_notes:
         parts.append(f"Quote budget: {note}.")
     if evidence.get("location_filter"):
@@ -546,6 +664,7 @@ def answer(
     proposed_label_ids: list[str] | None = None,
     route_stats: dict | None = None,
     synth_client: ModelClient | None = None,
+    skip_verification: bool = False,
 ) -> dict:
     """Step 2: evidence + synthesis + artifacts, from an approved route.
 
@@ -557,6 +676,13 @@ def answer(
     `synth_client` writes the answer; it defaults to `client` but is normally
     a stronger model, since synthesis is one call per question while every
     other stage scales with the corpus."""
+    if route.get("route") == "aggregate_direct":
+        # tally routes never synthesize — every figure is a computed count
+        # and the narration is a template, so the whole answer costs zero
+        # model calls past the route step
+        return answer_aggregate(client, question, route, ctx,
+                                description=description,
+                                route_stats=route_stats)
     t0 = time.time()
     synth = synth_client or client
     evidence = router.gather_evidence(
@@ -571,25 +697,90 @@ def answer(
         location_implicit_questions=ctx.location_implicit_questions or None,
         time_day_keys=ctx.time_day or None,
         time_night_keys=ctx.time_night or None,
-        time_mentioned_keys=ctx.time_mentioned or None)
+        time_mentioned_keys=ctx.time_mentioned or None,
+        sub_members=ctx.sub_members or None,
+        sub_names=ctx.sub_names or None,
+        sub_coded=ctx.sub_coded or None)
     lex_counts = router.lexicon_counts(
         ctx.lexicon, route["lexicon_concepts"], ctx.keys_by_question, ctx.texts
     ) if route["lexicon_concepts"] else []
+
+    # Coverage guardrails — computed BEFORE synthesis so the counts block can
+    # force the answer to disclose what it does and does not cover.
+    scope_qids = sorted({s["question_id"] for s in evidence["selection"]})
+    scope_total = sum(ctx.question_totals.get(q, 0) for q in scope_qids)
+    covered = evidence["n_unique_responses"]
+    evidence["scope_coverage"] = {
+        "covered": covered, "scope_total": scope_total, "questions": scope_qids,
+        "ratio": round(covered / scope_total, 3) if scope_total else None}
+    evidence["small_base"] = 0 < covered < SMALL_BASE_N
+    if scope_total and covered < COVERAGE_FLOOR * scope_total:
+        selected_lids = {s["label_id"] for s in evidence["selection"]}
+        uncovered = [
+            {"label_id": lid, "name": e["name"],
+             "count": len(ctx.members.get(lid, []))}
+            for lid, e in ctx.index.items()
+            if e["question_id"] in scope_qids and lid not in selected_lids
+            and ctx.members.get(lid)]
+        uncovered.sort(key=lambda u: (-u["count"], u["label_id"]))
+        evidence["uncovered_categories"] = uncovered[:MAX_UNCOVERED_SHOWN]
 
     raw_answer = router.run_synth(synth, question, route, evidence, ctx.index,
                                   lex_counts, ctx.question_totals, description,
                                   ctx.question_texts or None)
     answer_body, cited, n_invalid = router.resolve_citations(raw_answer, evidence)
+
+    # Verification: deterministic guards on every answer (free); one repair
+    # call ONLY when a guard fails — see verify.py. Whatever survives repair
+    # is disclosed, never silently shipped.
+    violations = verify.find_violations(answer_body, evidence, lex_counts,
+                                        ctx.question_totals)
+    verification = {"checked": True, "violations": violations,
+                    "repaired": False, "residual": []}
+    if violations and not skip_verification:
+        plan_str = router.render_section_plan(evidence)
+        fixed = verify.repair(
+            synth, answer_body, violations,
+            router.render_counts_block(evidence, lex_counts,
+                                       ctx.question_totals,
+                                       ctx.question_texts or None),
+            router.render_quotes_block(evidence, ctx.index),
+            question=question,
+            section_plan=plan_str)
+        residual = violations
+        if fixed:
+            f_body, f_cited, f_invalid = router.resolve_citations(fixed, evidence)
+            f_residual = verify.find_violations(f_body, evidence, lex_counts,
+                                                ctx.question_totals)
+            if len(f_residual) < len(violations):
+                answer_body, cited, n_invalid = f_body, f_cited, f_invalid
+                verification["repaired"] = True
+                # the repairer is told to preserve the plan; verify it did —
+                # structure breakage is disclosed, never silently accepted
+                residual = f_residual + verify.plan_structure_violations(
+                    f_body, plan_str)
+        verification["residual"] = residual
+    elif violations:
+        verification["residual"] = violations
+
     # the single-document form (body + Sources) goes to answer.md and the
     # CLI; the API returns the body and the sources as separate fields
     answer_md = answer_body + router.render_sources_section(cited)
     note = process_note(route, evidence, ctx, len(cited), lex_counts)
+    if verification["residual"]:
+        note += (f" CAUTION: {len(verification['residual'])} statement"
+                 f"{'' if len(verification['residual']) == 1 else 's'} could "
+                 f"not be verified against the computed data — see the "
+                 f"verification record.")
     stats = {
         "categories_searched": len(evidence["selection"]),
         "categories_total": len(ctx.valid_ids),
         "unique_responses": evidence["n_unique_responses"],
         "quotes_shown": len(evidence["quotes"]),
         "quotes_cited": len(cited),
+        "scope_total": scope_total,
+        "scope_coverage": evidence["scope_coverage"]["ratio"],
+        "small_base": evidence["small_base"],
     }
 
     selected_ids = [c["label_id"] for c in route["candidates"]]
@@ -631,6 +822,166 @@ def answer(
         "cited": cited,
         "invalid_citations": n_invalid,
         "selection": selection,
+        "verification": verification,
+    }
+
+
+def answer_aggregate(client: ModelClient, question: str, route: dict,
+                     ctx: AskContext, description: str = "",
+                     route_stats: dict | None = None) -> dict:
+    """Deterministic answer for route "aggregate_direct": the tally the
+    question asks for, computed from coded data and narrated by template.
+    No synthesis call — nothing here can hallucinate, and identical inputs
+    produce byte-identical answers. Candidates, when present, narrow the
+    tally to their members; otherwise it covers every coded response in
+    the question scope."""
+    t0 = time.time()
+    target = route.get("aggregate_target", "")
+    scope_qids = [q for q in (route.get("question_scope") or []) or ctx.question_ids]
+    scope: set[str] = set()
+    for q in scope_qids:
+        scope.update(ctx.keys_by_question.get(q, []))
+    n_question_scope = len(scope)
+    narrowed = bool(route.get("candidates"))
+    if narrowed:
+        selected: set[str] = set()
+        for c in route["candidates"]:
+            selected.update(ctx.members.get(c["label_id"], []))
+        scope &= selected
+    q_names = ", ".join(f'"{ctx.question_texts.get(q, q)}"' for q in scope_qids)
+    # When categories narrow the tally, "coded responses to <question>" would
+    # claim the wrong denominator (a reviewer caught 1,350 category-narrowed
+    # responses being presented as the question's total of 3,322) — the
+    # attribution must say which base it is.
+    if narrowed:
+        q_names = (f"{q_names} within the {len(route['candidates'])} selected "
+                   f"categor{'y' if len(route['candidates']) == 1 else 'ies'} "
+                   f"(the question has {n_question_scope} coded responses in "
+                   f"total)")
+    n_scope = len(scope)
+
+    lines: list[str] = []
+    aggregate: dict = {"target": target, "in_scope": n_scope,
+                       "questions": scope_qids}
+    if target == "location":
+        rows = []
+        naming: set[str] = set()
+        for name, keys in ctx.location_members.items():
+            hit = scope & set(keys)
+            if hit:
+                naming |= hit
+                rows.append({"name": name,
+                             "kind": ctx.location_kinds.get(name, "type"),
+                             "count": len(hit)})
+        rows.sort(key=lambda r: (-r["count"], r["name"]))
+        aggregate.update({"naming_any": len(naming), "counts": rows[:50]})
+        lines += [
+            f"Of the **{n_scope}** coded responses to {q_names}, "
+            f"**{len(naming)}** name at least one place. The most-mentioned "
+            f"places (a response can name several):", ""]
+        lines += [f"| Place | Kind | Responses |", "|---|---|---|"]
+        lines += [f"| {r['name']} | {r['kind']} | {r['count']} |"
+                  for r in rows[:20]]
+        if len(rows) > 20:
+            lines.append(f"\n…and {len(rows) - 20} more places with smaller "
+                         f"counts.")
+        lines.append(f"\nThe remaining {n_scope - len(naming)} responses name "
+                     f"no place; that says nothing about where their concern "
+                     f"applies.")
+    elif target == "time":
+        mentioned = scope & ctx.time_mentioned
+        day, night = scope & ctx.time_day, scope & ctx.time_night
+        both = day & night
+        classified = day | night
+        # `mentioned` includes ANY time phrase the coding captured —
+        # frequencies ("every weekend") and periods ("since covid") as well
+        # as times of day. The rendered arithmetic must close: mentioned =
+        # classified day/night + other-time-phrases (a reviewer caught the
+        # earlier wording implying 439 all named a time of day when only
+        # 192 did).
+        aggregate.update({"mentioning_any": len(mentioned), "day": len(day),
+                          "night": len(night), "both": len(both),
+                          "day_or_night": len(classified)})
+        lines += [
+            f"Of the **{n_scope}** coded responses to {q_names}, "
+            f"**{len(mentioned)}** include some time reference, and "
+            f"**{len(classified)}** of those name a time of day:", "",
+            f"- **{len(night)}** mention nighttime (“at night”, "
+            f"“after dark”…)",
+            f"- **{len(day)}** mention daytime",
+            f"- **{len(both)}** mention both", "",
+            f"The other {len(mentioned) - len(classified)} time references "
+            f"are frequencies or periods (“every weekend”, “for years”), "
+            f"not times of day. The remaining "
+            f"{n_scope - len(mentioned)} responses name no time at all — "
+            f"which is not evidence about when their experience happened, "
+            f"so no day/night split can honestly be claimed for them."]
+    elif target == "event":
+        coded = scope & ctx.event_coded
+        events = scope & ctx.events
+        aggregate.update({"coded": len(coded), "reported_incident": len(events)})
+        uncoded = n_scope - len(coded)
+        lines += [
+            f"Of the **{len(coded)}** coded responses to {q_names}, "
+            f"**{len(events)}** recount a specific incident that actually "
+            f"happened to a particular person (“my car window got "
+            f"smashed”) — the rest, **{len(coded) - len(events)}**, "
+            f"raise a concern, opinion, or ongoing condition without "
+            f"describing an incident.", "",
+            f"Not describing an incident is NOT evidence that nothing "
+            f"happened to that respondent; survey answers are short and most "
+            f"people do not recount events unprompted. These are self-reported "
+            f"accounts, not verified incidents."]
+        if uncoded:
+            lines.append(f"\n{uncoded} in-scope responses were never checked "
+                         f"for an incident (missing data).")
+    else:
+        raise ValueError(f"unknown aggregate_target {target!r}")
+
+    answer_md = "\n".join(lines)
+    note = (f"Answered deterministically from the coded {target} data — every "
+            f"figure is a computed count over {n_scope} in-scope responses; "
+            f"no synthesis model was involved. Scope: {q_names}.")
+    scope_total = sum(ctx.question_totals.get(q, 0) for q in scope_qids)
+    stats = {
+        "categories_searched": len(route.get("candidates") or []),
+        "categories_total": len(ctx.valid_ids),
+        "unique_responses": n_scope,
+        "quotes_shown": 0,
+        "quotes_cited": 0,
+        "scope_total": scope_total,
+        "scope_coverage": round(n_scope / scope_total, 3) if scope_total else None,
+        "small_base": 0 < n_scope < SMALL_BASE_N,
+    }
+    evidence = {
+        "selection": [], "quotes": [], "sampling_notes": {},
+        "group_counts": [], "n_unique_responses": n_scope,
+        "group_by": "category", "location_filter": [],
+        "scope_coverage": {"covered": n_scope, "scope_total": scope_total,
+                           "questions": scope_qids, "ratio": stats["scope_coverage"]},
+        "small_base": stats["small_base"],
+        "aggregate": aggregate,
+    }
+    run_id = make_run_id(question)
+    out_dir = write_artifacts(
+        run_id=run_id, question=question, ctx=ctx, route=route,
+        route_stats=route_stats or {}, evidence=evidence, lex_counts=[],
+        answer_md=answer_md, n_invalid_citations=0, selection=None,
+        client=client, description=description, elapsed=time.time() - t0,
+        process_note=note)
+    return {
+        "run_id": run_id,
+        "out_dir": str(out_dir),
+        "answer_markdown": answer_md,
+        "answer_body": answer_md,
+        "stats": stats,
+        "process_note": note,
+        "evidence": evidence,
+        "lexicon_counts": [],
+        "cited": [],
+        "invalid_citations": 0,
+        "selection": None,
+        "aggregate": aggregate,
     }
 
 
@@ -727,7 +1078,8 @@ def route_from_selection(selected: list[dict], route_name: str, reason: str,
                          actionability_filter: str = "",
                          event_filter: str = "",
                          time_filter: str = "",
-                         question_scope: list[str] | None = None) -> dict:
+                         question_scope: list[str] | None = None,
+                         aggregate_target: str = "") -> dict:
     """Rebuild a route dict from an analyst-approved selection (step 2 of the
     stateless flow). Unknown label ids raise ValueError — the server-side
     gate; the caller turns that into a 422. Unknown concepts are dropped."""
@@ -750,11 +1102,23 @@ def route_from_selection(selected: list[dict], route_name: str, reason: str,
         })
     if unknown:
         raise ValueError(f"Unknown label ids: {unknown}")
-    if not candidates:
-        raise ValueError("No categories selected")
     route_name = route_name.strip().lower()
     if route_name not in router.VALID_ROUTES:
         route_name = "retrieval"
+    aggregate_target = (aggregate_target or "").strip().lower()
+    if route_name == "aggregate_direct":
+        available = {"location": bool(ctx.valid_locations),
+                     "time": bool(ctx.time_mentioned),
+                     "event": bool(ctx.event_coded)}
+        if not available.get(aggregate_target):
+            raise ValueError(
+                f"aggregate_direct needs an available aggregate_target; got "
+                f"{aggregate_target!r} (available: "
+                f"{sorted(k for k, v in available.items() if v)})")
+    else:
+        aggregate_target = ""
+        if not candidates:
+            raise ValueError("No categories selected")
     group_by = (group_by or "category").strip().lower()
     if group_by not in {"category", "location"} or not ctx.valid_locations:
         group_by = "category"
@@ -800,4 +1164,5 @@ def route_from_selection(selected: list[dict], route_name: str, reason: str,
         # out-of-scope addition is not rejected
         "question_scope": [str(q).strip() for q in (question_scope or [])
                            if str(q).strip()],
+        "aggregate_target": aggregate_target,
     }

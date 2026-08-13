@@ -20,6 +20,7 @@ from fastapi import APIRouter, HTTPException
 
 from . import ask_service, induction
 from .llm import DEFAULT_SYNTH_MODEL, GeminiClient
+from . import ask_cache
 from .schemas import (
     AskAnswerRequest,
     AskAnswerResponse,
@@ -33,6 +34,9 @@ from .schemas import (
     AskQuestionOut,
     AskRouteRequest,
     AskRouteResponse,
+    AskSubBreakdownOut,
+    AskSubCountOut,
+    AskUncoveredOut,
     AskSourceOut,
 )
 
@@ -46,7 +50,10 @@ router = APIRouter(prefix="/datasets/{dataset_id}/ask", tags=["ask"])
 
 def _dataset_description(dataset_id: str) -> str:
     """Dataset row first (source of truth), export manifest second, the
-    deprecated legacy constant last."""
+    deprecated legacy constant last. The survey's fielding window, when
+    recorded at ingest, is appended — it flows into every ask prompt via
+    {dataset_context}, so answers can anchor claims to WHEN residents said
+    this instead of a timeless present."""
     try:
         from .db import SessionLocal
         from .models import Dataset
@@ -54,7 +61,18 @@ def _dataset_description(dataset_id: str) -> str:
         with SessionLocal() as db:
             dataset = db.get(Dataset, int(dataset_id))
             if dataset is not None and (dataset.description or "").strip():
-                return dataset.description.strip()
+                desc = dataset.description.strip()
+                start = (dataset.survey_start_date or "").strip() \
+                    if isinstance(dataset.survey_start_date, str) \
+                    else dataset.survey_start_date
+                end = (dataset.survey_end_date or "").strip() \
+                    if isinstance(dataset.survey_end_date, str) \
+                    else dataset.survey_end_date
+                if start or end:
+                    window = (f"{start} to {end}" if start and end
+                              else f"{start or end}")
+                    desc += f" Survey fielded {window}."
+                return desc
     except Exception:
         pass
     try:
@@ -193,6 +211,18 @@ def ask_route(dataset_id: str, req: AskRouteRequest) -> AskRouteResponse:
     description = _dataset_description(dataset_id)
     ctx = _load_context(dataset_id, description)
     client = _client()
+
+    # Identical question against identical data serves the stored proposal —
+    # temperature 0 is not a determinism guarantee, and a report re-run must
+    # not route differently for no reason. Any data/prompt/model change makes
+    # a different key, so staleness is structurally impossible.
+    cache_key = ask_cache.route_key(
+        ask_service.context_cache_key(dataset_id, description),
+        req.question, req.question_scope, client.model_id)
+    hit = ask_cache.load(dataset_id, cache_key)
+    if hit is not None:
+        return AskRouteResponse(**{**hit, "cached": True})
+
     try:
         route, stats = ask_service.propose(client, req.question, ctx,
                                            description,
@@ -206,10 +236,11 @@ def ask_route(dataset_id: str, req: AskRouteRequest) -> AskRouteResponse:
     if stats["invalid_label_ids"]:
         warnings.append(f"{stats['invalid_label_ids']} invented label id(s) "
                         "dropped from the proposal")
-    return AskRouteResponse(
+    resp = AskRouteResponse(
         answerable=route["answerable"],
         route=route["route"],
         reason=route["reason"],
+        aggregate_target=route.get("aggregate_target", ""),
         candidates=[_candidate_out(c, ctx) for c in route["candidates"]],
         available_categories=_available_categories(route, ctx),
         lexicon_concepts=route["lexicon_concepts"],
@@ -236,6 +267,8 @@ def ask_route(dataset_id: str, req: AskRouteRequest) -> AskRouteResponse:
         question_scope=route.get("question_scope", []),
         warnings=warnings,
     )
+    ask_cache.store(dataset_id, cache_key, resp.model_dump())
+    return resp
 
 
 @router.post("/answer", response_model=AskAnswerResponse)
@@ -253,22 +286,38 @@ def ask_answer(dataset_id: str, req: AskAnswerRequest) -> AskAnswerResponse:
             actionability_filter=req.actionability_filter,
             event_filter=req.event_filter,
             time_filter=req.time_filter,
-            question_scope=req.question_scope)
+            question_scope=req.question_scope,
+            aggregate_target=req.aggregate_target)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
     client = _client()
+    synth_client = _synth_client()
+
+    # The identical approved request against identical data pulls up the
+    # ORIGINAL stored answer (same run_id) instead of re-synthesizing — the
+    # key covers the full selection and filters, so an analyst edit is a
+    # different request and computes fresh.
+    cache_key = ask_cache.answer_key(
+        ask_service.context_cache_key(dataset_id, description),
+        req.model_dump(),
+        f"{client.model_id}|{(synth_client or client).model_id}")
+    hit = ask_cache.load(dataset_id, cache_key)
+    if hit is not None:
+        return AskAnswerResponse(**{**hit, "cached": True})
+
     try:
         result = ask_service.answer(
             client, req.question, route, ctx,
             description=description,
             proposed_label_ids=req.proposed_label_ids or None,
-            synth_client=_synth_client())
+            synth_client=synth_client,
+            skip_verification=req.skip_verification)
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc))
 
     selection = result["selection"] or {"deselected": [], "added": []}
-    return AskAnswerResponse(
+    resp = AskAnswerResponse(
         run_id=result["run_id"],
         answer_markdown=result["answer_body"],
         process_note=result["process_note"],
@@ -279,6 +328,17 @@ def ask_answer(dataset_id: str, req: AskAnswerRequest) -> AskAnswerResponse:
         counts_unfiltered={s["label_id"]: s["count_unfiltered"]
                            for s in result["evidence"]["selection"]
                            if "count_unfiltered" in s},
+        sub_breakdowns={
+            s["label_id"]: AskSubBreakdownOut(
+                sub_counts=[AskSubCountOut(**sc) for sc in s["sub_counts"]],
+                generic=s.get("sub_generic", 0),
+                coded=s.get("sub_coded", 0))
+            for s in result["evidence"]["selection"] if s.get("sub_counts")},
+        uncovered_categories=[
+            AskUncoveredOut(**u)
+            for u in result["evidence"].get("uncovered_categories") or []],
+        aggregate=result.get("aggregate"),
+        verification=result.get("verification"),
         sampling_notes=result["evidence"]["sampling_notes"],
         lexicon_counts=[AskLexiconCountOut(**lc)
                         for lc in result["lexicon_counts"]],
@@ -301,4 +361,6 @@ def ask_answer(dataset_id: str, req: AskAnswerRequest) -> AskAnswerResponse:
         deselected=selection["deselected"],
         added=selection["added"],
     )
+    ask_cache.store(dataset_id, cache_key, resp.model_dump())
+    return resp
 

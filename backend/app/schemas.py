@@ -299,9 +299,17 @@ class AskParentGroupOut(BaseModel):
 
 
 class AskRouteResponse(BaseModel):
+    # True when this proposal was served from the persistent ask cache —
+    # identical question against identical data returns the stored routing
+    # instead of re-rolling the model
+    cached: bool = False
     answerable: bool
     route: str
     reason: str
+    # route "aggregate_direct" answers from a coded tally with no synthesis
+    # call; this names the tally ("location" | "time" | "event"). Empty for
+    # every other route. Candidates may legitimately be empty on this route.
+    aggregate_target: str = ""
     candidates: list[AskCandidateOut]
     # The whole taxonomy, grouped question > parent > child, so the review
     # screen can show every category rather than only the proposed ones. The
@@ -360,12 +368,17 @@ class AskAnswerRequest(BaseModel):
     time_filter: str = ""
     question_scope: list[str] = []
     proposed_label_ids: list[str] = []
+    aggregate_target: str = ""
+    # debugging escape hatch: run the deterministic verification but skip the
+    # repair call when a guard fails (the violations still get disclosed)
+    skip_verification: bool = False
 
     @model_validator(mode="after")
     def _selection_required(self) -> Self:
         if not self.question.strip():
             raise ValueError("Question is required")
-        if not self.selected:
+        # aggregate_direct tallies the whole scope; categories only narrow it
+        if not self.selected and self.route != "aggregate_direct":
             raise ValueError("Select at least one category")
         return self
 
@@ -376,6 +389,11 @@ class AskSourceOut(BaseModel):
     label_id: str
     text: str
     location: str | None = None
+    # sub-themes this response was coded to (within its category) and the
+    # survey question it answered — the same tags the quotes are grouped
+    # under in the synthesis prompt
+    subs: list[str] = []
+    question_id: str = ""
 
 
 class AskAnswerStats(BaseModel):
@@ -387,6 +405,12 @@ class AskAnswerStats(BaseModel):
     unique_responses: int
     quotes_shown: int
     quotes_cited: int
+    # coverage guardrails: how much of the scoped questions' coded responses
+    # the searched categories cover, and whether the base is small enough
+    # (< ~200) that the UI should warn prominently
+    scope_total: int = 0
+    scope_coverage: float | None = None
+    small_base: bool = False
 
 
 class AskLexiconCountOut(BaseModel):
@@ -400,7 +424,37 @@ class AskGroupCountOut(BaseModel):
     count_unique_responses: int
 
 
+class AskSubCountOut(BaseModel):
+    sub_label_id: str
+    name: str
+    count: int
+
+
+class AskUncoveredOut(BaseModel):
+    """An in-scope category the answer did NOT search — surfaced when the
+    searched categories cover less than the coverage floor, so under-coverage
+    is visible in the UI instead of only in a footnote."""
+    label_id: str
+    name: str
+    count: int
+
+
+class AskSubBreakdownOut(BaseModel):
+    """Full-coverage sub-theme composition of one selected category, computed
+    over the same filtered membership as the category's own count. `generic`
+    responses raise the category without naming a specific sub-theme; members
+    the sub-pass never coded are in neither figure (missing data). Sub-counts
+    can sum past the category count — a response may raise several."""
+    sub_counts: list[AskSubCountOut]
+    generic: int
+    coded: int
+
+
 class AskAnswerResponse(BaseModel):
+    # True when served from the persistent ask cache: the identical request
+    # against identical data returns the ORIGINAL stored answer (same
+    # run_id), byte-for-byte, with zero model calls
+    cached: bool = False
     run_id: str
     # the answer body only — sources arrive structured in `sources`, and the
     # UI renders them itself (answer.md on disk keeps the embedded section)
@@ -412,6 +466,20 @@ class AskAnswerResponse(BaseModel):
     # with a location_filter, `counts` are filtered; this holds each
     # category's full size so the UI can show "n of N in category"
     counts_unfiltered: dict[str, int] = {}
+    # label_id -> full-coverage sub-theme breakdown, for categories the
+    # sub-theme layer has coded (app.subthemes); absent otherwise
+    sub_breakdowns: dict[str, AskSubBreakdownOut] = {}
+    # populated only when coverage fell below the floor: the largest in-scope
+    # categories this answer does not cover
+    uncovered_categories: list[AskUncoveredOut] = []
+    # aggregate_direct answers only: the computed tally itself (target,
+    # in_scope, per-place/time/event counts) as structured data
+    aggregate: dict | None = None
+    # {checked, violations, repaired, residual} — the answer's inspection
+    # record: numbers traced to computed counts, quoted spans checked against
+    # their cited sources, repair applied when a guard failed. None for
+    # deterministic tallies (nothing model-written to verify).
+    verification: dict | None = None
     sampling_notes: dict[str, str]
     lexicon_counts: list[AskLexiconCountOut] = []
     group_counts: list[AskGroupCountOut] = []

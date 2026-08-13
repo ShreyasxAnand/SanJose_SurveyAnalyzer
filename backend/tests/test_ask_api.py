@@ -75,12 +75,15 @@ def ask_ctx(tmp_path, monkeypatch):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(obj), encoding="utf-8")
 
+    from app import ask_cache
+
     monkeypatch.setattr(summary, "LABELS_DIR", tmp_path / "labels")
     monkeypatch.setattr(summary, "TAXONOMY_DIR", tmp_path / "taxonomy")
     monkeypatch.setattr(summary, "LEXICON_DIR", tmp_path / "lexicon")
     monkeypatch.setattr(summary, "LOCATIONS_DIR", tmp_path / "locations")
     monkeypatch.setattr(summary, "SUMMARY_DIR", tmp_path / "summary")
     monkeypatch.setattr(ask_service, "ANSWERS_DIR", tmp_path / "answers")
+    monkeypatch.setattr(ask_cache, "CACHE_DIR", tmp_path / "answers")
 
     _write(tmp_path / "taxonomy/1/2/2026-01-01T00-00-00Z_aaaa/candidate_taxonomy.json",
            TAXONOMY)
@@ -147,6 +150,122 @@ def _fake_gemini(monkeypatch, *replies):
     monkeypatch.setattr(ask_api, "_client", lambda: fake)
     monkeypatch.setattr(ask_api, "_synth_client", lambda: fake)
     return fake
+
+
+def test_context_key_sees_every_dataset_change(ask_ctx, monkeypatch):
+    """The persistent ask cache keys on this fingerprint — every way a
+    dataset's answer-relevant state can change MUST change it. Hand edits
+    are the treacherous case: taxonomies invite in-place editing, which
+    creates no new run directory."""
+    from app import induction, subthemes, summary
+
+    monkeypatch.setattr(induction, "DATA_DIR", ask_ctx)
+    monkeypatch.setattr(subthemes, "SUBTHEMES_DIR", ask_ctx / "subthemes")
+
+    def key():
+        return ask_service.context_cache_key("1", "desc")
+
+    def touch(path, content):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+    k0 = key()
+    # 1. hand-editing the taxonomy in place (no new run dir)
+    tax = ask_ctx / "taxonomy/1/2/2026-01-01T00-00-00Z_aaaa/candidate_taxonomy.json"
+    touch(tax, tax.read_text(encoding="utf-8") + " ")
+    k1 = key()
+    assert k1 != k0, "in-place taxonomy edit must invalidate"
+    # 2. hand-editing assignments in place
+    asg = ask_ctx / "labels/1/2/2026-01-01T00-05-00Z_bbbb/assignments.json"
+    touch(asg, asg.read_text(encoding="utf-8") + " ")
+    k2 = key()
+    assert k2 != k1, "in-place assignments edit must invalidate"
+    # 3. a new labels run directory (normal pipeline path)
+    touch(ask_ctx / "labels/1/2/2026-02-02T00-00-00Z_cccc/assignments.json", "[]")
+    k3 = key()
+    assert k3 != k2, "new labels run must invalidate"
+    # 4. a sub-themes run appearing, then being hand-edited
+    sub = ask_ctx / "subthemes/1/2/2026-02-03T00-00-00Z_dddd/sub_taxonomy.json"
+    touch(sub, json.dumps({"categories": []}))
+    k4 = key()
+    assert k4 != k3, "new sub-themes run must invalidate"
+    touch(sub, json.dumps({"categories": [{"x": 1}]}))
+    k5 = key()
+    assert k5 != k4, "in-place sub-taxonomy edit must invalidate"
+    # 5. exports in EITHER form — responses.parquet or reshaped.parquet
+    touch(ask_ctx / "exports/1/responses.parquet", "v1")
+    k6 = key()
+    assert k6 != k5, "export write must invalidate"
+    touch(ask_ctx / "exports/1/reshaped.parquet", "v1")
+    k7 = key()
+    assert k7 != k6, "reshaped-form export must invalidate too"
+    # 6. locations / lexicon artifacts
+    touch(ask_ctx / "locations/1/locations.json", "{}")
+    k8 = key()
+    assert k8 != k7, "locations change must invalidate"
+    touch(ask_ctx / "lexicon/1/lexicon.json", "{}")
+    k9 = key()
+    assert k9 != k8, "lexicon change must invalidate"
+    # 7. dataset description edits
+    assert ask_service.context_cache_key("1", "different description") != k9
+    # 8. and a different dataset id never shares a key
+    assert ask_service.context_cache_key("2", "desc") != k9
+
+
+def test_answer_repair_fires_only_on_violations(client, monkeypatch):
+    """A draft with an invented count triggers exactly one repair call; the
+    served answer is the corrected one and the verification record says so."""
+    bad = json.dumps({"answer_markdown":
+                      "**999 responses** report theft [1]."})
+    fixed = json.dumps({"answer_markdown":
+                        "**2 responses** report theft [1]."})
+    fake = _fake_gemini(monkeypatch, ROUTE_REPLY, bad, fixed)
+    client.post("/api/datasets/1/ask/route", json={"question": "verify me?"})
+    r = client.post("/api/datasets/1/ask/answer", json={
+        "question": "verify me?", "route": "retrieval", "reason": "r",
+        "selected": [{"label_id": "2_001", "relevance": "high", "rationale": "x"}],
+    })
+    assert r.status_code == 200
+    body = r.json()
+    assert not fake.replies, "route + synth + one repair, nothing more"
+    assert "**2 responses**" in body["answer_markdown"]
+    assert "999" not in body["answer_markdown"]
+    v = body["verification"]
+    assert v["checked"] and v["repaired"] and v["residual"] == []
+    assert v["violations"][0]["value"] == 999
+
+
+def test_ask_cache_serves_stored_route_and_answer(client, monkeypatch):
+    """Identical request against identical data returns the stored response
+    (cached=True, same run_id) with ZERO further model calls — the FakeClient
+    carries exactly one reply per step, so a second real call would raise."""
+    fake = _fake_gemini(monkeypatch, ROUTE_REPLY, SYNTH_REPLY)
+    q = {"question": "what about theft, cached?"}
+    r1 = client.post("/api/datasets/1/ask/route", json=q)
+    assert r1.status_code == 200 and r1.json()["cached"] is False
+    r2 = client.post("/api/datasets/1/ask/route", json=q)
+    assert r2.status_code == 200 and r2.json()["cached"] is True
+    assert {k: v for k, v in r2.json().items() if k != "cached"} \
+        == {k: v for k, v in r1.json().items() if k != "cached"}
+
+    body = {
+        "question": "what about theft, cached?", "route": "retrieval",
+        "reason": "r",
+        "selected": [{"label_id": "2_001", "relevance": "high", "rationale": "x"}],
+    }
+    a1 = client.post("/api/datasets/1/ask/answer", json=body)
+    assert a1.status_code == 200 and a1.json()["cached"] is False
+    a2 = client.post("/api/datasets/1/ask/answer", json=body)
+    assert a2.status_code == 200 and a2.json()["cached"] is True
+    assert a2.json()["run_id"] == a1.json()["run_id"]
+    assert not fake.replies, "every canned reply should have been consumed exactly once"
+
+    # an edited selection is a DIFFERENT request — it must MISS the cache and
+    # reach the model, which the empty reply queue turns into an IndexError
+    edited = {**body, "selected": body["selected"]
+              + [{"label_id": "2_002", "relevance": "low", "rationale": "y"}]}
+    with pytest.raises(IndexError):
+        client.post("/api/datasets/1/ask/answer", json=edited)
 
 
 def test_route_returns_enriched_candidates(client, monkeypatch):
@@ -260,6 +379,9 @@ def test_answer_happy_path_and_artifacts(client, monkeypatch, ask_ctx):
     assert body["stats"] == {
         "categories_searched": 1, "categories_total": 2,
         "unique_responses": 2, "quotes_shown": 2, "quotes_cited": 2,
+        # coverage guardrails: the fixture searches 2 of the question's 3
+        # coded responses; any base under SMALL_BASE_N flags small_base
+        "scope_total": 3, "scope_coverage": 0.667, "small_base": True,
     }
     # the process note is computed, never model-written — check its figures
     assert body["process_note"].startswith("Routed as retrieval")

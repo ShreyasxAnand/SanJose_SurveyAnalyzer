@@ -170,9 +170,15 @@ export interface AskParentGroup {
 }
 
 export interface AskRouteResponse {
+  // served from the persistent ask cache — same question, same data, same
+  // routing, no model call
+  cached: boolean;
   answerable: boolean;
   route: string;
   reason: string;
+  // route "aggregate_direct" answers from a coded tally ("location" |
+  // "time" | "event") with no synthesis call; candidates may be empty
+  aggregate_target: string;
   candidates: AskCandidate[];
   // the whole taxonomy, so the review screen shows every parent category with
   // its children rather than only what the router proposed
@@ -227,6 +233,7 @@ export interface AskAnswerRequest {
   time_filter: string;
   question_scope: string[];
   proposed_label_ids: string[];
+  aggregate_target: string;
 }
 
 export interface AskSource {
@@ -243,6 +250,33 @@ export interface AskAnswerStats {
   unique_responses: number;
   quotes_shown: number;
   quotes_cited: number;
+  // coverage guardrails: how much of the scoped questions' coded responses
+  // the searched categories cover; small_base flags an answer resting on
+  // fewer than ~200 responses
+  scope_total: number;
+  scope_coverage: number | null;
+  small_base: boolean;
+}
+
+export interface AskSubCount {
+  sub_label_id: string;
+  name: string;
+  count: number;
+}
+
+// Full-coverage sub-theme composition of one searched category. `generic`
+// responses raised the category without naming a specific sub-theme;
+// sub-counts can sum past the category count (a response may raise several).
+export interface AskSubBreakdown {
+  sub_counts: AskSubCount[];
+  generic: number;
+  coded: number;
+}
+
+export interface AskUncovered {
+  label_id: string;
+  name: string;
+  count: number;
 }
 
 export interface AskLexiconCount {
@@ -257,6 +291,9 @@ export interface AskGroupCount {
 }
 
 export interface AskAnswerResponse {
+  // served from the persistent ask cache — the original stored answer,
+  // byte-identical, zero model calls
+  cached: boolean;
   run_id: string;
   // answer body only — sources arrive separately and the UI renders them
   answer_markdown: string;
@@ -297,6 +334,23 @@ export interface AskAnswerResponse {
   invalid_citations: number;
   deselected: string[];
   added: string[];
+  // label_id -> full-coverage sub-theme breakdown (categories the sub-theme
+  // layer has coded); empty object otherwise
+  sub_breakdowns: Record<string, AskSubBreakdown>;
+  // largest in-scope categories NOT searched — present only when coverage
+  // fell below the floor
+  uncovered_categories: AskUncovered[];
+  // aggregate_direct answers only: the computed tally as structured data
+  aggregate: Record<string, unknown> | null;
+  // the answer's inspection record: numbers traced to computed counts,
+  // quoted spans checked against their cited sources; null for
+  // deterministic tallies (nothing model-written to verify)
+  verification: {
+    checked: boolean;
+    violations: { kind: string; value: string | number; detail: string }[];
+    repaired: boolean;
+    residual: { kind: string; value: string | number; detail: string }[];
+  } | null;
 }
 
 // --- Pipeline runs (induce -> label -> lexicon -> locations) ---

@@ -270,7 +270,7 @@ export default function Pipeline({
             <p className="pl-hint">
               Incremental: already-labelled responses are untouched; only new
               rows are labelled, against the existing taxonomy. Rows it can't
-              place may add new categories, flagged for review — every figure
+              place may add new categories automatically — every figure
               above is a projection.
             </p>
           )}
@@ -352,9 +352,7 @@ export default function Pipeline({
           )}
           {job.status === "done" && (
             <p className="pl-ok">
-              The Ask tab can answer questions about this dataset now. The
-              taxonomy is unreviewed — <code>scripts.review</code> is the
-              quality gate.
+              The Ask tab can answer questions about this dataset now.
             </p>
           )}
           {job.status !== "running" && (

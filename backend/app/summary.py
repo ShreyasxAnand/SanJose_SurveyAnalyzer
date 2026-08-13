@@ -196,10 +196,17 @@ def build_summary(dataset_id: str, dataset_description: str = "",
     }
 
 
-def render_summary(summary: dict) -> str:
+def render_summary(summary: dict,
+                   sub_names_by_label: dict[str, list[str]] | None = None) -> str:
     """The prompt-facing flat rendering. One line per label:
     `label_id | parent > name — description (n=count)`. Counts are computed;
-    the router is told exactly that so it never re-estimates them."""
+    the router is told exactly that so it never re-estimates them.
+
+    `sub_names_by_label` appends each category's sub-theme NAMES (names only,
+    truncated) to its line — the bridge that lets the router answer a
+    question phrased at sub-theme granularity ("catalytic converters")
+    instead of refusing something the data contains. Without it the
+    sub-structure is invisible at route time."""
     lines: list[str] = []
     desc = (summary.get("dataset_description") or "").strip()
     if desc:
@@ -215,7 +222,13 @@ def render_summary(summary: dict) -> str:
             if len(d) > MAX_DESC_CHARS:
                 d = d[:MAX_DESC_CHARS] + "…"
             parent = e["parent_name"] or "(no parent)"
-            lines.append(f'  {e["label_id"]} | {parent} > {e["name"]} — {d} (n={e["count"]})')
+            line = f'  {e["label_id"]} | {parent} > {e["name"]} — {d} (n={e["count"]})'
+            subs = (sub_names_by_label or {}).get(e["label_id"])
+            if subs:
+                shown = subs[:8]
+                more = f", +{len(subs) - 8} more" if len(subs) > 8 else ""
+                line += f' [sub: {", ".join(shown)}{more}]'
+            lines.append(line)
         lines.append("")
     if summary["lexicon_concepts"]:
         names = ", ".join(c["name"] for c in summary["lexicon_concepts"])
