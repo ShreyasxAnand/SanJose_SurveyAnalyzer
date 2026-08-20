@@ -65,7 +65,9 @@ def test_catch_all_does_not_serve_files_outside_dist():
                     "/../../backend/app/llm.py"):
         res = client.get(attempt)
         assert b"SQLite format" not in res.content
-        assert "GEMINI_API_KEY" not in res.text
+        # a distinctive string from llm.py's source — if traversal ever
+        # worked, the raw module text would leak through here
+        assert "PRICES_PER_MTOK" not in res.text
 
 
 def _point_serve_at(monkeypatch, root):

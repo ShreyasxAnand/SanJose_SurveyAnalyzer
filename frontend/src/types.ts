@@ -95,7 +95,24 @@ export interface DatasetOut {
   survey_start_date: string | null; // ISO YYYY-MM-DD
   survey_end_date: string | null;
   questions: QuestionColumnOut[];
+  metadata_columns: MetadataColumnOut[];
   exports: ExportInfo | null;
+}
+
+export interface MetadataValueCount {
+  value: string;
+  n_respondents: number;
+}
+
+// A demographic / respondent-attribute column. `high_cardinality` is advisory
+// only — the column is stored and usable either way (no hard blocks).
+export interface MetadataColumnOut {
+  id: number;
+  source_column: string;
+  label: string;
+  n_distinct: number;
+  values: MetadataValueCount[];
+  high_cardinality: boolean;
 }
 
 // Editable catalog metadata. Omitted/null field = leave unchanged, "" =
@@ -205,7 +222,31 @@ export interface AskRouteResponse {
   available_time: Record<string, number>;
   // survey question ids this proposal was scoped to; empty = all questions
   question_scope: string[];
+  // the analyst's respondent restriction, validated and echoed — the answer
+  // step must carry it back unchanged for the filter to apply
+  demographic_filter: Record<string, string[]>;
   warnings: string[];
+}
+
+// One demographic field the ask form offers as a respondent filter. Counts
+// are RESPONDENTS (the person, not their per-question responses); a blank
+// cell is missing data and appears under no value.
+export interface AskDemographicValue {
+  value: string;
+  n_respondents: number;
+}
+
+export interface AskDemographic {
+  field: string;
+  values: AskDemographicValue[];
+}
+
+// Faceted counts for the ask form: each field's values recounted under the
+// OTHER fields' ticked values, plus how many respondents match the whole
+// filter (null when nothing is ticked).
+export interface AskDemographicsResponse {
+  fields: AskDemographic[];
+  n_matching_respondents: number | null;
 }
 
 export interface AskQuestionOut {
@@ -232,6 +273,9 @@ export interface AskAnswerRequest {
   event_filter: string;
   time_filter: string;
   question_scope: string[];
+  // {field: [values]} — validated server-side against the dataset's actual
+  // demographics; values within a field are OR, fields are AND
+  demographic_filter: Record<string, string[]>;
   proposed_label_ids: string[];
   aggregate_target: string;
 }
@@ -328,6 +372,18 @@ export interface AskAnswerResponse {
     mentioning: number;
     matching: number;
   } | null;
+  demographic_filter: Record<string, string[]>;
+  // {in_scope, coded, matching} — `coded` responses belong to respondents
+  // with a recorded value for every filtered field; the gap to in_scope is
+  // missing data, never a group
+  demographic_denominator: {
+    in_scope: number;
+    coded: number;
+    matching: number;
+  } | null;
+  // the demographic filter left fewer matching responses than the thin-cell
+  // notice threshold — disclosed prominently, never blocked
+  demographic_thin: boolean;
   // survey questions whose every response counted as mentioning the filtered
   // place because the question itself asks about it
   location_filter_implicit_questions: string[];

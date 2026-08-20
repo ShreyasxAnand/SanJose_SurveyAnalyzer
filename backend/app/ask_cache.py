@@ -28,7 +28,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import tempfile
+import unicodedata
 from pathlib import Path
 
 from .induction import DATA_DIR, utc_now
@@ -37,11 +39,24 @@ SCHEMA_VERSION = 1
 CACHE_DIR = DATA_DIR / "answers"
 
 
+# apostrophes vanish ("what's" == "whats" — accepting that contractions merge
+# with real words, "we're" == "were"; no two plausible questions differ only
+# by that). U+02BC is the phone-keyboard apostrophe, a *letter* to \w, so it
+# needs deleting explicitly. Every other punctuation mark — and underscore,
+# which \w would otherwise keep — becomes a space ("theft/vandalism" ==
+# "theft vandalism", and "1.5" stays distinct from "15").
+_APOSTROPHES = str.maketrans("", "", "'’ʼ")
+_PUNCT_RE = re.compile(r"[^\w\s]|_")
+
+
 def _norm_question(q: str) -> str:
-    """Whitespace- and case-insensitive: 'What locations…' and
-    'what  locations…' are the same question. Nothing fuzzier — a wrong
-    cache hit is worse than a missed one."""
-    return " ".join((q or "").split()).casefold()
+    """Whitespace-, case- and punctuation-insensitive: 'What locations…?' and
+    'what  locations…' are the same question. NFKC first, so composed and
+    decomposed accents (café pasted vs typed) key identically. Nothing
+    fuzzier — a wrong cache hit is worse than a missed one."""
+    q = unicodedata.normalize("NFKC", q or "")
+    q = _PUNCT_RE.sub(" ", q.translate(_APOSTROPHES))
+    return " ".join(q.split()).casefold()
 
 
 def _canonical(payload: dict) -> str:
@@ -56,7 +71,7 @@ def _canonical(payload: dict) -> str:
 # cache MISSES, never a filtered ask served an unfiltered cached answer.
 _NORMALIZED_FIELDS = {
     "question", "selected", "lexicon_concepts", "location_filter",
-    "question_scope", "reason", "proposed_label_ids",
+    "question_scope", "reason", "proposed_label_ids", "demographic_filter",
 }
 
 
@@ -90,6 +105,12 @@ def answer_key(context_key: str, request: dict, model_ids: str) -> str:
         "location_filter": sorted(request.get("location_filter") or []),
         "question_scope": sorted(str(s)
                                  for s in request.get("question_scope") or []),
+        # value order inside a field is meaningless — sort so ticking the
+        # same set in a different order hits; empty value lists are no filter
+        "demographic_filter": {
+            str(f): sorted(str(v) for v in vals)
+            for f, vals in sorted((request.get("demographic_filter")
+                                   or {}).items()) if vals},
         "extra": {k: v for k, v in sorted(request.items())
                   if k not in _NORMALIZED_FIELDS},
         "prompts": _ask_prompt_hash(),

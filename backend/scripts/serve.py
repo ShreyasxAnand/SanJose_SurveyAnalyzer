@@ -152,9 +152,19 @@ def main() -> int:
     url = f"http://{'localhost' if args.host == '0.0.0.0' else args.host}:{args.port}"
     print(f"\n  Survey Analyzer  ->  {url}\n", flush=True)
     if args.host == "0.0.0.0":
-        print("  NOTE --host 0.0.0.0 exposes this to your network, and the app has no\n"
-              "       authentication: anyone who can reach the port can read every\n"
-              "       dataset and spend the API key.\n", flush=True)
+        from app.auth import configured_passcode
+
+        if configured_passcode() is None:
+            print("  NOTE --host 0.0.0.0 exposes this to your network. No ADMIN_PASSCODE\n"
+                  "       is set, so anyone who can reach the port can upload files, run\n"
+                  "       billed pipeline jobs, read every dataset, and spend AI credit.\n"
+                  "       Set ADMIN_PASSCODE in the repo-root .env to gate the first two.\n",
+                  flush=True)
+        else:
+            print("  NOTE --host 0.0.0.0 exposes this to your network. ADMIN_PASSCODE is\n"
+                  "       set, so uploads and pipeline runs are gated — but there is no\n"
+                  "       login for reading: anyone who can reach the port can read every\n"
+                  "       dataset and ask questions that spend AI credit.\n", flush=True)
     if args.open:
         threading.Timer(1.5, webbrowser.open, args=(url,)).start()
 

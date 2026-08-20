@@ -27,6 +27,10 @@ from .schemas import (
     AskAnswerStats,
     AskCandidateOut,
     AskChildOut,
+    AskDemographicOut,
+    AskDemographicsRequest,
+    AskDemographicsResponse,
+    AskDemographicValueOut,
     AskGroupCountOut,
     AskLexiconCountOut,
     AskLocationOut,
@@ -109,7 +113,7 @@ def _load_context(dataset_id: str, description: str) -> ask_service.AskContext:
 def _client() -> GeminiClient:
     try:
         return GeminiClient()
-    except RuntimeError as exc:      # missing API key
+    except RuntimeError as exc:      # missing/expired Google credentials (ADC)
         raise HTTPException(status_code=503, detail=str(exc))
 
 
@@ -204,10 +208,38 @@ def ask_questions(dataset_id: str) -> list[AskQuestionOut]:
             for q in ctx.summary["questions"]]
 
 
+@router.post("/demographics", response_model=AskDemographicsResponse)
+def ask_demographics(dataset_id: str,
+                     req: AskDemographicsRequest) -> AskDemographicsResponse:
+    """The dataset's demographic fields and values for the respondent filter
+    on the ask form — same role /questions plays for the scope selector, but
+    POST because the counts are faceted: send the current selection and each
+    field comes back recounted under the OTHER fields' ticked values, so the
+    dropdowns always show what a tick would actually leave. Empty fields list
+    = no demographics, which is how the UI knows to keep the control
+    disabled."""
+    ctx = _load_context(dataset_id, _dataset_description(dataset_id))
+    try:
+        demo = ask_service.validate_demographic_filter(
+            req.demographic_filter, ctx)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    fields, n_matching = ask_service.facet_demographics(ctx, demo)
+    return AskDemographicsResponse(
+        fields=[AskDemographicOut(
+                    field=f,
+                    values=[AskDemographicValueOut(value=v, n_respondents=n)
+                            for v, n in vals])
+                for f, vals in fields],
+        n_matching_respondents=n_matching)
+
+
 @router.post("/route", response_model=AskRouteResponse)
 def ask_route(dataset_id: str, req: AskRouteRequest) -> AskRouteResponse:
-    """Step 1: propose categories. One model call. An unanswerable question
-    is a valid 200 with zero candidates — empty results are correct results."""
+    """Step 1: propose categories. One routing call, plus an add-only
+    completeness call when code flags possibly-missed categories. An
+    unanswerable question is a valid 200 with zero candidates — empty results
+    are correct results."""
     description = _dataset_description(dataset_id)
     ctx = _load_context(dataset_id, description)
     client = _client()
@@ -218,16 +250,20 @@ def ask_route(dataset_id: str, req: AskRouteRequest) -> AskRouteResponse:
     # a different key, so staleness is structurally impossible.
     cache_key = ask_cache.route_key(
         ask_service.context_cache_key(dataset_id, description),
-        req.question, req.question_scope, client.model_id)
+        req.question, req.question_scope, client.model_id,
+        extra={"demographic_filter": {
+            f: sorted(v) for f, v in sorted(req.demographic_filter.items())
+            if v}} if req.demographic_filter else None)
     hit = ask_cache.load(dataset_id, cache_key)
     if hit is not None:
         return AskRouteResponse(**{**hit, "cached": True})
 
     try:
-        route, stats = ask_service.propose(client, req.question, ctx,
-                                           description,
-                                           question_scope=req.question_scope)
-    except ValueError as exc:        # unknown question ids in the scope
+        route, stats = ask_service.propose(
+            client, req.question, ctx, description,
+            question_scope=req.question_scope,
+            demographic_filter=req.demographic_filter)
+    except ValueError as exc:        # unknown scope ids / demographic values
         raise HTTPException(status_code=422, detail=str(exc))
     except RuntimeError as exc:      # Gemini failure after retries
         raise HTTPException(status_code=502, detail=str(exc))
@@ -265,6 +301,7 @@ def ask_route(dataset_id: str, req: AskRouteRequest) -> AskRouteResponse:
                          "mentioned": len(ctx.time_mentioned)}
                         if (ctx.time_day or ctx.time_night) else {}),
         question_scope=route.get("question_scope", []),
+        demographic_filter=route.get("demographic_filter", {}),
         warnings=warnings,
     )
     ask_cache.store(dataset_id, cache_key, resp.model_dump())
@@ -273,9 +310,10 @@ def ask_route(dataset_id: str, req: AskRouteRequest) -> AskRouteResponse:
 
 @router.post("/answer", response_model=AskAnswerResponse)
 def ask_answer(dataset_id: str, req: AskAnswerRequest) -> AskAnswerResponse:
-    """Step 2: synthesize from the analyst-approved selection. One model
-    call. Counts and quotes are recomputed here — the request carries
-    choices, never evidence."""
+    """Step 2: synthesize from the analyst-approved selection. One synthesis
+    call, plus a repair call only when verification flags a violation (and
+    zero calls on an aggregate_direct tally). Counts and quotes are recomputed
+    here — the request carries choices, never evidence."""
     description = _dataset_description(dataset_id)
     ctx = _load_context(dataset_id, description)
     try:
@@ -287,7 +325,8 @@ def ask_answer(dataset_id: str, req: AskAnswerRequest) -> AskAnswerResponse:
             event_filter=req.event_filter,
             time_filter=req.time_filter,
             question_scope=req.question_scope,
-            aggregate_target=req.aggregate_target)
+            aggregate_target=req.aggregate_target,
+            demographic_filter=req.demographic_filter)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
@@ -355,6 +394,10 @@ def ask_answer(dataset_id: str, req: AskAnswerRequest) -> AskAnswerResponse:
         event_denominator=result["evidence"].get("event_denominator"),
         time_filter=result["evidence"].get("time_filter") or "",
         time_denominator=result["evidence"].get("time_denominator"),
+        demographic_filter=result["evidence"].get("demographic_filter") or {},
+        demographic_denominator=result["evidence"].get(
+            "demographic_denominator"),
+        demographic_thin=bool(result["evidence"].get("demographic_thin")),
         location_filter_implicit_questions=result["evidence"].get(
             "location_filter_implicit_questions") or [],
         invalid_citations=result["invalid_citations"],

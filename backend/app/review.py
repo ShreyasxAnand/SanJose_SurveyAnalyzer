@@ -4,8 +4,9 @@ The labeling pass is a measurement instrument, not just output. Every way a
 taxonomy can be wrong leaves a mechanical signature in the full-corpus
 assignments, so the diagnostics here are pure counting: no model calls, no
 state, nothing to drift. The output is a report a human reads and an edits
-file a human approves — the human gate this project has always required for
-Phase 2, now with the evidence gathered instead of hunted.
+file a human approves. This loop is optional — the pipeline runs end to end
+without it — but when an analyst does repair a taxonomy, the evidence is
+gathered for them instead of hunted.
 
 Defect -> signature -> repair cost:
   duplicate labels (co-assigned)   high overlap coefficient     zero relabeling

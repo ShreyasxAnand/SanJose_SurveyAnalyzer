@@ -17,11 +17,10 @@ scraping stdout.
 
 **Cost is estimated before anything is spent.** `estimate_dataset` runs only
 free code (`induction.plan_dry_run` plus a projection for labeling) so the
-analyst approves a figure before the first billed call — the same "human gates
-at the expensive irreversible steps" rule the taxonomy review follows. Which
-figures are *planned* and which are *projected* is marked per row and must stay
-marked: a projection presented as a plan is exactly the kind of invented number
-this project refuses to produce.
+analyst approves a figure before the first billed call. Which figures are
+*planned* and which are *projected* is marked per row and must stay marked: a
+projection presented as a plan is exactly the kind of invented number this
+project refuses to produce.
 
 Job state is in memory with `status.json` mirrored to disk at every transition.
 A server restart (e.g. uvicorn --reload) kills an in-flight run, and the status

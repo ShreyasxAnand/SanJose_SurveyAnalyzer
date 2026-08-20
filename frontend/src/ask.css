@@ -19,7 +19,14 @@
   --ask-serif: "Charter", "Bitstream Charter", "Sitka Text", Georgia, serif;
   --ask-mono: "Cascadia Code", ui-monospace, Consolas, monospace;
 
-  /* break out of the app shell's narrow column for the two-column layout */
+  /* Reading column: the question, the status strip and the answer all share
+     it, so the page reads as one centred document. The evidence boxes below
+     deliberately break out of it to the full width. 720px is set by the stat
+     strip — six cells at its 120px minimum — not by the prose, which is
+     narrower still (see .ask-article). */
+  --ask-read: 720px;
+
+  /* break out of the app shell's narrow column — the boxes grid uses it all */
   width: min(1100px, calc(100vw - 3rem));
   margin-left: 50%;
   transform: translateX(-50%);
@@ -106,17 +113,42 @@
   border-radius: 6px; padding: 12px 14px; margin: 8px 0 0; line-height: 1.6;
 }
 
-/* ---- layout ---- */
-.ask-grid {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 300px;
-  gap: 40px;
-  margin-top: 26px;
-}
-@media (max-width: 880px) { .ask-grid { grid-template-columns: 1fr; } }
+/* ---- layout ----
+   The answer reads first, centred, at a comfortable measure; the supporting
+   counts follow underneath as boxes. Previously a 300px rail ran alongside,
+   which cost the prose a third of the width and squeezed the panel with the
+   most in it (Categories searched) into the narrowest column on the page. */
+.ask-main { margin-top: 26px; }
 
-/* ---- narrative ---- */
-.ask-article { max-width: 66ch; position: relative; }
+/* Everything above the boxes lives in the reading column. Listed rather than
+   wrapped in a div so the header stays a flat sequence of siblings; this rule
+   sits after their own margin shorthands so `margin-inline: auto` wins. */
+/* One left edge for the whole page. The header used to be centred in a 720px
+   column while the flowed sections started at the container edge, which put
+   three different left margins on screen at once. */
+
+/* ---- narrative ----
+   The article spans the page so the sections can flow across it. Only the
+   INTRO keeps a reading measure — it is one continuous paragraph and would
+   be unreadable at 1100px. */
+.ask-article { max-width: 100%; position: relative; }
+/* left-aligned, not centred — it shares the page's single left edge */
+.ask-intro { max-width: 72ch; margin: 0 0 26px; }
+
+/* Sections flow left-to-right and wrap, instead of stacking down a narrow
+   column. `1 1 380px` fits 2-3 across at 1100px and drops to one on a phone;
+   align-items:flex-start keeps a short section from being stretched to the
+   height of the tallest one in its row. */
+.ask-sections {
+  display: flex; flex-wrap: wrap; align-items: flex-start; gap: 10px 26px;
+}
+.ask-section {
+  flex: 1 1 380px; min-width: 0; max-width: 560px;
+  padding-bottom: 6px;
+}
+/* the heading's top margin is the stack's spacing — inside a flowed section
+   it just pushes the first row's text off the top edge */
+.ask-section > h4:first-child { margin-top: 4px; }
 .ask-article .ask-lede {
   font-family: var(--ask-serif);
   font-size: 18px;
@@ -180,10 +212,38 @@
 }
 .ask-popover-jump:hover { text-decoration: underline; }
 
-/* ---- evidence rail ---- */
+/* ---- evidence boxes (below the answer) ---- */
+.ask-boxes {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  align-items: start;
+  gap: 16px;
+  margin-top: 34px;
+  padding-top: 26px;
+  border-top: 1px solid var(--ask-line);
+}
+/* Categories searched spans the row: it carries a sub-theme breakdown per
+   category, so it is by far the tallest box and the one worth reading wide. */
+.ask-panel-wide { grid-column: 1 / -1; }
+/* inside it, the categories themselves column up rather than running one
+   long ladder down a full-width box */
+/* Multi-column, not grid: categories carry wildly different sub-theme counts
+   (5 vs 13 here), and grid rows size to the tallest cell — which left a short
+   category reserving the height of a long one. Columns flow instead. */
+.ask-cat-cols { columns: 300px 3; column-gap: 30px; }
+.ask-cat-item { break-inside: avoid; margin-bottom: 10px; }
+/* The 300px rail had to clip these to one line; a full-width box does not,
+   and a clipped sub-theme name ("Encampments, Homelessness, and Erratic Beh…")
+   is the one thing in this panel a reader cannot reconstruct. */
+.ask-panel-wide .ask-subtheme-nm,
+.ask-panel-wide .ask-bar-label .ask-nm {
+  white-space: normal; overflow: visible; text-overflow: clip;
+}
+.ask-panel-wide .ask-bar-label { align-items: baseline; }
+
 .ask-panel {
   background: var(--ask-surface); border: 1px solid var(--ask-line);
-  border-radius: 10px; padding: 14px 16px; margin-bottom: 16px;
+  border-radius: 10px; padding: 14px 16px; margin: 0;
 }
 .ask-panel h5 {
   font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase;
@@ -312,17 +372,37 @@
   font-size: 11px; letter-spacing: 0.07em; text-transform: uppercase;
   color: var(--ask-ink-3); margin: 0 0 4px; font-weight: 600;
 }
+/* group size, so "showing 5" never reads as "there are only 5" */
+.ask-src-group h6 .ask-src-n {
+  font-family: var(--ask-mono); font-variant-numeric: tabular-nums;
+  letter-spacing: 0; color: var(--ask-ink-3); opacity: 0.7;
+}
+/* Horizontal flow: cards fill the row, then wrap. `1 1 300px` lets the last
+   row's cards grow to close the gap rather than leaving a ragged hole, and
+   align-items:flex-start stops a long quote stretching its whole row. */
+.ask-src-items {
+  display: flex; flex-wrap: wrap; align-items: flex-start; gap: 10px;
+}
 .ask-src-item {
-  display: grid; grid-template-columns: 112px minmax(0, 1fr); gap: 12px;
-  padding: 7px 0; border-top: 1px dotted var(--ask-line);
+  flex: 1 1 300px; min-width: 0; max-width: 460px;
+  border: 1px solid var(--ask-line); border-radius: 9px;
+  background: var(--ask-surface); padding: 9px 12px 11px;
 }
 .ask-src-item .ask-meta {
   font-family: var(--ask-mono); font-size: 11px; color: var(--ask-ink-3);
-  font-variant-numeric: tabular-nums;
+  font-variant-numeric: tabular-nums; margin-bottom: 4px;
 }
 .ask-src-item .ask-meta .ask-n { color: var(--ask-accent-ink); }
+/* Clamped so one 1,200-character response cannot set the height of a whole
+   row of cards. Nothing is lost: the card expands on click and the full text
+   is still in the copied markdown and answer.md. */
 .ask-src-item blockquote {
   margin: 0; font-family: var(--ask-serif); font-size: 13.5px; line-height: 1.5;
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 7;
+  overflow: hidden; cursor: pointer;
+}
+.ask-src-item.ask-src-open blockquote {
+  -webkit-line-clamp: unset; overflow: visible; cursor: default;
 }
 .ask-src-flash { animation: ask-flash 1.6s ease-out; }
 @keyframes ask-flash {
@@ -557,15 +637,65 @@
   border-top: 1px solid #eef1ef;
 }
 .ask-home-scope { font-size: 13px; color: #5a6560; }
-.ask-home-scope select {
-  font: inherit;
-  font-size: 13px;
-  max-width: 320px;
-  padding: 4px 6px;
-  border-radius: 6px;
-  border: 1px solid #e2e7e4;
-  background: #fff;
-  color: #1f2724;
+
+/* ---- checkbox dropdowns (scope, respondents) ---- */
+/* Fixed grid, not a wrapping flex row: every dropdown occupies an
+   equal-width cell and the button fills it, so a summary changing from
+   "all respondents" to "3 of 7 selected" truncates in place instead of
+   re-widthing the button and reflowing every control after it. */
+.ask-home-filters {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 8px 16px;
+  min-width: 0;
+  flex: 1;
+}
+.ask-dd { position: relative; display: flex; align-items: center; gap: 7px; min-width: 0; }
+.ask-dd-label {
+  font-size: 13px; color: #5a6560; white-space: nowrap;
+  max-width: 45%; overflow: hidden; text-overflow: ellipsis; flex: none;
+}
+.ask-dd-btn {
+  font: inherit; font-size: 13px; color: #1f2724;
+  display: inline-flex; align-items: center; gap: 8px;
+  flex: 1; min-width: 0; padding: 5px 9px;
+  border: 1px solid #e2e7e4; border-radius: 7px; background: #fff;
+  cursor: pointer; text-align: left;
+}
+.ask-dd-btn:hover:not(:disabled) { border-color: #cfd8d4; }
+.ask-dd-btn:disabled { color: #8b958f; background: #f7f9f8; cursor: not-allowed; }
+.ask-dd-summary {
+  flex: 1; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ask-dd-caret { color: #8b958f; font-size: 10px; flex: none; }
+.ask-dd-menu {
+  position: absolute; z-index: 40; top: calc(100% + 6px); left: 0;
+  min-width: 300px; max-width: min(460px, 80vw);
+  max-height: 320px; overflow-y: auto;
+  background: #fff; border: 1px solid #e2e7e4; border-radius: 10px;
+  box-shadow: 0 8px 28px rgba(31, 46, 43, 0.14);
+  padding: 5px;
+}
+.ask-dd-all {
+  font: inherit; font-size: 13px; width: 100%; text-align: left;
+  display: flex; justify-content: space-between; gap: 8px;
+  padding: 7px 9px; border: none; border-radius: 6px;
+  background: none; color: #1f2724; cursor: pointer;
+}
+.ask-dd-all:hover { background: #f0f3f0; }
+.ask-dd-tick { color: #1f6e68; }
+.ask-dd-sep { height: 1px; background: #eef1ef; margin: 4px 2px; }
+.ask-dd-opt {
+  display: flex; align-items: flex-start; gap: 9px;
+  padding: 7px 9px; border-radius: 6px; cursor: pointer; font-size: 13px;
+}
+.ask-dd-opt:hover { background: #f0f3f0; }
+.ask-dd-opt input { margin: 2px 0 0; accent-color: #1f6e68; flex: none; }
+.ask-dd-opt-text { min-width: 0; line-height: 1.4; }
+.ask-dd-opt-meta {
+  margin-left: auto; color: #8b958f; font-variant-numeric: tabular-nums;
+  flex: none; padding-left: 8px;
 }
 .ask-home-go {
   font: inherit;

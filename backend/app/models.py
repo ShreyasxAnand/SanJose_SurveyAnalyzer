@@ -49,6 +49,10 @@ class Dataset(Base):
     questions: Mapped[list["QuestionColumn"]] = relationship(
         back_populates="dataset", cascade="all, delete-orphan"
     )
+    # NB: not `metadata` — that name is taken by SQLAlchemy's declarative API.
+    metadata_columns: Mapped[list["MetadataColumn"]] = relationship(
+        back_populates="dataset", cascade="all, delete-orphan"
+    )
     responses: Mapped[list["Response"]] = relationship(
         back_populates="dataset", cascade="all, delete-orphan"
     )
@@ -172,6 +176,81 @@ class QuestionColumn(Base):
     responses: Mapped[list["Response"]] = relationship(
         back_populates="question", cascade="all, delete-orphan"
     )
+
+
+class MetadataColumn(Base):
+    """One selected demographic / respondent-attribute column from the wide
+    upload — "District", "Age band", "Own or rent".
+
+    Mirrors QuestionColumn exactly, including the upsert-by-(dataset_id,
+    source_column) contract, so a column that stays selected across re-runs
+    keeps its id and its stored values keep theirs.
+
+    `n_distinct` is the non-blank cardinality measured at selection time. It
+    exists to power a WARNING, never a refusal: a high-cardinality column
+    (exact age, ZIP+4) makes thin, barely-useful filters, but the analyst
+    knows their survey better than a threshold does. See
+    docs/DEMOGRAPHICS_PLAN.md §3.
+    """
+
+    __tablename__ = "metadata_columns"
+    __table_args__ = (
+        UniqueConstraint(
+            "dataset_id", "source_column", name="uq_metadata_columns_dataset_source"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    dataset_id: Mapped[int] = mapped_column(ForeignKey("datasets.id"), nullable=False)
+    source_column: Mapped[str] = mapped_column(String, nullable=False)
+    label: Mapped[str] = mapped_column(String, nullable=False)
+    position: Mapped[int] = mapped_column(Integer, default=0)
+    n_distinct: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    dataset: Mapped["Dataset"] = relationship(back_populates="metadata_columns")
+    values: Mapped[list["RespondentAttribute"]] = relationship(
+        back_populates="column", cascade="all, delete-orphan"
+    )
+
+
+class RespondentAttribute(Base):
+    """One respondent's value for one metadata column.
+
+    Keyed by source_row_index, NOT by response id: a demographic belongs to
+    the RESPONDENT, and one respondent contributes one response per question.
+    Storing it per response would duplicate every value N times and let the
+    copies disagree. `respondent_key` (dataset_id:source_row_index) is already
+    in the export and is the join key on the ask side.
+
+    A blank cell produces NO row. Absence means "this respondent did not
+    answer that question", which is missing data — never a filterable
+    "Unknown" category. Same asymmetry event_occurred and time_context
+    already enforce.
+    """
+
+    __tablename__ = "respondent_attributes"
+    __table_args__ = (
+        UniqueConstraint(
+            "dataset_id",
+            "source_row_index",
+            "metadata_column_id",
+            name="uq_respondent_attributes_row_column",
+        ),
+        Index("ix_respondent_attributes_col_value", "metadata_column_id", "value"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    dataset_id: Mapped[int] = mapped_column(ForeignKey("datasets.id"), nullable=False)
+    upload_id: Mapped[int | None] = mapped_column(
+        ForeignKey("uploads.id"), nullable=True
+    )
+    metadata_column_id: Mapped[int] = mapped_column(
+        ForeignKey("metadata_columns.id"), nullable=False
+    )
+    source_row_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    value: Mapped[str] = mapped_column(String, nullable=False)
+
+    column: Mapped["MetadataColumn"] = relationship(back_populates="values")
 
 
 class Response(Base):

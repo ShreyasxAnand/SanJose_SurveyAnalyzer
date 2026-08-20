@@ -5,8 +5,17 @@
 - **Python 3.12**, via conda. Newer versions have no prebuilt pandas/pyarrow
   wheels and try to compile from source.
 - **Node.js 18+** (built against 22).
-- **A Google Gemini API key** — <https://aistudio.google.com/apikey>. Every AI
-  stage needs it; there is no offline mode.
+- **Google Cloud credentials (ADC)** — the AI stages run Gemini on Vertex AI
+  and authenticate with Application Default Credentials; there are no API
+  keys and no offline mode. Install the gcloud CLI, then once per machine:
+
+  ```
+  gcloud auth application-default login
+  ```
+
+  The account (or, in production, the attached service account) needs Vertex
+  AI access (role: Vertex AI User) on a project with the Vertex AI API
+  enabled.
 
 ## Install
 
@@ -21,13 +30,26 @@ pip install -r backend/requirements.txt      # requirements-dev.txt to run tests
 cd frontend && npm install && cd ..
 ```
 
-Put the key in a `.env` file at the repo root (gitignored):
+Optional `.env` settings at the repo root (gitignored). The project defaults
+to the one recorded by `gcloud auth application-default login`, and the
+location to the global endpoint — set these only to override:
 
 ```
-GEMINI_API_KEY=your-key-here
+GOOGLE_CLOUD_PROJECT=your-project-id
+GOOGLE_CLOUD_LOCATION=global
 ```
 
-`GEMINI_API_KEY` in the environment takes precedence if you'd rather set one.
+Environment variables of the same names take precedence over the file.
+
+Optional, recommended when serving on a network: an admin passcode. With it
+set, uploading, reshaping, appending, discarding, metadata edits, exports,
+and pipeline runs all require the passcode (the UI prompts for it once per
+tab); viewing datasets and asking questions stay open. Without it, nothing
+is gated.
+
+```
+ADMIN_PASSCODE=pick-a-passcode
+```
 
 ## Run
 
@@ -64,7 +86,7 @@ cd backend
 pytest
 ```
 
-255 tests, a few seconds, no API calls.
+337 tests, a few seconds, no API calls.
 
 ## Reset
 

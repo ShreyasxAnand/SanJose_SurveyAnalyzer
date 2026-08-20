@@ -1,21 +1,26 @@
 """Phase 5: query router — an analyst question in, a grounded answer out.
 
-Two model calls, everything between them deterministic:
+Everything between the model calls is deterministic:
 
   1. ROUTE: the model sees the analyst's question and the Phase 4 taxonomy
      summary, and returns candidate child categories (each with a rationale
-     and relevance), a route (retrieval / aggregate / comparative / hybrid),
-     and optionally lexicon concepts worth a keyword count. An empty
-     selection is explicitly permitted — a question the data can't answer
-     returns nothing rather than the nearest plausible match. Invented
-     label ids are dropped and counted, never trusted.
+     and relevance), a route (retrieval / aggregate / comparative / hybrid /
+     aggregate_direct), and optionally lexicon concepts worth a keyword
+     count. An empty selection is explicitly permitted — a question the data
+     can't answer returns nothing rather than the nearest plausible match.
+     Invented label ids are dropped and counted, never trusted. A RATIFY
+     call may follow: code computes a keyword candidate-miss set and the
+     model add-only ratifies it (see ask_service.propose).
 
   2. SYNTH: the model writes the answer from evidence assembled in code:
      computed counts (counting assignment rows — a model never produces a
      number) and verbatim quotes, numbered in the prompt and resolved back
      to response_key in code, so every claim traces to source rows. When a
      category has more members than the quote budget, a seeded sample is
-     shown and the prompt says so.
+     shown and the prompt says so. Route aggregate_direct skips SYNTH
+     entirely — the answer is a computed tally narrated by template.
+     app.verify then checks the draft; a repair call runs only when a
+     deterministic guard fails.
 
 The routing structure mirrors labeling's guards: numbered references
 resolved in code, invalid output dropped and counted, empty results treated
@@ -40,10 +45,22 @@ def ask_prompt_hash() -> str:
     prompt_hash versions its runs. Computed lazily over module constants so
     it can live at the top of the file without forward references."""
     import hashlib as _hashlib
+    import inspect as _inspect
     blob = "".join([
         ROUTE_SYSTEM, ROUTE_USER, ACTIONABILITY_BLOCK, EVENT_BLOCK,
-        TIME_BLOCK, RATIFY_SYSTEM, RATIFY_USER, SYNTH_SYSTEM, SYNTH_USER,
+        TIME_BLOCK, DEMOGRAPHIC_NOTE, RATIFY_SYSTEM, RATIFY_USER,
+        SYNTH_SYSTEM, SYNTH_USER,
         json.dumps(ROUTE_GUIDANCE, sort_keys=True),
+        # The SECTION PLAN is prompt text too — it dictates the answer's
+        # structure — but it is BUILT, not templated, so no constant here can
+        # stand in for it. Hashing the builder's own source covers its prose,
+        # its fusion thresholds, and anything added later, automatically.
+        # Deliberately over-inclusive: a comment-only edit rolls the cache for
+        # nothing, which costs cents of lazy recompute, while the failure this
+        # replaces — a human editing plan logic and leaving no trace — costs
+        # silent bifurcation and false provenance. Cheap direction wins.
+        _inspect.getsource(render_section_plan),
+        _inspect.getsource(_plan_tokens),
         # tunable BEHAVIOR is answer-relevant too: quote budgets, plan grain,
         # quote caps — an answer computed under old settings must not be
         # served after the settings change
@@ -172,7 +189,7 @@ Decide how to answer the analyst's question:
   WHERE something happens or which places are affected — the answer is then
   organized by place instead of by category. Candidates are still required:
   they define which responses are in scope. Only valid when a Locations list
-  is shown below.
+  appears in the summary above.
 - "location_filter": names copied from the Locations list (if shown) ONLY
   when the question names specific places ("what do people say about
   downtown?") — evidence is then restricted to responses mentioning them.
@@ -180,10 +197,10 @@ Decide how to answer the analyst's question:
   organizes by place, and adding a broad filter would hide how many
   responses named no place at all.
 - "aggregate_target": ONLY for route "aggregate_direct" — which tally:
-  "location" (valid only when a Locations list is shown below), "time"
-  (only when a time-of-day section is shown below), or "event" (only when
-  a first-hand-incident section is shown below). Leave "" for every other
-  route.
+  "location" (valid only when a Locations list appears in the summary
+  above), "time" (only when a time-of-day rule appears below), or "event"
+  (only when a first-hand-incident rule appears below). Leave "" for every
+  other route.
 {actionability_block}{event_block}{time_block}- Never estimate counts, frequencies, or percentages.
 
 Return ONLY valid JSON, exactly this shape:
@@ -252,6 +269,19 @@ TIME_BLOCK = """\
 
 ROUTE_USER = """Analyst question:
 {question}
+"""
+
+# Appended to ROUTE_USER when the analyst set a demographic filter on the ask
+# form. Purely informational: the filter is applied in code at evidence time
+# and the router can neither choose nor change it — but without this note the
+# router reads a question like "what do women say…" and refuses, believing
+# demographics are unlinked to responses. It must route the TOPIC instead.
+DEMOGRAPHIC_NOTE = """
+Note: the analyst has already restricted the evidence to respondents with
+{worded}. That restriction is applied in code after routing — you do not
+handle it. Route the topical part of the question normally over the summary
+above; never mark the question unanswerable because of its demographic part,
+and do not mention demographics in "reason".
 """
 
 # Add-only completeness ratification. Asking a lite model "did you miss
@@ -443,6 +473,7 @@ def build_route_prompts(question: str, summary_text: str,
                         actionability_counts: dict[str, int] | None = None,
                         event_counts: tuple[int, int] | None = None,
                         time_counts: dict[str, int] | None = None,
+                        demographic_filter: dict[str, list[str]] | None = None,
                         ) -> tuple[str, str]:
     """`event_counts` is (n_reporting_an_incident, n_coded); `time_counts`
     is {"day": n, "night": n, "mentioned": n}. All optional blocks are
@@ -471,7 +502,12 @@ def build_route_prompts(question: str, summary_text: str,
         event_block=evt_block,
         time_block=time_block,
     )
-    return system, ROUTE_USER.format(question=question.strip())
+    user = ROUTE_USER.format(question=question.strip())
+    if demographic_filter:
+        worded = "; ".join(f"{f} = {' or '.join(vals)}"
+                           for f, vals in demographic_filter.items())
+        user += DEMOGRAPHIC_NOTE.format(worded=worded)
+    return system, user
 
 
 def normalize_actionability(raw) -> str:
@@ -829,18 +865,22 @@ def gather_evidence(
     sub_members: dict[str, dict[str, list[str]]] | None = None,  # lid -> sub -> keys
     sub_names: dict[str, str] | None = None,                     # sub_id -> name
     sub_coded: dict[str, set[str]] | None = None,                # lid -> coded keys
+    demographic_members: dict[str, dict[str, set[str]]] | None = None,
+    demographic_coded: dict[str, set[str]] | None = None,
 ) -> dict:
     """Counts + numbered quotes for the synth prompt. Sampling is seeded,
     composite (coverage picks over signal tags + a uniform draw — see
     composite_sample) and disclosed; counts always cover the full (possibly
     filtered) membership.
 
-    Three orthogonal filters compose here, each restricting the same evidence
+    Orthogonal filters compose here, each restricting the same evidence
     set and each leaving the unfiltered per-category count behind for
     disclosure: location_filter (responses mentioning given places),
     actionability_filter (responses marked as proposing a concrete action vs
-    raising a general concern), and event_filter (responses describing an
-    incident that actually happened to someone). They apply in that fixed
+    raising a general concern), event_filter (responses describing an
+    incident that actually happened to someone), time_filter, and
+    demographic_filter (the analyst's respondent-attribute selection — the
+    one filter the router never proposes). They apply in that fixed
     order, and each one's denominator is measured against the scope the
     previous filters left — so "460 of 933" always reads "of the responses
     that survived everything before me". With group_by=location, quotes and
@@ -850,6 +890,7 @@ def gather_evidence(
     act_filter = route.get("actionability_filter") or ""
     evt_filter = route.get("event_filter") or ""
     time_filter = route.get("time_filter") or ""
+    demo_filter = route.get("demographic_filter") or {}
     group_by = route.get("group_by", "category")
 
     allowed: set[str] | None = None
@@ -924,6 +965,27 @@ def gather_evidence(
                 "matching": len(pre & t_keys),
             }
             allowed = restrict(set(t_keys))
+
+    # The analyst's demographic filter — never proposed by the router, always
+    # picked in the UI from the dataset's own fields. Values within one field
+    # are OR ("District 3 or 5"), fields are AND ("...who rent"). `coded` is
+    # the responses whose respondent has a value for EVERY filtered field: a
+    # respondent with no recorded value is missing data, not a non-match.
+    demographic_denominator: dict[str, int] | None = None
+    if demo_filter and demographic_members:
+        pre = scope_under(allowed)
+        hits = set.intersection(*[
+            set().union(*(set(demographic_members.get(f, {}).get(v, ()))
+                          for v in vals))
+            for f, vals in demo_filter.items()])
+        coded_all = set.intersection(*[
+            set((demographic_coded or {}).get(f, ())) for f in demo_filter])
+        demographic_denominator = {
+            "in_scope": len(pre),
+            "coded": len(pre & coded_all),
+            "matching": len(pre & hits),
+        }
+        allowed = restrict(hits)
 
     def member_keys(lid: str) -> list[str]:
         keys = members.get(lid, [])
@@ -1235,7 +1297,9 @@ def gather_evidence(
             "event_filter": evt_filter,
             "event_denominator": event_denominator,
             "time_filter": time_filter,
-            "time_denominator": time_denominator}
+            "time_denominator": time_denominator,
+            "demographic_filter": demo_filter,
+            "demographic_denominator": demographic_denominator}
 
 
 def lexicon_counts(lexicon: dict, concept_names: list[str],
@@ -1279,6 +1343,8 @@ def filter_phrase(evidence: dict) -> str:
     t = evidence.get("time_filter")
     if t:
         parts.append(f"mentioning {t}time" if t in {"day", "night"} else t)
+    for f, vals in (evidence.get("demographic_filter") or {}).items():
+        parts.append(f"from respondents with {f} {' or '.join(vals)}")
     return " and ".join(parts)
 
 
@@ -1356,6 +1422,24 @@ def render_counts_block(evidence: dict, lex_counts: list[dict],
         lines.append('- the remainder named no time of day, which says '
                      'nothing about when their experience happened — never '
                      'report it as the other time of day')
+    denom_demo = evidence.get("demographic_denominator")
+    if denom_demo:
+        worded = "; ".join(f"{f} = {' or '.join(vals)}"
+                           for f, vals in
+                           (evidence.get("demographic_filter") or {}).items())
+        lines.append(f'- responses in scope before the demographic filter '
+                     f'({worded}): {denom_demo["in_scope"]}')
+        lines.append(f'- of those, responses from respondents matching the '
+                     f'filter: {denom_demo["matching"]} — the answer covers '
+                     f'ONLY these, and must state this denominator')
+        no_value = denom_demo["in_scope"] - denom_demo["coded"]
+        if no_value:
+            lines.append(f'- {no_value} in-scope response'
+                         f'{"" if no_value == 1 else "s"} '
+                         f'{"has" if no_value == 1 else "have"} no recorded '
+                         f'value for the filtered field'
+                         f'{"s" if len(evidence.get("demographic_filter") or {}) > 1 else ""} '
+                         f'(missing data, not a group to characterise)')
     denom_loc = evidence.get("location_denominator")
     if denom_loc:
         lines.append(f'- responses in scope (union of selected categories): '
@@ -1505,7 +1589,42 @@ def _plan_tokens(name: str) -> set[str]:
             if w not in _PLAN_STOPWORDS}
 
 
-def render_section_plan(evidence: dict, max_sections: int = 8) -> str:
+def _fusion_test(rulings):
+    """How two plan lines are judged the same idea.
+
+    With a ruling index (app.rulings), this is a pure STORE LOOKUP: no ruling
+    means no fusion, a "distinct" ruling means no fusion, and only an
+    affirmative same_idea (or an analyst override) fuses. Without one — a
+    dataset whose ruling pass has not been run — it falls back to the interim
+    strict name-similarity bar, which is measurably safe but cannot tell a
+    shared topic word from a shared idea. Similarity NOMINATES for the ruling
+    pass; it should not be deciding here once rulings exist."""
+    if rulings is not None:
+        return lambda id_a, id_b, name_a, name_b: rulings.may_fuse(id_a, id_b)
+
+    def by_name(_id_a, _id_b, name_a: str, name_b: str) -> bool:
+        # STRICTLY greater than 0.5, and the strictness is the point. Measured
+        # over 60,461 real within-dataset pairs, the known FALSE fusions sit
+        # exactly on the 0.5 plateau ("Traffic Safety and Infrastructure" vs
+        # "Bicycle Infrastructure and Safety"; "public_transit_deficiencies" vs
+        # "public_transit_graffiti" — the live judge later ruled the first pair
+        # distinct, confirming the plateau's character), while every known-true
+        # pair scores 0.6 or above. Excluding the plateau drops 35 pairs and
+        # costs no true fusion.
+        #
+        # A relaxed cross-question bar was tried and reverted: cross-question
+        # members can never overlap (response keys are question-scoped), so the
+        # name is the ONLY signal there — precisely where widening is least
+        # affordable, since a false fusion prints "one section covering the
+        # same idea" while a missed one prints two honest sections.
+        ta, tb = _plan_tokens(name_a), _plan_tokens(name_b)
+        return bool(ta and tb) and len(ta & tb) / len(ta | tb) > 0.5
+
+    return by_name
+
+
+def render_section_plan(evidence: dict, max_sections: int = 8,
+                        rulings=None) -> str:
     """A computed section plan for the synth prompt — code decides the
     answer's structure from full-coverage (sub-)counts, the model only
     narrates. This is the equity mechanism: before sub-themes existed, the
@@ -1524,21 +1643,23 @@ def render_section_plan(evidence: dict, max_sections: int = 8) -> str:
         return ""
 
     multi_q = len({s["question_id"] for s in evidence["selection"]}) > 1
-    # The same idea must never read as two sections. It arrives twice two
-    # ways: the same topic labeled under two survey questions ("Public
-    # Transportation Improvements" vs "Public transit and accessibility"),
-    # or near-identical sub-themes induced inside two different categories
-    # of ONE question ("Robbery, Theft, and Shoplifting" vs "Retail Theft
-    # and Shoplifting" — auto-review dedupes within a category only). In
-    # both cases the counts stay separate — overlapping membership or
-    # different denominators — but the SECTION merges.
-    merge_rule = (
-        "When two plan lines name the same idea — sub-themes of different "
-        "categories, or lines from different survey questions — write ONE "
-        "section for both; this overrides one-section-per-line for exactly "
-        "those pairs. State each line's count separately with its own "
-        "within-category or question attribution, and NEVER add such counts "
-        "together: their responses overlap, or answer different questions.")
+    # The same idea must never read as two sections. It arrives two ways: the
+    # same topic labeled under two survey questions ("Public Transportation
+    # Improvements" vs "Public transit and accessibility"), or near-identical
+    # sub-themes induced inside two different categories of ONE question
+    # ("Robbery, Theft, and Shoplifting" vs "Retail Theft and Shoplifting" —
+    # auto-review dedupes within a category only). In both cases the counts
+    # stay separate — overlapping membership or different denominators — but
+    # the SECTION merges.
+    #
+    # BOTH cases fuse in code, in both branches below, and the model is never
+    # asked to merge plan lines. A prose merge rule used to ride along here on
+    # multi-question asks; it re-licensed the model to overturn fusions code
+    # had deliberately declined, per-ask and inconsistently, and any
+    # model-side fusion collapses two numbered plan lines into one section —
+    # which verify.plan_structure_violations then flags as a structure
+    # defect, sending a correct answer into a repair pass whose own
+    # instruction ("same sections, same order") undoes the merge.
 
     if len(evidence["selection"]) > SECTION_PLAN_SUBTHEME_MAX_CATS:
         cats = sorted((s for s in evidence["selection"] if s["count"]),
@@ -1547,12 +1668,21 @@ def render_section_plan(evidence: dict, max_sections: int = 8) -> str:
         # both "Robbery, Theft, and Shoplifting" and "Retail Theft and
         # Shoplifting") — fuse those into one plan line, in code, exactly
         # like the sub-theme branch below
+        may_fuse = _fusion_test(rulings)
         fused_cats: list[list[dict]] = []
         for s in cats:
-            st = _plan_tokens(s["name"])
             for group in fused_cats:
-                gt = _plan_tokens(group[0]["name"])
-                if st and gt and len(st & gt) / len(st | gt) >= 0.5:
+                # COMPLETE LINKAGE: same-idea with EVERY member, not just the
+                # representative. Real rulings are intransitive — ds1 has
+                # "Parking Availability" == "Parking Availability and Pricing",
+                # that == "Improve parking availability and cost", and the
+                # first != the third. Comparing only against group[0] lets a
+                # group absorb a pair an analyst explicitly ruled DISTINCT,
+                # depending on which member happened to land first. Requiring
+                # every member keeps "distinct always wins", which is the same
+                # asymmetry that governs the unruled case.
+                if all(may_fuse(s["label_id"], g["label_id"],
+                                s["name"], g["name"]) for g in group):
                     group.append(s)
                     break
             else:
@@ -1598,8 +1728,6 @@ def render_section_plan(evidence: dict, max_sections: int = 8) -> str:
             "they illustrate. Do NOT create separate sections for sub-themes "
             "— related sub-themes of different categories often overlap, and "
             "the category sections already separate the topics.")
-        if multi_q:
-            lines.append(merge_rule)
         lines.append("")
         return "\n".join(lines)
 
@@ -1642,16 +1770,38 @@ def render_section_plan(evidence: dict, max_sections: int = 8) -> str:
         m = min(len(a), len(b))
         return len(a & b) / m if m else 0.0
 
+    def _row_id(r) -> str:
+        # sub-theme rows carry a sub_label_id; a small category competing as
+        # its own line carries only its label_id
+        return r[4] or r[5]
+
     fused: list[list[tuple]] = []
     for r in kept_rows:
         rt = _plan_tokens(r[1])
         for group in fused:
             g = group[0]
+            # A ruling, where one exists, is the whole decision — including a
+            # "distinct" ruling, which must beat every similarity heuristic
+            # below or the store would only ever be able to ADD fusions.
+            if rulings is not None:
+                # complete linkage, for the same reason as the category branch:
+                # rulings are intransitive in practice, and matching only the
+                # representative lets a group swallow an explicitly-distinct pair
+                if all(rulings.may_fuse(_row_id(r), _row_id(m)) for m in group):
+                    group.append(r)
+                    break
+                continue
             gt = _plan_tokens(g[1])
             if not rt or not gt:
                 continue
             sim = len(rt & gt) / len(rt | gt)
             cross = r[2] != g[2]        # different category (or small-cat)
+            # Interim heuristics, pending ruling coverage. The `cross and
+            # sim >= 0.4` arm is the widest rule left in this file — no
+            # corroboration at all — and it is the next thing rulings should
+            # displace; it survives only because the measured false-fusion
+            # evidence is category-level, and retuning it unmeasured would
+            # repeat the mistake this whole layer exists to correct.
             if (sim >= 0.5
                     or (cross and sim >= 0.4)
                     or (cross and sim >= 0.2 and _overlap(r[4], g[4]) >= 0.3)):
@@ -1770,6 +1920,16 @@ def build_synth_prompts(question: str, route: dict, evidence: dict,
             f" COUNTS. Never write or imply anything about when the OTHER"
             f" responses' experiences happened: naming no time of day is not"
             f" evidence either way.")
+    if route.get("demographic_filter"):
+        worded = "; ".join(
+            f"{f} = {' or '.join(vals)}"
+            for f, vals in route["demographic_filter"].items())
+        guidance += (
+            f" The analyst restricted the evidence to respondents with"
+            f" {worded} — say plainly that the answer covers only this group,"
+            f" copying its denominator from COMPUTED COUNTS. Never"
+            f" characterise the respondents who have no recorded value for a"
+            f" filtered field: that is missing data, not a group.")
     system = SYNTH_SYSTEM.format(
         dataset_context=context_block(dataset_description),
         route_guidance=guidance,
@@ -1857,10 +2017,12 @@ def run_route(client: ModelClient, question: str, summary_text: str,
               actionability_counts: dict[str, int] | None = None,
               event_counts: tuple[int, int] | None = None,
               time_counts: dict[str, int] | None = None,
+              demographic_filter: dict[str, list[str]] | None = None,
               ) -> tuple[dict, dict]:
     system, user = build_route_prompts(question, summary_text,
                                        dataset_description, actionability_counts,
-                                       event_counts, time_counts)
+                                       event_counts, time_counts,
+                                       demographic_filter)
     act_available = bool(actionability_counts)
     evt_available = bool(event_counts and event_counts[0])
     time_available = bool(time_counts and

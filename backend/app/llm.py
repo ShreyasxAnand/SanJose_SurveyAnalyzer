@@ -1,8 +1,12 @@
-"""Thin model-client interface for taxonomy induction.
+"""Thin model-client interface for every AI stage.
 
-One protocol, one production implementation (Gemini via raw REST — no SDK
-dependency). Swap models by passing a different ModelClient to the pipeline;
-nothing outside this module knows which vendor is behind it.
+One protocol, one production implementation: Gemini on Vertex AI through the
+google-genai SDK, authenticated with Application Default Credentials (ADC).
+There are no API keys anywhere — locally, `gcloud auth application-default
+login` puts credentials in the environment; in production, the compute
+resource's service account does. Swap models by passing a different
+ModelClient to the pipeline; nothing outside this module knows which vendor
+is behind it.
 """
 from __future__ import annotations
 
@@ -12,11 +16,21 @@ import random
 import sys
 import threading
 import time
-import urllib.error
-import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
+
+import httpx
+from google import genai
+from google.auth import exceptions as gauth_exceptions
+from google.genai import errors as genai_errors
+from google.genai import types as genai_types
+
+# The SDK logs an "automatic function calling is not recommended" advisory on
+# every generate_content call. We never use function calling, and a labeling
+# run makes thousands of calls — that line would drown the job logs.
+import logging as _logging
+_logging.getLogger("google_genai.models").setLevel(_logging.ERROR)
 
 RETRYABLE_HTTP = {429, 500, 502, 503, 504}
 # 6 attempts with exponential backoff ≈ 62s cumulative — a production run is
@@ -52,12 +66,12 @@ DEFAULT_MODEL = "gemini-3.5-flash-lite"
 # pass --synth-model / GEMINI_SYNTH_MODEL; nothing else needs to change.
 DEFAULT_SYNTH_MODEL = DEFAULT_MODEL
 
-# Published USD per 1M tokens, (input, output), checked against
-# ai.google.dev/gemini-api/docs/pricing on 2026-07-29. The output rate
-# INCLUDES thinking tokens — which is why complete() folds thoughtsTokenCount
-# into output_tokens. A model absent from this table prices to None rather
-# than to a guess: an unpriced run reports tokens and says the cost is
-# unknown, which is recoverable; a confidently wrong dollar figure is not.
+# Published USD per 1M tokens, (input, output), checked against the Vertex AI
+# pricing page on 2026-07-29. The output rate INCLUDES thinking tokens —
+# which is why complete() folds thoughts_token_count into output_tokens. A
+# model absent from this table prices to None rather than to a guess: an
+# unpriced run reports tokens and says the cost is unknown, which is
+# recoverable; a confidently wrong dollar figure is not.
 PRICES_PER_MTOK: dict[str, tuple[float, float]] = {
     "gemini-3.5-flash-lite": (0.30, 2.50),
     "gemini-3.6-flash": (1.50, 7.50),
@@ -82,9 +96,9 @@ def load_dotenv(path: Path | None = None) -> dict[str, str]:
     Kept dependency-free to match the rest of this module. Handles `KEY=value`,
     an optional `export ` prefix, `#` comments, and surrounding quotes. Reads as
     utf-8-sig because editors and PowerShell's `Out-File` on this platform write
-    a BOM, which would otherwise turn the first key into "\\ufeffGEMINI_API_KEY".
-    Unparseable lines are skipped rather than raising — a malformed .env should
-    not crash an induction run that has a real env var set."""
+    a BOM, which would otherwise corrupt the first key's name. Unparseable
+    lines are skipped rather than raising — a malformed .env should not crash
+    a run that has real environment variables set."""
     env_path = path or REPO_ROOT / ".env"
     values: dict[str, str] = {}
     try:
@@ -108,23 +122,54 @@ def load_dotenv(path: Path | None = None) -> dict[str, str]:
     return values
 
 
-def resolve_api_key(explicit: str | None = None) -> str | None:
-    """Explicit argument, then environment, then repo-root .env."""
-    for candidate in (
-        explicit,
-        os.environ.get("GEMINI_API_KEY"),
-        os.environ.get("GOOGLE_API_KEY"),
-    ):
+def _adc_quota_project() -> str | None:
+    """The quota project recorded in the local ADC file, if any — written by
+    `gcloud auth application-default login`, and the project a developer
+    almost always means when they have configured nothing else."""
+    if os.name == "nt":
+        adc = Path(os.environ.get("APPDATA", "")) / "gcloud" / \
+            "application_default_credentials.json"
+    else:
+        adc = Path.home() / ".config" / "gcloud" / \
+            "application_default_credentials.json"
+    try:
+        return json.loads(adc.read_text(encoding="utf-8")).get("quota_project_id")
+    except (OSError, ValueError):
+        return None
+
+
+def resolve_project(explicit: str | None = None) -> str | None:
+    """Explicit argument, then environment, then .env, then the ADC file's
+    quota project."""
+    for candidate in (explicit, os.environ.get("GOOGLE_CLOUD_PROJECT")):
         if candidate and candidate.strip():
             return candidate.strip()
-    dotenv = load_dotenv()
-    for name in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
-        candidate = dotenv.get(name)
+    candidate = load_dotenv().get("GOOGLE_CLOUD_PROJECT")
+    if candidate and candidate.strip():
+        return candidate.strip()
+    return _adc_quota_project()
+
+
+def resolve_location(explicit: str | None = None) -> str:
+    """Explicit argument, then environment, then .env, then the global
+    endpoint — the right default for Gemini on Vertex when nobody has a
+    data-residency reason to pin a region."""
+    for candidate in (explicit, os.environ.get("GOOGLE_CLOUD_LOCATION")):
         if candidate and candidate.strip():
-            # stripped: a trailing newline or space in the file would otherwise
-            # go straight into an HTTP header and fail with an opaque error
             return candidate.strip()
-    return None
+    candidate = load_dotenv().get("GOOGLE_CLOUD_LOCATION")
+    if candidate and candidate.strip():
+        return candidate.strip()
+    return "global"
+
+
+_ADC_HELP = (
+    "Google credentials not found or not usable. Run `gcloud auth "
+    "application-default login` on this machine (or attach a service "
+    "account with Vertex AI access in production), and set "
+    "GOOGLE_CLOUD_PROJECT in the environment or the repo-root .env if the "
+    "project cannot be inferred."
+)
 
 
 @dataclass
@@ -168,18 +213,20 @@ class ModelClient(Protocol):
 
 
 class GeminiClient:
-    """Gemini generateContent over plain HTTPS. Temperature 0, JSON output.
+    """Gemini on Vertex AI via the google-genai SDK. Temperature 0, JSON
+    output, Application Default Credentials.
 
-    Key comes from GEMINI_API_KEY (or GOOGLE_API_KEY), looked up in the
-    environment first and then in the repo-root .env — which is gitignored, so
-    it never reaches a commit. Model id is a plain string so new releases need
-    no code change.
+    No API key exists anywhere in this path: google.auth discovers the
+    credentials (gcloud ADC locally, the attached service account in
+    production). The project comes from GOOGLE_CLOUD_PROJECT (environment or
+    .env) or the ADC file's quota project; the location from
+    GOOGLE_CLOUD_LOCATION, defaulting to the global endpoint. Model id is a
+    plain string so new releases need no code change.
     """
 
     def __init__(
         self,
         model: str | None = None,
-        api_key: str | None = None,
         temperature: float = 0.0,
         max_output_tokens: int = 16384,
         timeout_s: int = 240,
@@ -187,18 +234,22 @@ class GeminiClient:
         min_interval_s: float = 0.1,
         max_attempts: int = MAX_ATTEMPTS,
         timeouts: tuple[int, ...] | None = None,
+        project: str | None = None,
+        location: str | None = None,
     ) -> None:
         # Pinned to a concrete version, not a "-latest" alias: the manifest
         # records model_id so a run can be reproduced, which an alias silently
         # breaks when it moves. Override per-run with --model or GEMINI_MODEL.
         self.model_id = model or os.environ.get("GEMINI_MODEL", DEFAULT_MODEL)
-        self.api_key = resolve_api_key(api_key)
-        if not self.api_key:
-            raise RuntimeError(
-                "No API key found. Set GEMINI_API_KEY (or GOOGLE_API_KEY) in the "
-                f"environment, or put it in {REPO_ROOT / '.env'} as "
-                "GEMINI_API_KEY=your-key-here"
-            )
+        self.project = resolve_project(project)
+        self.location = resolve_location(location)
+        if not self.project:
+            raise RuntimeError(_ADC_HELP)
+        try:
+            self._client = genai.Client(
+                vertexai=True, project=self.project, location=self.location)
+        except Exception as exc:
+            raise RuntimeError(f"{_ADC_HELP} ({exc})") from exc
         self.temperature = temperature
         self.max_output_tokens = max_output_tokens
         self.timeout_s = timeout_s
@@ -241,79 +292,79 @@ class GeminiClient:
             time.sleep(wait)
 
     def _timeout_for(self, attempt: int) -> int:
-        """This attempt's read timeout. Without an explicit schedule every
-        attempt gets timeout_s, which is what the batch stages want."""
+        """This attempt's read timeout in seconds. Without an explicit
+        schedule every attempt gets timeout_s, which is what the batch stages
+        want."""
         if not self.timeouts:
             return self.timeout_s
         return self.timeouts[min(attempt - 1, len(self.timeouts) - 1)]
 
-    def _backoff_delay(self, attempt: int, http_error: urllib.error.HTTPError | None = None) -> float:
+    def _backoff_delay(self, attempt: int, retry_after: float | None = None) -> float:
         """Exponential backoff with jitter; a 429's Retry-After header, when
-        present, overrides the exponential schedule."""
-        retry_after = None
-        if http_error is not None and http_error.code == 429:
-            try:
-                retry_after = float(http_error.headers.get("Retry-After", ""))
-            except (TypeError, ValueError):
-                retry_after = None
+        the SDK exposes one, overrides the exponential schedule."""
         base = retry_after if retry_after else min(60, 2 ** attempt)
         return base * (1 + random.uniform(0.0, 0.25))
 
-    def _url(self) -> str:
-        return (
-            "https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{self.model_id}:generateContent"
+    @staticmethod
+    def _retry_after_seconds(error: Exception) -> float | None:
+        """Best-effort Retry-After from an APIError's underlying response —
+        every access guarded, because the SDK does not promise the response
+        object survives into the exception."""
+        try:
+            headers = getattr(getattr(error, "response", None), "headers", None)
+            if headers is None:
+                return None
+            return float(headers.get("Retry-After", ""))
+        except (TypeError, ValueError, AttributeError):
+            return None
+
+    def _generate(self, system: str, user: str, timeout_s: int):
+        """One SDK call — the single seam between this module and google-genai,
+        which is also what the offline tests monkeypatch."""
+        config = genai_types.GenerateContentConfig(
+            system_instruction=system,
+            temperature=self.temperature,
+            max_output_tokens=self.max_output_tokens,
+            response_mime_type="application/json",
+            **({"seed": self.seed} if self.seed is not None else {}),
+            # per-attempt timeout; the SDK takes milliseconds
+            http_options=genai_types.HttpOptions(timeout=int(timeout_s * 1000)),
         )
+        return self._client.models.generate_content(
+            model=self.model_id, contents=user, config=config)
 
     def complete(self, system: str, user: str) -> str:
-        body = {
-            "systemInstruction": {"parts": [{"text": system}]},
-            "contents": [{"role": "user", "parts": [{"text": user}]}],
-            "generationConfig": {
-                "temperature": self.temperature,
-                "maxOutputTokens": self.max_output_tokens,
-                "responseMimeType": "application/json",
-                **({"seed": self.seed} if self.seed is not None else {}),
-            },
-        }
-        payload = self._post_with_retries(body)
+        response = self._generate_with_retries(system, user)
 
-        candidates = payload.get("candidates") or []
+        candidates = getattr(response, "candidates", None) or []
         if not candidates:
-            raise RuntimeError(f"Gemini returned no candidates: {json.dumps(payload)[:500]}")
+            raise RuntimeError("Gemini returned no candidates.")
         cand = candidates[0]
-        finish = cand.get("finishReason", "")
-        parts = (cand.get("content") or {}).get("parts") or []
-        text = "".join(p.get("text", "") for p in parts)
-        if finish == "MAX_TOKENS":
+        finish = str(getattr(cand, "finish_reason", "") or "")
+        parts = getattr(getattr(cand, "content", None), "parts", None) or []
+        text = "".join(getattr(p, "text", "") or "" for p in parts)
+        if "MAX_TOKENS" in finish:
             raise RuntimeError(
-                "Gemini hit maxOutputTokens mid-response; raise --max-output-tokens "
-                "or lower --chunk-size."
+                "Gemini hit max_output_tokens mid-response; raise "
+                "--max-output-tokens or lower --chunk-size."
             )
         if not text.strip():
-            raise RuntimeError(f"Gemini returned empty text (finishReason={finish}).")
+            raise RuntimeError(f"Gemini returned empty text (finish_reason={finish}).")
 
-        meta = payload.get("usageMetadata") or {}
-        thoughts = meta.get("thoughtsTokenCount", 0) or 0
-        out_tokens = meta.get("candidatesTokenCount", 0) + thoughts
-        self.usage.add(meta.get("promptTokenCount", 0), out_tokens, thoughts)
+        meta = getattr(response, "usage_metadata", None)
+        thoughts = getattr(meta, "thoughts_token_count", 0) or 0
+        out_tokens = (getattr(meta, "candidates_token_count", 0) or 0) + thoughts
+        self.usage.add(getattr(meta, "prompt_token_count", 0) or 0,
+                       out_tokens, thoughts)
         return text
 
-    def _post_with_retries(self, body: dict) -> dict:
-        data = json.dumps(body).encode("utf-8")
+    def _generate_with_retries(self, system: str, user: str):
         last_err: Exception | None = None
         for attempt in range(1, self.max_attempts + 1):
             self._throttle()
-            req = urllib.request.Request(
-                self._url(),
-                data=data,
-                headers={"Content-Type": "application/json", "x-goog-api-key": self.api_key},
-                method="POST",
-            )
             try:
                 started = time.time()
-                with urllib.request.urlopen(req, timeout=self._timeout_for(attempt)) as resp:
-                    payload = json.loads(resp.read().decode("utf-8"))
+                response = self._generate(system, user, self._timeout_for(attempt))
                 # A retrying or merely slow call used to be indistinguishable
                 # from a hang: nothing was printed, and timeout_s is 240s across
                 # 6 attempts. Say so once it is past the point where a human
@@ -323,22 +374,23 @@ class GeminiClient:
                     _warn(f"{self.model_id}: {elapsed:.1f}s"
                           + (f" (attempt {attempt}/{self.max_attempts})"
                              if attempt > 1 else ""))
-                return payload
-            except urllib.error.HTTPError as e:
-                detail = ""
-                try:
-                    detail = e.read().decode("utf-8", errors="replace")[:500]
-                except Exception:
-                    pass
-                if e.code in RETRYABLE_HTTP and attempt < self.max_attempts:
+                return response
+            except gauth_exceptions.GoogleAuthError as e:
+                # expired or missing credentials never fix themselves by
+                # retrying — fail with the instruction that actually helps
+                raise RuntimeError(f"{_ADC_HELP} ({e})") from e
+            except genai_errors.APIError as e:
+                code = getattr(e, "code", None)
+                if code in RETRYABLE_HTTP and attempt < self.max_attempts:
                     last_err = e
-                    delay = self._backoff_delay(attempt, e)
-                    _warn(f"HTTP {e.code} from {self.model_id}; retrying in "
+                    delay = self._backoff_delay(attempt, self._retry_after_seconds(e))
+                    _warn(f"HTTP {code} from {self.model_id}; retrying in "
                           f"{delay:.1f}s (attempt {attempt}/{self.max_attempts})")
                     time.sleep(delay)
                     continue
-                raise RuntimeError(f"Gemini HTTP {e.code}: {detail}") from e
-            except (urllib.error.URLError, TimeoutError) as e:
+                raise RuntimeError(
+                    f"Gemini HTTP {code}: {getattr(e, 'message', e)}") from e
+            except (httpx.HTTPError, TimeoutError, ConnectionError, OSError) as e:
                 if attempt < self.max_attempts:
                     last_err = e
                     delay = self._backoff_delay(attempt)
@@ -347,5 +399,7 @@ class GeminiClient:
                           f"(attempt {attempt}/{self.max_attempts})")
                     time.sleep(delay)
                     continue
-                raise RuntimeError(f"Gemini request failed after {self.max_attempts} attempts: {e}") from e
+                raise RuntimeError(
+                    f"Gemini request failed after {self.max_attempts} attempts: {e}"
+                ) from e
         raise RuntimeError(f"Gemini request failed: {last_err}")

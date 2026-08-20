@@ -243,7 +243,14 @@ def render_summary(summary: dict,
             if items:
                 rendered = ", ".join(f'{c["name"]} (n={c["count"]})' for c in items)
                 lines.append(f"  {label}: {rendered}")
-        cov = summary.get("location_coverage") or {}
+        # Restricted to the questions actually rendered. A question-scoped ask
+        # re-renders with summary["questions"] filtered (ask_service), and an
+        # unscoped coverage line would quote another question's denominator at
+        # a router that cannot select from it — which is exactly the input it
+        # weighs when deciding group_by=location.
+        shown_qs = {str(q["question_id"]) for q in summary["questions"]}
+        cov = {q: c for q, c in (summary.get("location_coverage") or {}).items()
+               if str(q) in shown_qs}
         if cov:
             per_q = "; ".join(
                 f'q{q}: {c["responses_with_location"]}/{c["responses"]}'

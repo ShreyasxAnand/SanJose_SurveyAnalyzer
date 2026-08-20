@@ -1,15 +1,18 @@
 """Phase 5: ask an analyst question, get an answer grounded in the responses.
 
-From backend/, inside the surveyanalyzer conda env (needs GEMINI_API_KEY):
+From backend/, inside the surveyanalyzer conda env (needs Google ADC — run
+`gcloud auth application-default login` once on this machine):
 
     python -m scripts.ask "when residents mention affordability, what specific costs are they referring to?"
     python -m scripts.ask --route-only "what makes people feel unsafe downtown?"
 
 Flow: rebuild the Phase 4 summary (free, deterministic) -> ROUTE call picks
-candidate categories and a route -> code computes counts and samples
+candidate categories and a route (an add-only RATIFY call runs when code
+flags possibly-missed categories) -> code computes counts and samples
 verbatims -> SYNTH call writes the answer, citing responses that code
-resolves back to response_key. Two model calls total; every number in the
-answer is computed, never estimated.
+resolves back to response_key, then deterministic verification (a repair
+call only when a guard fails). Two model calls in the common case; every
+number in the answer is computed, never estimated.
 
 The heavy lifting lives in app.ask_service, shared with the API endpoints —
 the CLI and the browser run the same pipeline and write the same artifacts:

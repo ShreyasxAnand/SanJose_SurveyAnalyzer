@@ -103,9 +103,33 @@ class QuestionColumnSelection(BaseModel):
         return self
 
 
+class MetadataValueCount(BaseModel):
+    value: str
+    n_respondents: int
+
+
+class MetadataColumnSelection(BaseModel):
+    """A demographic / respondent-attribute column. Unlike a question column
+    the label MAY equal the raw column name — "District" is already the right
+    display name, whereas a question column needs the actual question wording
+    (a raw header like "Q2oe" tells a reader nothing)."""
+    column: str
+    label: str
+
+    @model_validator(mode="after")
+    def _label_required(self) -> Self:
+        if not self.label.strip():
+            raise ValueError(f"A name is required for metadata column '{self.column}'")
+        return self
+
+
 class SelectColumnsRequest(BaseModel):
     respondent_id_column: str | None = None
     questions: list[QuestionColumnSelection]
+    # Demographic columns. Optional and independent of `questions`: a dataset
+    # with none behaves exactly as before. Not named `metadata` — that shadows
+    # BaseModel internals and reads ambiguously next to dataset_notes etc.
+    metadata_columns: list[MetadataColumnSelection] = []
     # Free-text survey description (what the survey is, who answered it —
     # never what the analyst hopes to find). Optional; None leaves any
     # previously saved description untouched.
@@ -144,6 +168,21 @@ class ExportInfo(BaseModel):
     per_question_counts: dict[str, int]
 
 
+class MetadataColumnOut(BaseModel):
+    id: int
+    source_column: str
+    label: str
+    n_distinct: int
+    # value -> respondent count, most common first. Capped for transport; the
+    # full set always lives in the database.
+    values: list[MetadataValueCount] = []
+    # True when n_distinct exceeds METADATA_MAX_DISTINCT. Advisory: the column
+    # is stored and usable either way — see docs/DEMOGRAPHICS_PLAN.md §3.
+    high_cardinality: bool = False
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class DatasetOut(BaseModel):
     id: int
     name: str
@@ -157,6 +196,7 @@ class DatasetOut(BaseModel):
     survey_start_date: str | None = None
     survey_end_date: str | None = None
     questions: list[QuestionColumnOut]
+    metadata_columns: list[MetadataColumnOut] = []
     exports: ExportInfo | None = None
 
     model_config = ConfigDict(from_attributes=True)
@@ -231,6 +271,11 @@ class AskRouteRequest(BaseModel):
     # the router only sees the scoped questions' summary, so an out-of-scope
     # category cannot be proposed. Empty = all questions.
     question_scope: list[str] = []
+    # Analyst-picked demographic restriction, {field: [values]} — the same
+    # kind of scope selection as question_scope, never something the router
+    # proposes. Values within one field are OR, fields are AND. Unknown
+    # fields/values are a 422. Empty = everyone.
+    demographic_filter: dict[str, list[str]] = {}
 
     @model_validator(mode="after")
     def _question_required(self) -> Self:
@@ -266,6 +311,35 @@ class AskLocationOut(BaseModel):
     name: str
     kind: str
     count: int
+
+
+class AskDemographicValueOut(BaseModel):
+    """One value of a demographic field, with the number of RESPONDENTS
+    carrying it — a demographic belongs to the person, not the response."""
+    value: str
+    n_respondents: int
+
+
+class AskDemographicOut(BaseModel):
+    """One demographic field the ask form offers as a respondent filter.
+    Values are the dataset's actual non-blank values; a respondent who left
+    the cell blank is missing data and appears under no value."""
+    field: str
+    values: list[AskDemographicValueOut]
+
+
+class AskDemographicsRequest(BaseModel):
+    """The ask form's current selection, so the counts come back faceted:
+    each field recounted under the OTHER fields' ticked values. Empty = the
+    unfiltered counts."""
+    demographic_filter: dict[str, list[str]] = {}
+
+
+class AskDemographicsResponse(BaseModel):
+    fields: list[AskDemographicOut]
+    # respondents matching the whole current filter; None when no filter is
+    # active (the form shows it as a running "who am I asking about" figure)
+    n_matching_respondents: int | None = None
 
 
 class AskChildOut(BaseModel):
@@ -343,6 +417,9 @@ class AskRouteResponse(BaseModel):
     available_time: dict[str, int] = {}
     # echo of the analyst-requested scope this proposal was made under
     question_scope: list[str] = []
+    # echo of the analyst's demographic restriction (validated); the answer
+    # step must carry it back unchanged for the filter to apply
+    demographic_filter: dict[str, list[str]] = {}
     warnings: list[str]
 
 
@@ -367,6 +444,9 @@ class AskAnswerRequest(BaseModel):
     event_filter: str = ""
     time_filter: str = ""
     question_scope: list[str] = []
+    # {field: [values]} — validated server-side against the dataset's actual
+    # demographics; part of the answer-cache key via ask_cache
+    demographic_filter: dict[str, list[str]] = {}
     proposed_label_ids: list[str] = []
     aggregate_target: str = ""
     # debugging escape hatch: run the deterministic verification but skip the
@@ -501,6 +581,14 @@ class AskAnswerResponse(BaseModel):
     # mentioned the filtered time of day; responses naming no time say
     # nothing about when their experience happened.
     time_denominator: dict[str, int] | None = None
+    demographic_filter: dict[str, list[str]] = {}
+    # {in_scope, coded, matching} — `coded` responses belong to respondents
+    # with a recorded value for every filtered field; the gap to in_scope is
+    # missing data, never a group.
+    demographic_denominator: dict[str, int] | None = None
+    # True when the demographic filter left fewer matching responses than the
+    # thin-cell notice threshold — disclosed, never blocked
+    demographic_thin: bool = False
     # survey questions whose every response counted as mentioning the
     # filtered place because the question itself asks about it
     location_filter_implicit_questions: list[str] = []

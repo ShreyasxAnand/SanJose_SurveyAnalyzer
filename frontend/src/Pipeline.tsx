@@ -7,10 +7,10 @@ import "./pipeline.css";
 // label -> lexicon -> locations -> summary, as a background job on the server.
 //
 // Estimate first, then confirm. The estimate makes no model calls and writes
-// nothing, so the analyst always approves a figure before any spend — the same
-// gate the taxonomy review applies to the other expensive step. Which figures
-// are *planned* (real chunking and prompt sizes) and which are *projected*
-// (extrapolated from a measured rate) is shown per row and must stay shown.
+// nothing, so the analyst always approves a figure before any spend. Which
+// figures are *planned* (real chunking and prompt sizes) and which are
+// *projected* (extrapolated from a measured rate) is shown per row and must
+// stay shown.
 
 type Mode =
   | { name: "idle" }

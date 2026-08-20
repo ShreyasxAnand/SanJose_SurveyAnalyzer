@@ -19,10 +19,10 @@ label-a-pool-and-overlay problem):
   same_run_id, exactly like a review run;
 - old run dirs are never touched.
 
-New labels never create new parents: parents are the shared, human-edited
-layer, and an auto-created parent would bypass the review gate. A proposal the
-ASSIGN call can't place under an existing parent becomes an orphan
-(parent_id=None), which review.diagnose already surfaces.
+New labels never create new parents: parents are the shared layer every
+question's answers organize under, and an auto-created one would silently
+reshape it. A proposal the ASSIGN call can't place under an existing parent
+becomes an orphan (parent_id=None), which review.diagnose already surfaces.
 """
 
 from __future__ import annotations

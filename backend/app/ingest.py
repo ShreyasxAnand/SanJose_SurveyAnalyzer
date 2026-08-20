@@ -16,11 +16,14 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app import rowhash
+from app.auth import require_admin
 from app.db import DATA_DIR, EXPORTS_DIR, UPLOADS_DIR, get_db
 from app.models import (
     ColumnFingerprint,
     Dataset,
+    MetadataColumn,
     QuestionColumn,
+    RespondentAttribute,
     Response,
     RowHash,
     Upload,
@@ -37,6 +40,8 @@ from app.schemas import (
     DatasetOut,
     DuplicateCheck,
     ExportInfo,
+    MetadataColumnOut,
+    MetadataValueCount,
     QuestionColumnOut,
     SelectColumnsRequest,
     UploadHistoryEntry,
@@ -57,6 +62,17 @@ REPO_ROOT = DATA_DIR.parent
 # schema, so v1 exports keep working until regenerated.
 EXPORT_SCHEMA_VERSION = 2
 LIST_COLUMNS = ("label_ids", "locations", "time_context")
+# Demographics sidecar — see the comment at its write site in _write_exports
+# for why this is a separate file rather than columns on the response schema.
+RESPONDENT_PARQUET_SCHEMA = pa.schema(
+    [
+        ("respondent_key", pa.string()),
+        ("source_row_index", pa.int64()),
+        ("field", pa.string()),
+        ("value", pa.string()),
+    ]
+)
+
 RESPONSE_PARQUET_SCHEMA = pa.schema(
     [
         ("dataset_id", pa.int64()),
@@ -277,6 +293,67 @@ def _owned_row_indices(db: Session, upload: Upload) -> list[int]:
     return [r[0] for r in rows]
 
 
+# Cardinality above which a metadata column is flagged as probably too
+# fine-grained to filter usefully. Advisory ONLY — nothing refuses a column
+# past it. A survey with 100 districts is a real survey; a column with 8,000
+# distinct values is almost certainly free text or an exact age, and the
+# analyst gets told so and decides. See docs/DEMOGRAPHICS_PLAN.md §3.
+METADATA_MAX_DISTINCT = 100
+# How many (value, count) pairs travel in a DTO. The database keeps them all.
+METADATA_VALUES_IN_DTO = 200
+
+
+def _upsert_upload_metadata(
+    db: Session,
+    dataset: Dataset,
+    upload: Upload,
+    df: pd.DataFrame,
+    columns: dict[str, "MetadataColumn"],
+) -> None:
+    """Store one upload's demographic values, mirroring
+    _upsert_upload_responses: bulk mappings, deletion scoped to this upload
+    so re-reading one file can never drop another file's rows.
+
+    A column absent from THIS file is skipped rather than erroring — an
+    appended wave may not carry every demographic the first file had, and
+    those respondents simply have no value for it (missing, not "Unknown").
+    """
+    owned = _owned_row_indices(db, upload)
+    db.query(RespondentAttribute).filter(
+        RespondentAttribute.dataset_id == dataset.id,
+        RespondentAttribute.upload_id == upload.id,
+    ).delete(synchronize_session=False)
+    if not columns:
+        return
+
+    rows: list[dict] = []
+    for source_column, col in columns.items():
+        if source_column not in df.columns:
+            continue
+        values = df[source_column].tolist()
+        for global_index in owned:
+            local_index = global_index - upload.row_offset
+            raw = values[local_index] if 0 <= local_index < len(values) else ""
+            # same mojibake repair the response text gets — a demographic
+            # value is displayed and filtered on, so "Distrito Três" must not
+            # arrive mangled and split one real group into two
+            value, _repaired = _repair_mojibake(str(raw).strip())
+            value = value.strip()
+            if not value:
+                continue          # blank = missing, never a stored category
+            rows.append(
+                {
+                    "dataset_id": dataset.id,
+                    "upload_id": upload.id,
+                    "metadata_column_id": col.id,
+                    "source_row_index": global_index,
+                    "value": value,
+                }
+            )
+    if rows:
+        db.bulk_insert_mappings(RespondentAttribute, rows)
+
+
 def _upsert_upload_responses(
     db: Session,
     dataset: Dataset,
@@ -480,6 +557,50 @@ def _write_exports(db: Session, dataset: Dataset) -> ExportInfo:
     table = pa.Table.from_pylist(records, schema=RESPONSE_PARQUET_SCHEMA)
     pq.write_table(table, parquet_path)
 
+    # Demographics go in a SIDECAR, not into RESPONSE_PARQUET_SCHEMA. That
+    # schema is fixed and every artifact and the whole ask path depend on it;
+    # per-dataset demographic columns cannot live in a fixed schema, and
+    # widening it for a map column would rewrite the contract for every
+    # dataset that has no demographics at all. Long format, one row per
+    # (respondent, field) — blanks simply absent. Written only when the
+    # dataset has metadata columns, so nothing changes for datasets without.
+    meta_cols = (
+        db.query(MetadataColumn)
+        .filter(MetadataColumn.dataset_id == dataset.id)
+        .order_by(MetadataColumn.position)
+        .all()
+    )
+    if meta_cols:
+        label_by_id = {m.id: m.label for m in meta_cols}
+        attrs = (
+            db.query(
+                RespondentAttribute.metadata_column_id,
+                RespondentAttribute.source_row_index,
+                RespondentAttribute.value,
+            )
+            .filter(RespondentAttribute.dataset_id == dataset.id)
+            .order_by(
+                RespondentAttribute.source_row_index,
+                RespondentAttribute.metadata_column_id,
+            )
+            .all()
+        )
+        pq.write_table(
+            pa.Table.from_pylist(
+                [
+                    {
+                        "respondent_key": f"{dataset.id}:{a.source_row_index}",
+                        "source_row_index": a.source_row_index,
+                        "field": label_by_id[a.metadata_column_id],
+                        "value": a.value,
+                    }
+                    for a in attrs
+                ],
+                schema=RESPONDENT_PARQUET_SCHEMA,
+            ),
+            export_dir / "respondents.parquet",
+        )
+
     csv_path = export_dir / "responses.csv"
     csv_records = [
         {
@@ -610,9 +731,45 @@ def _dataset_out(db: Session, dataset: Dataset) -> DatasetOut:
                 response_count=count,
             )
         )
+    # Demographic columns with their value distribution — one grouped COUNT
+    # for the whole dataset rather than a query per column.
+    meta_out: list[MetadataColumnOut] = []
+    if dataset.metadata_columns:
+        counts = (
+            db.query(
+                RespondentAttribute.metadata_column_id,
+                RespondentAttribute.value,
+                func.count(RespondentAttribute.id),
+            )
+            .filter(RespondentAttribute.dataset_id == dataset.id)
+            .group_by(
+                RespondentAttribute.metadata_column_id, RespondentAttribute.value
+            )
+            .all()
+        )
+        by_col: dict[int, list[MetadataValueCount]] = {}
+        for col_id, value, n in counts:
+            by_col.setdefault(col_id, []).append(
+                MetadataValueCount(value=value, n_respondents=n)
+            )
+        for m in sorted(dataset.metadata_columns, key=lambda m: m.position):
+            vals = sorted(by_col.get(m.id, []),
+                          key=lambda v: (-v.n_respondents, v.value))
+            meta_out.append(
+                MetadataColumnOut(
+                    id=m.id,
+                    source_column=m.source_column,
+                    label=m.label,
+                    n_distinct=m.n_distinct,
+                    values=vals[:METADATA_VALUES_IN_DTO],
+                    high_cardinality=m.n_distinct > METADATA_MAX_DISTINCT,
+                )
+            )
+
     return DatasetOut(
         id=dataset.id,
         name=dataset.name,
+        metadata_columns=meta_out,
         original_filename=dataset.original_filename,
         status=dataset.status,
         uploaded_at=dataset.uploaded_at,
@@ -627,7 +784,8 @@ def _dataset_out(db: Session, dataset: Dataset) -> DatasetOut:
     )
 
 
-@router.post("/upload", response_model=UploadResponse)
+@router.post("/upload", response_model=UploadResponse,
+             dependencies=[Depends(require_admin)])
 async def upload_dataset(file: UploadFile, db: Session = Depends(get_db)):
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in SUPPORTED_SUFFIXES:
@@ -758,7 +916,8 @@ async def upload_dataset(file: UploadFile, db: Session = Depends(get_db)):
     )
 
 
-@router.delete("/{dataset_id}", status_code=204)
+@router.delete("/{dataset_id}", status_code=204,
+               dependencies=[Depends(require_admin)])
 def discard_dataset(dataset_id: int, db: Session = Depends(get_db)):
     """Discard a provisional upload. Only allowed before column selection —
     an ingested dataset has derived artifacts (taxonomies, labels, answers)
@@ -777,7 +936,8 @@ def discard_dataset(dataset_id: int, db: Session = Depends(get_db)):
         shutil.rmtree(upload_dir, ignore_errors=True)
 
 
-@router.post("/{dataset_id}/append", response_model=AppendResponse)
+@router.post("/{dataset_id}/append", response_model=AppendResponse,
+             dependencies=[Depends(require_admin)])
 def append_upload(
     dataset_id: int, body: AppendRequest, db: Session = Depends(get_db)
 ):
@@ -908,6 +1068,17 @@ def append_upload(
     inserted = _upsert_upload_responses(
         db, target, upload, df, questions_by_column, target.respondent_id_column
     )
+    # The appended wave's demographics, for the columns the dataset already
+    # has selected. A column this file lacks is skipped inside the helper —
+    # its respondents get no value, which is missing data, not an error.
+    _upsert_upload_metadata(
+        db,
+        target,
+        upload,
+        df,
+        {m.source_column: m for m in db.query(MetadataColumn)
+         .filter(MetadataColumn.dataset_id == target.id).all()},
+    )
     labels_by_question = {q.id: q.label for q in questions}
     new_responses_per_question = {
         labels_by_question[qid]: n for qid, n in inserted.items()
@@ -954,7 +1125,8 @@ def get_dataset(dataset_id: int, db: Session = Depends(get_db)):
     return _dataset_out(db, dataset)
 
 
-@router.patch("/{dataset_id}", response_model=DatasetOut)
+@router.patch("/{dataset_id}", response_model=DatasetOut,
+              dependencies=[Depends(require_admin)])
 def update_dataset_metadata(
     dataset_id: int, body: DatasetMetadataPatch, db: Session = Depends(get_db)
 ):
@@ -1042,7 +1214,8 @@ def dataset_history(dataset_id: int, db: Session = Depends(get_db)):
     return DatasetHistoryOut(dataset_id=dataset.id, entries=entries)
 
 
-@router.post("/{dataset_id}/columns", response_model=DatasetOut)
+@router.post("/{dataset_id}/columns", response_model=DatasetOut,
+             dependencies=[Depends(require_admin)])
 def select_columns(
     dataset_id: int, body: SelectColumnsRequest, db: Session = Depends(get_db)
 ):
@@ -1057,11 +1230,24 @@ def select_columns(
     first_df = frames[0][1]
 
     all_selected = [q.column for q in body.questions]
+    all_selected += [m.column for m in body.metadata_columns]
     if body.respondent_id_column:
         all_selected.append(body.respondent_id_column)
     missing = [c for c in all_selected if c not in first_df.columns]
     if missing:
         raise HTTPException(status_code=400, detail=f"Columns not found in file: {missing}")
+
+    # A column cannot be both a question and a demographic: the first is
+    # reshaped into Responses and analysed, the second is an attribute of the
+    # respondent. Selecting one as both is a mistake with silent consequences
+    # (its text would be induced over AND offered as a filter value).
+    overlap = sorted({q.column for q in body.questions}
+                     & {m.column for m in body.metadata_columns})
+    if overlap:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Columns selected as both a question and a demographic: {overlap}",
+        )
 
     # Question columns must exist in every appended file too — a re-select
     # reshapes all uploads, and a column one file lacks has no rows to give.
@@ -1142,6 +1328,47 @@ def select_columns(
             db.delete(existing)
     db.flush()
 
+    # Metadata columns: same upsert-by-source_column contract as questions, so
+    # a demographic that survives a re-select keeps its id and its stored
+    # values. Dropped ones cascade their RespondentAttribute rows away.
+    existing_meta = {
+        m.source_column: m
+        for m in db.query(MetadataColumn)
+        .filter(MetadataColumn.dataset_id == dataset.id)
+        .all()
+    }
+    desired_meta = {m.column for m in body.metadata_columns}
+    meta_kept: dict[str, MetadataColumn] = {}
+    for position, m in enumerate(body.metadata_columns):
+        # cardinality measured across every upload, not just the first: a
+        # column is only as coarse as the union of the waves makes it
+        distinct: set[str] = set()
+        for _u, f in frames:
+            if m.column in f.columns:
+                distinct |= {v.strip() for v in f[m.column].tolist() if str(v).strip()}
+        existing = existing_meta.get(m.column)
+        if existing is not None:
+            existing.label = m.label.strip()
+            existing.position = position
+            existing.n_distinct = len(distinct)
+            meta_kept[m.column] = existing
+        else:
+            col = MetadataColumn(
+                dataset_id=dataset.id,
+                source_column=m.column,
+                label=m.label.strip(),
+                position=position,
+                n_distinct=len(distinct),
+            )
+            db.add(col)
+            db.flush()
+            meta_kept[m.column] = col
+
+    for source_column, existing in existing_meta.items():
+        if source_column not in desired_meta:
+            db.delete(existing)
+    db.flush()
+
     # Upsert Response rows upload by upload, keyed (dataset_id, question_id,
     # source_row_index) so a row that survives a re-run keeps its id and
     # response_key. Stale deletion inside the helper is scoped per upload_id —
@@ -1151,6 +1378,7 @@ def select_columns(
         _upsert_upload_responses(
             db, dataset, upload, upload_df, kept_or_created, body.respondent_id_column
         )
+        _upsert_upload_metadata(db, dataset, upload, upload_df, meta_kept)
 
     dataset.status = "ingested"
     db.commit()
@@ -1167,7 +1395,8 @@ def select_columns(
     return _dataset_out(db, dataset)
 
 
-@router.post("/{dataset_id}/export", response_model=DatasetOut)
+@router.post("/{dataset_id}/export", response_model=DatasetOut,
+             dependencies=[Depends(require_admin)])
 def export_dataset(dataset_id: int, db: Session = Depends(get_db)):
     dataset = _get_dataset_or_404(db, dataset_id)
     if dataset.status != "ingested":

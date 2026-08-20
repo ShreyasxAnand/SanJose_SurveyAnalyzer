@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { askAnswer, askQuestions, askRoute } from "./api";
+import { askAnswer, askDemographics, askQuestions, askRoute } from "./api";
 import Pipeline from "./Pipeline";
 import type {
   AskAnswerResponse,
+  AskDemographic,
   AskParentGroup,
   AskQuestionOut,
   AskRouteResponse,
@@ -124,7 +125,23 @@ export default function Ask({
   const [phase, setPhase] = useState<Phase>({ name: "question" });
   // the dataset's survey questions, for the scope selector; null while loading
   const [questions, setQuestions] = useState<AskQuestionOut[] | null>(null);
-  const [scope, setScope] = useState<string>("");   // "" = all questions
+  // question_scope is a LIST end to end (schemas.py, ask_service.propose), so
+  // multi-select needed no backend change — the UI was the only thing
+  // restricting it to one. [] = all questions.
+  const [scope, setScope] = useState<string[]>([]);
+  // The dataset's demographic fields (null while loading, [] when it has
+  // none) and the analyst's respondent filter: field -> ticked values.
+  // Same posture as question scope — picked here, applied deterministically
+  // server-side, never proposed by the router.
+  const [demographics, setDemographics] = useState<AskDemographic[] | null>(
+    null,
+  );
+  const [demoFilter, setDemoFilter] = useState<Record<string, string[]>>({});
+  // respondents matching the whole current filter; null when nothing ticked
+  const [nMatching, setNMatching] = useState<number | null>(null);
+  // guards the faceted refetch: rapid ticking can land responses out of
+  // order, and stale counts would contradict the checkboxes on screen
+  const demoSeq = useRef(0);
   // Debug mode surfaces the category-review step between routing and the
   // answer. Off by default: the router's proposal is accepted as-is and the
   // answer appears in one step ("Adjust and re-answer" on the answer screen
@@ -142,6 +159,7 @@ export default function Ask({
 
   useEffect(() => {
     let cancelled = false;
+    setDemoFilter({});
     askQuestions(datasetId)
       .then((qs) => {
         if (!cancelled) setQuestions(qs);
@@ -156,11 +174,36 @@ export default function Ask({
     };
   }, [datasetId]);
 
+  // Faceted dropdown counts: every tick refetches, so each field's numbers
+  // reflect the OTHER fields' current selection (its own list stays
+  // unrestricted — an OR selection must be extendable). Runs on mount too,
+  // fetching the unfiltered counts.
+  useEffect(() => {
+    const seq = ++demoSeq.current;
+    const active = Object.fromEntries(
+      Object.entries(demoFilter).filter(([, vals]) => vals.length > 0),
+    );
+    askDemographics(datasetId, active)
+      .then((r) => {
+        if (demoSeq.current !== seq) return; // a newer tick superseded this
+        setDemographics(r.fields);
+        setNMatching(r.n_matching_respondents);
+      })
+      .catch(() => {
+        // 409 (unprocessed) or transient failure — first load degrades to
+        // the disabled control; later failures keep the previous counts
+        if (demoSeq.current === seq) setDemographics((d) => d ?? []);
+      });
+  }, [datasetId, demoFilter]);
+
   async function handleAsk(question: string) {
     setPhase({ name: "routing", question });
+    // fields with nothing ticked are no filter at all
+    const activeDemo = Object.fromEntries(
+      Object.entries(demoFilter).filter(([, vals]) => vals.length > 0),
+    );
     try {
-      const proposal = await askRoute(datasetId, question,
-                                      scope ? [scope] : []);
+      const proposal = await askRoute(datasetId, question, scope, activeDemo);
       if (!debug && proposal.answerable) {
         // accept the router's proposal as-is and answer in one step; the
         // unanswerable screen still shows (there is nothing to auto-accept)
@@ -222,6 +265,9 @@ export default function Ask({
         event_filter: eventsOnly ? "reported" : "",
         time_filter: timeOfDay,
         question_scope: proposal.question_scope,
+        // the validated echo from the proposal, not local state — the answer
+        // must apply exactly the filter the routing step was asked under
+        demographic_filter: proposal.demographic_filter ?? {},
         proposed_label_ids: proposal.candidates.map((c) => c.label_id),
         aggregate_target: proposal.aggregate_target ?? "",
       });
@@ -241,6 +287,10 @@ export default function Ask({
           questions={questions ?? []}
           scope={scope}
           onScope={setScope}
+          demographics={demographics ?? []}
+          demoFilter={demoFilter}
+          onDemoFilter={setDemoFilter}
+          nMatching={nMatching}
           debug={debug}
           onToggleDebug={toggleDebug}
         />
@@ -349,14 +399,22 @@ function QuestionForm({
   questions,
   scope,
   onScope,
+  demographics,
+  demoFilter,
+  onDemoFilter,
+  nMatching,
   debug,
   onToggleDebug,
 }: {
   busy: boolean;
   onAsk: (q: string) => void;
   questions: AskQuestionOut[];
-  scope: string;
-  onScope: (s: string) => void;
+  scope: string[];
+  onScope: (s: string[]) => void;
+  demographics: AskDemographic[];
+  demoFilter: Record<string, string[]>;
+  onDemoFilter: (f: Record<string, string[]>) => void;
+  nMatching: number | null;
   debug: boolean;
   onToggleDebug: () => void;
 }) {
@@ -382,25 +440,56 @@ function QuestionForm({
           autoFocus
         />
         <div className="ask-home-row">
-          {questions.length > 1 ? (
-            <label className="ask-home-scope">
-              Answer from{" "}
-              <select
-                value={scope}
-                onChange={(e) => onScope(e.target.value)}
+          <div className="ask-home-filters">
+            {questions.length > 1 && (
+              <CheckboxDropdown
+                label="Answer from"
+                allLabel="all survey questions"
                 disabled={busy}
-              >
-                <option value="">all survey questions</option>
-                {questions.map((q) => (
-                  <option key={q.question_id} value={q.question_id}>
-                    “{q.question_text}” ({q.n_responses})
-                  </option>
-                ))}
-              </select>
-            </label>
-          ) : (
-            <span />
-          )}
+                selected={scope}
+                onChange={onScope}
+                options={questions.map((q) => ({
+                  value: q.question_id,
+                  label: `“${q.question_text}”`,
+                  meta: q.n_responses.toLocaleString(),
+                }))}
+              />
+            )}
+            {/* Respondent filters — one dropdown per demographic field the
+                dataset carries (marked at ingest). Values within a field are
+                OR, fields are AND; the server validates and applies the
+                filter deterministically. A dataset without demographics keeps
+                the disabled control so the seam stays visible. */}
+            {demographics.length === 0 ? (
+              <CheckboxDropdown
+                label="Respondents"
+                allLabel="everyone"
+                options={[]}
+                selected={[]}
+                onChange={() => {}}
+                disabled
+                disabledNote="no demographic columns in this dataset"
+              />
+            ) : (
+              demographics.map((d) => (
+                <CheckboxDropdown
+                  key={d.field}
+                  label={d.field}
+                  allLabel="all respondents"
+                  disabled={busy}
+                  selected={demoFilter[d.field] ?? []}
+                  onChange={(vals) =>
+                    onDemoFilter({ ...demoFilter, [d.field]: vals })
+                  }
+                  options={d.values.map((v) => ({
+                    value: v.value,
+                    label: v.value,
+                    meta: v.n_respondents.toLocaleString(),
+                  }))}
+                />
+              ))
+            )}
+          </div>
           <button
             className="ask-home-go"
             onClick={() => onAsk(question)}
@@ -409,6 +498,17 @@ function QuestionForm({
             {busy ? "Finding relevant categories…" : "Ask"}
           </button>
         </div>
+        {nMatching != null && (
+          <p
+            className="ask-fs-hint"
+            style={{ margin: "0.5rem 0 0" }}
+            title="Respondents matching every ticked value (values within a field are either/or, fields combine). Respondents with no recorded value for a ticked field are missing data and never match."
+          >
+            {nMatching.toLocaleString()} respondent
+            {nMatching === 1 ? "" : "s"} match
+            {nMatching === 1 ? "es" : ""} the current filter
+          </p>
+        )}
       </div>
       <div className="ask-home-examples">
         <span className="ask-home-try">Try:</span>
@@ -750,6 +850,18 @@ function ReviewPanel({
       <p>
         Answer strategy: <strong>{proposal.route}</strong> — {proposal.reason}
       </p>
+      {Object.keys(proposal.demographic_filter ?? {}).length > 0 && (
+        <p className="ask-fs-hint">
+          Respondent filter (set on the ask form):{" "}
+          <strong>
+            {Object.entries(proposal.demographic_filter)
+              .map(([f, vals]) => `${f} = ${vals.join(" or ")}`)
+              .join("; ")}
+          </strong>
+          . Counts and quotes will cover only matching respondents, and the
+          answer will state that denominator.
+        </p>
+      )}
       {proposal.warnings.map((w) => (
         <p key={w} style={{ color: "#b45309", fontSize: "0.9em" }}>
           ⚠ {w}
@@ -1241,13 +1353,9 @@ function ReviewPanel({
         </fieldset>
       )}
 
-      <fieldset style={{ marginTop: "1rem", color: "#999" }}>
-        <legend style={{ color: "#999" }}>Respondent filters</legend>
-        <p style={{ margin: 0, fontSize: "0.9em" }}>
-          Filtering by demographics (district, etc.) needs demographic columns
-          ingested first — coming with metadata column support.
-        </p>
-      </fieldset>
+      {/* Respondent (demographic) filters are set on the ask form, like the
+          question scope — the active filter is echoed at the top of this
+          screen. To change it, go back and re-ask. */}
 
       <div style={{ marginTop: "1rem" }}>
         {/* a tally route needs no categories — selecting some only narrows
@@ -1295,7 +1403,117 @@ const ROUTE_DISPLAY: Record<string, string> = {
   aggregate_direct: "Direct tally — counted, not written by AI",
 };
 
+/* A <select> that holds checkboxes: pick several survey questions or several
+   demographic values instead of one.
+   Native <select multiple> is unusable for this — it needs ctrl-click, gives
+   no count, and cannot show a per-option response total. Closes on outside
+   click or Escape; the button reports the selection so the state is legible
+   without opening it. */
+function CheckboxDropdown({
+  label,
+  allLabel,
+  options,
+  selected,
+  onChange,
+  disabled,
+  disabledNote,
+}: {
+  label: string;
+  allLabel: string;
+  options: { value: string; label: string; meta?: string }[];
+  selected: string[];
+  onChange: (next: string[]) => void;
+  disabled?: boolean;
+  disabledNote?: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const wrap = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    function onDoc(e: MouseEvent) {
+      if (!wrap.current?.contains(e.target as Node)) setOpen(false);
+    }
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") setOpen(false);
+    }
+    document.addEventListener("mousedown", onDoc);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDoc);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
+  const byValue = new Map(options.map((o) => [o.value, o]));
+  const chosen = selected.filter((v) => byValue.has(v));
+  const summary =
+    chosen.length === 0
+      ? allLabel
+      : chosen.length === 1
+        ? (byValue.get(chosen[0])!.label)
+        : `${chosen.length} of ${options.length} selected`;
+
+  return (
+    <div className="ask-dd" ref={wrap}>
+      <span className="ask-dd-label">{label}</span>
+      <button
+        type="button"
+        className="ask-dd-btn"
+        disabled={disabled}
+        title={disabled ? disabledNote : summary}
+        aria-expanded={open}
+        aria-haspopup="listbox"
+        onClick={() => setOpen((v) => !v)}
+      >
+        <span className="ask-dd-summary">{disabled ? disabledNote : summary}</span>
+        <span className="ask-dd-caret" aria-hidden="true">▾</span>
+      </button>
+      {open && !disabled && (
+        <div className="ask-dd-menu" role="listbox">
+          <button
+            type="button"
+            className="ask-dd-all"
+            onClick={() => onChange([])}
+          >
+            {allLabel}
+            {chosen.length === 0 && <span className="ask-dd-tick">✓</span>}
+          </button>
+          <div className="ask-dd-sep" />
+          {options.map((o) => {
+            const on = chosen.includes(o.value);
+            return (
+              <label key={o.value} className="ask-dd-opt">
+                <input
+                  type="checkbox"
+                  checked={on}
+                  onChange={() =>
+                    onChange(
+                      on
+                        ? chosen.filter((v) => v !== o.value)
+                        : [...chosen, o.value],
+                    )
+                  }
+                />
+                <span className="ask-dd-opt-text">{o.label}</span>
+                {o.meta && <span className="ask-dd-opt-meta">{o.meta}</span>}
+              </label>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 const PLACES_SHOWN = 10;
+
+// Sources per group before "show more". A filtered ask can cite 90+ responses
+// (the night-safety ask cited 91 of 98 shown), and the panel rendered every
+// one at full length — quotes stopped being truncated on 2026-08-13 — so the
+// list read as a wall rather than as examples. Five is enough to see what a
+// group sounds like; the rest are one click away and still all present.
+const SOURCES_SHOWN = 5;
 
 // Mirrors router.filter_phrase — how the active evidence restrictions read in
 // the counts panel, so the sidebar can't describe a narrower set than the
@@ -1315,6 +1533,9 @@ function filterPhrase(result: AskAnswerResponse): string {
   }
   if (result.time_filter === "night" || result.time_filter === "day") {
     parts.push(`explicitly mentioning ${result.time_filter}time`);
+  }
+  for (const [f, vals] of Object.entries(result.demographic_filter ?? {})) {
+    parts.push(`from respondents with ${f} ${vals.join(" or ")}`);
   }
   return parts.join(" and ");
 }
@@ -1359,6 +1580,16 @@ function AnswerView({
     return [...groups.entries()];
   }, [result.sources, byLocation, nameOf]);
 
+  // which group holds each citation — a "jump to source" for a source hidden
+  // behind "show more" has to open that group first, or it scrolls to nothing
+  const groupTitleOf = useMemo(() => {
+    const m = new Map<number, string>();
+    for (const [title, items] of sourceGroups) {
+      for (const s of items) m.set(s.n, title);
+    }
+    return m;
+  }, [sourceGroups]);
+
   const articleRef = useRef<HTMLDivElement>(null);
   const sourcesRef = useRef<HTMLDetailsElement>(null);
 
@@ -1366,6 +1597,10 @@ function AnswerView({
   const [flashN, setFlashN] = useState<number | null>(null);
   const [allPlaces, setAllPlaces] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [openGroups, setOpenGroups] = useState<ReadonlySet<string>>(new Set());
+  // quote cards are line-clamped so one long response can't set a whole row's
+  // height; clicking one opens it in place
+  const [openQuotes, setOpenQuotes] = useState<ReadonlySet<number>>(new Set());
 
   // the confirm button sits at the bottom of a long review screen — land
   // the analyst on the takeaway, not mid-answer
@@ -1404,16 +1639,30 @@ function AnswerView({
     setPop({ n, top: b.bottom - w.top + 8, left });
   }
 
+  function toggleGroup(title: string) {
+    setOpenGroups((prev) => {
+      const next = new Set(prev);
+      if (!next.delete(title)) next.add(title);
+      return next;
+    });
+  }
+
   function jumpToSource(n: number) {
     setPop(null);
     if (sourcesRef.current) sourcesRef.current.open = true;
     setFlashN(null);
-    requestAnimationFrame(() => {
-      document
-        .getElementById(`ask-src-${n}`)
-        ?.scrollIntoView({ behavior: "smooth", block: "center" });
-      setFlashN(n);
-    });
+    // the target may be past its group's "show more" cut — open that group,
+    // then wait for the render to commit before scrolling
+    const title = groupTitleOf.get(n);
+    if (title) setOpenGroups((prev) => new Set(prev).add(title));
+    requestAnimationFrame(() =>
+      requestAnimationFrame(() => {
+        document
+          .getElementById(`ask-src-${n}`)
+          ?.scrollIntoView({ behavior: "smooth", block: "center" });
+        setFlashN(n);
+      }),
+    );
   }
 
   async function copyAnswer() {
@@ -1529,6 +1778,21 @@ function AnswerView({
         {(result.time_filter === "night" || result.time_filter === "day") && (
           <span className="ask-chip ask-chip-route">
             Only {result.time_filter}time mentions
+          </span>
+        )}
+        {Object.keys(result.demographic_filter ?? {}).length > 0 && (
+          <span className="ask-chip ask-chip-route">
+            Respondents:{" "}
+            {Object.entries(result.demographic_filter)
+              .map(([f, vals]) => `${f} ${vals.join(" or ")}`)
+              .join(" · ")}
+          </span>
+        )}
+        {result.demographic_thin && result.demographic_denominator && (
+          <span className="ask-chip ask-chip-warn">
+            ⚠ Thin group — only {result.demographic_denominator.matching}{" "}
+            matching response
+            {result.demographic_denominator.matching === 1 ? "" : "s"}
           </span>
         )}
         {proposal.question_scope.length > 0 && (
@@ -1650,6 +1914,17 @@ function AnswerView({
             </dd>
           </div>
         )}
+        {result.demographic_denominator && (
+          <div>
+            <dt>Matched the respondent filter</dt>
+            <dd>
+              {result.demographic_denominator.matching}{" "}
+              <span className="ask-sub">
+                of {result.demographic_denominator.in_scope}
+              </span>
+            </dd>
+          </div>
+        )}
         {result.location_denominator && (
           <div>
             <dt>Named a place</dt>
@@ -1688,6 +1963,15 @@ function AnswerView({
           same as nothing having happened to those respondents.
         </p>
       )}
+      {result.demographic_thin && result.demographic_denominator && (
+        <p className="ask-caveat">
+          Thin group: only {result.demographic_denominator.matching} of{" "}
+          {result.demographic_denominator.in_scope} in-scope responses match
+          the respondent filter. The answer is those few voices, not the
+          group — and respondents with no recorded value for a filtered field
+          are missing data, not part of either side.
+        </p>
+      )}
       {stats.small_base && (
         <p className="ask-caveat">
           Small base: this answer rests on only {stats.unique_responses}{" "}
@@ -1703,7 +1987,7 @@ function AnswerView({
         <p>{result.process_note}</p>
       </details>
 
-      <div className="ask-grid">
+      <div className="ask-main">
         <div className="ask-article" ref={articleRef}>
           <AnswerMarkdown
             text={result.answer_markdown}
@@ -1712,34 +1996,6 @@ function AnswerView({
             onCite={handleCite}
             chartFor={chartFor}
           />
-
-          <details className="ask-sources" ref={sourcesRef}>
-            <summary>
-              Sources{" "}
-              <span className="ask-cnt">
-                — {result.sources.length} cited response
-                {result.sources.length === 1 ? "" : "s"}, each traceable to its
-                survey row
-              </span>
-            </summary>
-            {sourceGroups.map(([title, items]) => (
-              <div key={title} className="ask-src-group">
-                <h6>{title}</h6>
-                {items.map((s) => (
-                  <div
-                    key={s.n}
-                    id={`ask-src-${s.n}`}
-                    className={`ask-src-item${flashN === s.n ? " ask-src-flash" : ""}`}
-                  >
-                    <div className="ask-meta">
-                      <span className="ask-n">[{s.n}]</span> {s.response_key}
-                    </div>
-                    <blockquote>“{s.text}”</blockquote>
-                  </div>
-                ))}
-              </div>
-            ))}
-          </details>
 
           {pop && popSource && (
             <div
@@ -1769,82 +2025,79 @@ function AnswerView({
           )}
         </div>
 
-        <aside>
-          <div className="ask-panel">
-            <h5>Categories searched</h5>
-            <p className="ask-hint">
-              {filterPhrase(result)
-                ? `Responses in each category ${filterPhrase(result)} — “of N” is the category's full size.`
-                : "Real counts from the coded data, never estimated."}
-            </p>
-            {countRows.map(([lid, n]) => {
-              const breakdown = result.sub_breakdowns?.[lid];
-              return (
-                <div key={lid}>
+      </div>
+
+      {/* Sources sit OUTSIDE the reading column: 91 cited responses stacked
+          one-per-row down a 600px column ran for thousands of pixels with the
+          rest of the page empty beside it. As cards they flow left-to-right
+          and wrap, so the width does the work instead of the scrollbar. */}
+      <details className="ask-sources" ref={sourcesRef}>
+        <summary>
+          Sources{" "}
+          <span className="ask-cnt">
+            — {result.sources.length} cited response
+            {result.sources.length === 1 ? "" : "s"}, each traceable to its
+            survey row
+          </span>
+        </summary>
+        {sourceGroups.map(([title, items]) => {
+          const expanded = openGroups.has(title);
+          const shown = expanded ? items : items.slice(0, SOURCES_SHOWN);
+          const hidden = items.length - shown.length;
+          return (
+            <div key={title} className="ask-src-group">
+              <h6>
+                {title} <span className="ask-src-n">{items.length}</span>
+              </h6>
+              <div className="ask-src-items">
+                {shown.map((s) => (
                   <div
-                    className="ask-bar-row"
-                    title={
-                      result.sampling_notes[lid]
-                        ? `${nameOf.get(lid) ?? lid} — answer quoted a sample (${result.sampling_notes[lid]})`
-                        : (nameOf.get(lid) ?? lid)
+                    key={s.n}
+                    id={`ask-src-${s.n}`}
+                    className={
+                      "ask-src-item"
+                      + (flashN === s.n ? " ask-src-flash" : "")
+                      + (openQuotes.has(s.n) ? " ask-src-open" : "")
                     }
                   >
-                    <div className="ask-bar-label">
-                      <span className="ask-nm">{nameOf.get(lid) ?? lid}</span>
-                      <span className="ask-ct">
-                        {n}
-                        {result.counts_unfiltered[lid] != null && (
-                          <span className="ask-sub"> of {result.counts_unfiltered[lid]}</span>
-                        )}
-                      </span>
+                    <div className="ask-meta">
+                      <span className="ask-n">[{s.n}]</span> {s.response_key}
                     </div>
-                    <div className="ask-bar-track">
-                      <div
-                        className="ask-bar-fill"
-                        style={{ width: `${Math.max((n / countMax) * 100, 2)}%` }}
-                      />
-                    </div>
+                    <blockquote
+                      onClick={() =>
+                        setOpenQuotes((prev) => {
+                          const next = new Set(prev);
+                          if (!next.delete(s.n)) next.add(s.n);
+                          return next;
+                        })
+                      }
+                    >
+                      “{s.text}”
+                    </blockquote>
                   </div>
-                  {breakdown && breakdown.sub_counts.length > 0 && (
-                    /* the full-coverage composition the answer's sections are
-                       built from — every member of the category was coded, so
-                       these are counts, not a sample */
-                    <div className="ask-subthemes">
-                      {breakdown.sub_counts.map((sc) => (
-                        <div key={sc.sub_label_id} className="ask-subtheme-row">
-                          <span className="ask-subtheme-ct">{sc.count}</span>
-                          <span className="ask-subtheme-nm">{sc.name}</span>
-                        </div>
-                      ))}
-                      {breakdown.generic > 0 && (
-                        <div className="ask-subtheme-row ask-subtheme-generic">
-                          <span className="ask-subtheme-ct">
-                            {breakdown.generic}
-                          </span>
-                          <span className="ask-subtheme-nm">
-                            raise it only generically — no specific sub-theme
-                          </span>
-                        </div>
-                      )}
-                    </div>
-                  )}
-                </div>
-              );
-            })}
-            {nSampled > 0 && (
-              <div className="ask-sampling-note">
-                {/* a note now means "these quotes are not all of them" from
-                    any cause — sampling, or a response already quoted under
-                    another place — so this no longer says "sampled" */}
-                {nSampled}{" "}
-                {byLocation ? "place" : "categor"}
-                {nSampled === 1 ? (byLocation ? "" : "y") : byLocation ? "s" : "ies"}{" "}
-                showed the model only some of their responses; counts always
-                cover the full data.
+                ))}
               </div>
-            )}
-          </div>
+              {(hidden > 0 || expanded) && (
+                <button
+                  className="ask-more-link"
+                  onClick={() => toggleGroup(title)}
+                >
+                  {expanded
+                    ? "Show fewer"
+                    : `Show ${hidden} more response${hidden === 1 ? "" : "s"}…`}
+                </button>
+              )}
+            </div>
+          );
+        })}
+      </details>
 
+      {/* Evidence boxes. These used to be a 300px rail beside the answer,
+          which put the prose in a ~66ch gutter and made the biggest panel
+          (Categories searched, with a sub-theme breakdown per category) the
+          narrowest thing on the page. The answer now runs full width in the
+          middle and the supporting counts sit below it as boxes. */}
+      <div className="ask-boxes">
           {(result.uncovered_categories?.length ?? 0) > 0 && (
             <div className="ask-panel">
               <h5>Not covered by this answer</h5>
@@ -1953,7 +2206,82 @@ function AnswerView({
               </ul>
             </div>
           )}
-        </aside>
+          <div className="ask-panel ask-panel-wide">
+            <h5>Categories searched</h5>
+            <p className="ask-hint">
+              {filterPhrase(result)
+                ? `Responses in each category ${filterPhrase(result)} — “of N” is the category's full size.`
+                : "Real counts from the coded data, never estimated."}
+            </p>
+            <div className="ask-cat-cols">
+              {countRows.map(([lid, n]) => {
+                const breakdown = result.sub_breakdowns?.[lid];
+                return (
+                  <div key={lid} className="ask-cat-item">
+                    <div
+                      className="ask-bar-row"
+                      title={
+                        result.sampling_notes[lid]
+                          ? `${nameOf.get(lid) ?? lid} — answer quoted a sample (${result.sampling_notes[lid]})`
+                          : (nameOf.get(lid) ?? lid)
+                      }
+                    >
+                      <div className="ask-bar-label">
+                        <span className="ask-nm">{nameOf.get(lid) ?? lid}</span>
+                        <span className="ask-ct">
+                          {n}
+                          {result.counts_unfiltered[lid] != null && (
+                            <span className="ask-sub"> of {result.counts_unfiltered[lid]}</span>
+                          )}
+                        </span>
+                      </div>
+                      <div className="ask-bar-track">
+                        <div
+                          className="ask-bar-fill"
+                          style={{ width: `${Math.max((n / countMax) * 100, 2)}%` }}
+                        />
+                      </div>
+                    </div>
+                    {breakdown && breakdown.sub_counts.length > 0 && (
+                      /* the full-coverage composition the answer's sections are
+                         built from — every member of the category was coded, so
+                         these are counts, not a sample */
+                      <div className="ask-subthemes">
+                        {breakdown.sub_counts.map((sc) => (
+                          <div key={sc.sub_label_id} className="ask-subtheme-row">
+                            <span className="ask-subtheme-ct">{sc.count}</span>
+                            <span className="ask-subtheme-nm">{sc.name}</span>
+                          </div>
+                        ))}
+                        {breakdown.generic > 0 && (
+                          <div className="ask-subtheme-row ask-subtheme-generic">
+                            <span className="ask-subtheme-ct">
+                              {breakdown.generic}
+                            </span>
+                            <span className="ask-subtheme-nm">
+                              raise it only generically — no specific sub-theme
+                            </span>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+            {nSampled > 0 && (
+              <div className="ask-sampling-note">
+                {/* a note now means "these quotes are not all of them" from
+                    any cause — sampling, or a response already quoted under
+                    another place — so this no longer says "sampled" */}
+                {nSampled}{" "}
+                {byLocation ? "place" : "categor"}
+                {nSampled === 1 ? (byLocation ? "" : "y") : byLocation ? "s" : "ies"}{" "}
+                showed the model only some of their responses; counts always
+                cover the full data.
+              </div>
+            )}
+          </div>
       </div>
 
       <div className="ask-runbar">
@@ -2077,9 +2405,8 @@ function AnswerMarkdown({
   );
 
   let sawParagraph = false;
-  return (
-    <div>
-      {segments.map((block, i) => {
+
+  const renderSegment = (block: string, i: number) => {
         const heading = block.match(/^(#{1,4})\s+(.*)$/);
         if (heading) {
           const chart = chartFor?.(heading[2]) ?? null;
@@ -2168,7 +2495,37 @@ function AnswerMarkdown({
             {inline(block)}
           </p>
         );
-      })}
+  };
+
+  // Group the flat segment list into sections: a "### " heading and every
+  // block under it until the next heading. The intro (before the first
+  // heading) keeps the full reading measure; the sections then flow
+  // left-to-right and wrap, rather than stacking down one narrow column.
+  const intro: number[] = [];
+  const sections: { head: number; body: number[] }[] = [];
+  segments.forEach((block, i) => {
+    if (/^#{1,4}\s/.test(block)) sections.push({ head: i, body: [] });
+    else if (sections.length) sections[sections.length - 1].body.push(i);
+    else intro.push(i);
+  });
+
+  return (
+    <div>
+      {intro.length > 0 && (
+        <div className="ask-intro">
+          {intro.map((i) => renderSegment(segments[i], i))}
+        </div>
+      )}
+      {sections.length > 0 && (
+        <div className="ask-sections">
+          {sections.map((s) => (
+            <section key={s.head} className="ask-section">
+              {renderSegment(segments[s.head], s.head)}
+              {s.body.map((i) => renderSegment(segments[i], i))}
+            </section>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

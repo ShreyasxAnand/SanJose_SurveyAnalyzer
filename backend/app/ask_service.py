@@ -37,6 +37,12 @@ SMALL_BASE_N = 200
 COVERAGE_FLOOR = 0.60
 MAX_UNCOVERED_SHOWN = 5
 
+# A demographic-filtered answer resting on fewer matching responses than this
+# gets a prominent thin-cell caveat (docs/DEMOGRAPHICS_PLAN.md §7.1) — the
+# same failure SMALL_BASE_N guards, one order of magnitude down. Disclosed,
+# never blocked: quotes still show, the answer is still produced.
+DEMOGRAPHIC_NOTICE_N = 10
+
 # Deterministic day/night classification of labeling's verbatim time_context
 # spans. Deliberately coarse: a span matching neither set (e.g. "recently",
 # "for years") stays unclassified, and one matching both ("day and night")
@@ -107,6 +113,25 @@ class AskContext:
     # label_id -> its sub-theme names, for the routing summary — the router
     # sees NAMES only (selection stays at category level)
     sub_names_by_label: dict[str, list[str]] = field(default_factory=dict)
+    # Demographics (docs/DEMOGRAPHICS_PLAN.md), joined from the respondents
+    # sidecar. This is an ANALYST-side filter like question_scope, not a
+    # routing dimension: the router LLM never sees these fields — the UI
+    # offers them from demographic_values, the request carries the selection,
+    # and gather_evidence applies it deterministically.
+    #   field -> value -> response_keys (mirrors location_members)
+    demographic_members: dict[str, dict[str, set[str]]] = field(default_factory=dict)
+    # field -> response_keys whose respondent HAS a value — the `coded` set;
+    # a respondent with no value is missing data, never a filterable bucket
+    demographic_coded: dict[str, set[str]] = field(default_factory=dict)
+    # field -> [(value, n_respondents)] sorted by count, for the UI dropdown.
+    # Respondent counts, not response counts — a demographic belongs to the
+    # person, who contributes one response per question.
+    demographic_values: dict[str, list[tuple[str, int]]] = field(default_factory=dict)
+    # field -> value -> respondent_keys, straight from the sidecar (no corpus
+    # join): the faceted dropdown counts recount RESPONDENTS under the other
+    # fields' selections, including respondents none of whose responses made
+    # it into the coded corpus.
+    demographic_respondents: dict[str, dict[str, set[str]]] = field(default_factory=dict)
     # How long this context took to assemble, and whether the location sweep
     # was read from its cache or recomputed. Both land in the answer manifest:
     # the load is the bulk of an ask's wall clock, and a run that reports only
@@ -225,6 +250,10 @@ def _context_key(dataset_id: str, description: str) -> str:
     # must be watched — a reshaped-only dataset re-exported must invalidate
     for p in (induction.DATA_DIR / "exports" / str(dataset_id) / "responses.parquet",
               induction.DATA_DIR / "exports" / str(dataset_id) / "reshaped.parquet",
+              # the demographics sidecar: re-selecting metadata columns
+              # rewrites it without touching responses.parquet, and a stale
+              # hit would answer a filtered ask from the previous selection
+              induction.DATA_DIR / "exports" / str(dataset_id) / "respondents.parquet",
               summary.LOCATIONS_DIR / str(dataset_id) / "locations.json",
               summary.LEXICON_DIR / str(dataset_id) / "lexicon.json"):
         try:
@@ -241,6 +270,7 @@ def ask_logic_hash() -> str:
     classification regexes all change what an answer says without touching
     any prompt text. Tuning one must invalidate stored answers."""
     blob = repr((SMALL_BASE_N, COVERAGE_FLOOR, MAX_UNCOVERED_SHOWN,
+                 DEMOGRAPHIC_NOTICE_N,
                  TIME_NIGHT_RE.pattern, TIME_DAY_RE.pattern)).encode("utf-8")
     return hashlib.sha256(blob).hexdigest()[:16]
 
@@ -374,6 +404,49 @@ def load_context(dataset_id: str, parquet: str | None = None,
             if qs:
                 location_implicit_questions[concept["name"]] = qs
 
+    # Demographics: join the respondents sidecar to the corpus on
+    # respondent_key. Both files are written by the same _write_exports call,
+    # so a sidecar implies the corpus parquet carries respondent_key; the
+    # column check below is the guard for a hand-supplied older parquet.
+    demographic_members: dict[str, dict[str, set[str]]] = {}
+    demographic_coded: dict[str, set[str]] = {}
+    demographic_values: dict[str, list[tuple[str, int]]] = {}
+    demographic_respondents: dict[str, dict[str, set[str]]] = {}
+    sidecar = induction.DATA_DIR / "exports" / dataset_id / "respondents.parquet"
+    if sidecar.exists():
+        import pyarrow.parquet as pq
+        corpus_cols = set(pq.ParquetFile(parquet_path).schema_arrow.names)
+        if {"response_key", "respondent_key"} <= corpus_cols:
+            tbl = pq.read_table(parquet_path,
+                                columns=["response_key", "respondent_key"])
+            keys_of: dict[str, list[str]] = {}
+            for rk, pk in zip(tbl.column("response_key").to_pylist(),
+                              tbl.column("respondent_key").to_pylist()):
+                if rk in texts:   # coded corpus only — empties/sentinels out
+                    keys_of.setdefault(pk, []).append(rk)
+            side = pq.read_table(sidecar,
+                                 columns=["respondent_key", "field", "value"])
+            n_respondents: dict[str, dict[str, int]] = {}
+            for pk, f, v in zip(side.column("respondent_key").to_pylist(),
+                                side.column("field").to_pylist(),
+                                side.column("value").to_pylist()):
+                # blank is missing data, never an "Unknown" bucket to filter for
+                if v is None or not str(v).strip():
+                    continue
+                v = str(v).strip()
+                n_respondents.setdefault(f, {})
+                n_respondents[f][v] = n_respondents[f].get(v, 0) + 1
+                demographic_respondents.setdefault(f, {}).setdefault(
+                    v, set()).add(pk)
+                rks = keys_of.get(pk)
+                if rks:
+                    demographic_members.setdefault(f, {}).setdefault(
+                        v, set()).update(rks)
+                    demographic_coded.setdefault(f, set()).update(rks)
+            demographic_values = {
+                f: sorted(vals.items(), key=lambda t: (-t[1], t[0]))
+                for f, vals in n_respondents.items()}
+
     ctx = AskContext(
         dataset_id=dataset_id,
         summary=s,
@@ -405,6 +478,10 @@ def load_context(dataset_id: str, parquet: str | None = None,
         sub_coded=sub_coded,
         sub_runs=sub_runs,
         sub_names_by_label=sub_names_by_label,
+        demographic_members=demographic_members,
+        demographic_coded=demographic_coded,
+        demographic_values=demographic_values,
+        demographic_respondents=demographic_respondents,
         load_seconds=time.time() - t0,
         location_members_source=members_source,
         context_source="computed",
@@ -418,9 +495,76 @@ def load_context(dataset_id: str, parquet: str | None = None,
     return ctx
 
 
+def validate_demographic_filter(demo: dict | None,
+                                ctx: AskContext) -> dict[str, list[str]]:
+    """The analyst's demographic filter, validated against the dataset's
+    actual fields and values. Unknown field or value raises ValueError (the
+    API's 422): the UI builds the filter from the server's own list, so a
+    mismatch is a client bug or stale data — never something to guess at.
+    Semantics downstream: values within one field are OR, fields are AND."""
+    out: dict[str, list[str]] = {}
+    known_fields = set(ctx.demographic_members) | set(ctx.demographic_values)
+    for f, vals in (demo or {}).items():
+        f = str(f).strip()
+        vals = sorted({str(v).strip() for v in (vals or []) if str(v).strip()})
+        if not f or not vals:
+            continue
+        if f not in known_fields:
+            raise ValueError(
+                f"Unknown demographic field {f!r}; this dataset has "
+                f"{sorted(known_fields)}")
+        # a value can legitimately exist only on respondents whose responses
+        # never made the coded corpus — offered by the UI, matching zero
+        # evidence; that is an honest empty result, not a client bug
+        known = set(ctx.demographic_members.get(f, {})) | {
+            v for v, _ in ctx.demographic_values.get(f, [])}
+        unknown = [v for v in vals if v not in known]
+        if unknown:
+            raise ValueError(
+                f"Unknown values for demographic field {f!r}: {unknown}")
+        out[f] = vals
+    return out
+
+
+def facet_demographics(ctx: AskContext, demo: dict[str, list[str]],
+                       ) -> tuple[list[tuple[str, list[tuple[str, int]]]],
+                                  int | None]:
+    """Dropdown counts under the CURRENT selection, faceted-search style:
+    each field's value counts are recomputed against the OTHER fields'
+    ticked values (a field never restricts its own list, so an OR selection
+    can still be extended), plus the number of respondents matching the
+    whole filter (None when no filter is active). Counts are respondents,
+    from the sidecar; value order stays the unfiltered one so the dropdown
+    doesn't reshuffle as the analyst ticks."""
+    R = ctx.demographic_respondents
+
+    def matching(exclude: str | None) -> set[str] | None:
+        """Respondents matching every selected field except `exclude`;
+        None = no restriction applies."""
+        allowed: set[str] | None = None
+        for f, vals in demo.items():
+            if f == exclude:
+                continue
+            hits = set().union(*(R.get(f, {}).get(v, set()) for v in vals))
+            allowed = hits if allowed is None else (allowed & hits)
+        return allowed
+
+    fields: list[tuple[str, list[tuple[str, int]]]] = []
+    for f, vals in sorted(ctx.demographic_values.items()):
+        allowed = matching(exclude=f)
+        fields.append((f, [
+            (v, n if allowed is None
+             else len(R.get(f, {}).get(v, set()) & allowed))
+            for v, n in vals]))
+    overall = matching(exclude=None)
+    return fields, (len(overall) if overall is not None else None)
+
+
 def propose(client: ModelClient, question: str, ctx: AskContext,
             description: str = "",
-            question_scope: list[str] | None = None) -> tuple[dict, dict]:
+            question_scope: list[str] | None = None,
+            demographic_filter: dict[str, list[str]] | None = None,
+            ) -> tuple[dict, dict]:
     """Step 1: the routing proposal. Returns (route, stats) exactly as
     router.run_route does — the caller renders it for review.
 
@@ -429,7 +573,14 @@ def propose(client: ModelClient, question: str, ctx: AskContext,
     ids validate, so an out-of-scope category is structurally impossible in
     the proposal — the analyst's stated scope is enforced in code, not
     requested in prose. Unknown question ids raise ValueError (the API's
-    422). An empty scope means all questions, as before."""
+    422). An empty scope means all questions, as before.
+
+    `demographic_filter` is the same kind of analyst-side restriction, one
+    dimension over: {field: [values]} picked from the dataset's own
+    demographics. It is validated and carried on the route here, but the
+    router LLM never sees it — categories are proposed over the whole corpus
+    and the filter is applied deterministically at evidence time."""
+    demo = validate_demographic_filter(demographic_filter, ctx)
     scope = [str(q).strip() for q in (question_scope or []) if str(q).strip()]
     summary_text = ctx.summary_text
     valid_ids = ctx.valid_ids
@@ -453,8 +604,13 @@ def propose(client: ModelClient, question: str, ctx: AskContext,
         event_counts=(len(ctx.events), len(ctx.event_coded)),
         time_counts={"day": len(ctx.time_day), "night": len(ctx.time_night),
                      "mentioned": len(ctx.time_mentioned)}
-                    if ctx.time_mentioned else None)
+                    if ctx.time_mentioned else None,
+        # informational only — the router is told the restriction is already
+        # handled in code, so it routes the topic instead of refusing the
+        # question for its demographic wording
+        demographic_filter=demo or None)
     route["question_scope"] = scope
+    route["demographic_filter"] = demo
 
     # Add-only completeness ratification: code finds unselected categories
     # sharing meaningful terms with the question; one cheap call rules on
@@ -637,6 +793,27 @@ def process_note(route: dict, evidence: dict, ctx: AskContext,
             f"in-scope responses ({denom_time['mentioning']} named any time "
             f"of day at all). The rest named no time, which says nothing "
             f"about when their experience happened.")
+    denom_demo = evidence.get("demographic_denominator")
+    if denom_demo:
+        worded = "; ".join(
+            f"{f} = {' or '.join(vals)}"
+            for f, vals in (evidence.get("demographic_filter") or {}).items())
+        no_value = denom_demo["in_scope"] - denom_demo["coded"]
+        parts.append(
+            f"Evidence restricted by the analyst to respondents with "
+            f"{worded}: {denom_demo['matching']} of {denom_demo['in_scope']} "
+            f"in-scope responses"
+            + (f" ({no_value} {'has' if no_value == 1 else 'have'} no "
+               f"recorded value for the filtered field"
+               f"{'s' if len(evidence.get('demographic_filter') or {}) > 1 else ''}"
+               f" — missing data, not a group)" if no_value else "")
+            + ".")
+        if evidence.get("demographic_thin"):
+            n = denom_demo["matching"]
+            parts.append(
+                f"CAUTION: only {n} response{'' if n == 1 else 's'} "
+                f"match{'es' if n == 1 else ''} this demographic filter — "
+                f"read the answer as those few voices, not as the group.")
     denom = evidence.get("location_denominator")
     if denom:
         parts.append(f"Grouped by place: {denom['naming_any']} of "
@@ -700,7 +877,15 @@ def answer(
         time_mentioned_keys=ctx.time_mentioned or None,
         sub_members=ctx.sub_members or None,
         sub_names=ctx.sub_names or None,
-        sub_coded=ctx.sub_coded or None)
+        sub_coded=ctx.sub_coded or None,
+        demographic_members=ctx.demographic_members or None,
+        demographic_coded=ctx.demographic_coded or None)
+    # thin-cell notice (docs/DEMOGRAPHICS_PLAN.md §7.1): a demographic filter
+    # narrow enough to rest on a handful of responses is disclosed, never
+    # blocked — the constant is folded into ask_logic_hash
+    dd = evidence.get("demographic_denominator")
+    evidence["demographic_thin"] = bool(
+        dd and dd["matching"] < DEMOGRAPHIC_NOTICE_N)
     lex_counts = router.lexicon_counts(
         ctx.lexicon, route["lexicon_concepts"], ctx.keys_by_question, ctx.texts
     ) if route["lexicon_concepts"] else []
@@ -848,6 +1033,26 @@ def answer_aggregate(client: ModelClient, question: str, route: dict,
         for c in route["candidates"]:
             selected.update(ctx.members.get(c["label_id"], []))
         scope &= selected
+    # The analyst's demographic filter narrows the tally too — a filtered ask
+    # answered over everyone would be silently wrong, the worst failure this
+    # route has. Same OR-within-field / AND-across-fields semantics as
+    # gather_evidence, same {in_scope, coded, matching} disclosure.
+    demo_filter = route.get("demographic_filter") or {}
+    demographic_denominator = None
+    if demo_filter and ctx.demographic_members:
+        pre = set(scope)
+        hits = set.intersection(*[
+            set().union(*(ctx.demographic_members.get(f, {}).get(v, set())
+                          for v in vals))
+            for f, vals in demo_filter.items()])
+        coded_all = set.intersection(*[
+            ctx.demographic_coded.get(f, set()) for f in demo_filter])
+        demographic_denominator = {
+            "in_scope": len(pre),
+            "coded": len(pre & coded_all),
+            "matching": len(pre & hits),
+        }
+        scope &= hits
     q_names = ", ".join(f'"{ctx.question_texts.get(q, q)}"' for q in scope_qids)
     # When categories narrow the tally, "coded responses to <question>" would
     # claim the wrong denominator (a reviewer caught 1,350 category-narrowed
@@ -858,11 +1063,20 @@ def answer_aggregate(client: ModelClient, question: str, route: dict,
                    f"categor{'y' if len(route['candidates']) == 1 else 'ies'} "
                    f"(the question has {n_question_scope} coded responses in "
                    f"total)")
+    if demographic_denominator:
+        worded = "; ".join(f"{f} = {' or '.join(vals)}"
+                           for f, vals in demo_filter.items())
+        q_names = (f"{q_names}, restricted to respondents with {worded} "
+                   f"({demographic_denominator['matching']} of "
+                   f"{demographic_denominator['in_scope']} in-scope responses)")
     n_scope = len(scope)
 
     lines: list[str] = []
     aggregate: dict = {"target": target, "in_scope": n_scope,
                        "questions": scope_qids}
+    if demographic_denominator:
+        aggregate["demographic_filter"] = demo_filter
+        aggregate["demographic_denominator"] = demographic_denominator
     if target == "location":
         rows = []
         naming: set[str] = set()
@@ -961,6 +1175,11 @@ def answer_aggregate(client: ModelClient, question: str, route: dict,
                            "questions": scope_qids, "ratio": stats["scope_coverage"]},
         "small_base": stats["small_base"],
         "aggregate": aggregate,
+        "demographic_filter": demo_filter,
+        "demographic_denominator": demographic_denominator,
+        "demographic_thin": bool(
+            demographic_denominator
+            and demographic_denominator["matching"] < DEMOGRAPHIC_NOTICE_N),
     }
     run_id = make_run_id(question)
     out_dir = write_artifacts(
@@ -1047,6 +1266,8 @@ def write_artifacts(*, run_id: str, question: str, ctx: AskContext, route: dict,
             "event_denominator": evidence.get("event_denominator"),
             "time_filter": evidence.get("time_filter") or "",
             "time_denominator": evidence.get("time_denominator"),
+            "demographic_filter": evidence.get("demographic_filter") or {},
+            "demographic_denominator": evidence.get("demographic_denominator"),
             "location_filter_implicit_questions":
                 evidence.get("location_filter_implicit_questions") or [],
         },
@@ -1079,7 +1300,9 @@ def route_from_selection(selected: list[dict], route_name: str, reason: str,
                          event_filter: str = "",
                          time_filter: str = "",
                          question_scope: list[str] | None = None,
-                         aggregate_target: str = "") -> dict:
+                         aggregate_target: str = "",
+                         demographic_filter: dict[str, list[str]] | None = None,
+                         ) -> dict:
     """Rebuild a route dict from an analyst-approved selection (step 2 of the
     stateless flow). Unknown label ids raise ValueError — the server-side
     gate; the caller turns that into a 422. Unknown concepts are dropped."""
@@ -1165,4 +1388,8 @@ def route_from_selection(selected: list[dict], route_name: str, reason: str,
         "question_scope": [str(q).strip() for q in (question_scope or [])
                            if str(q).strip()],
         "aggregate_target": aggregate_target,
+        # analyst-side restriction, validated the same way an unknown label
+        # id is: the UI offers only real values, so a mismatch is a 422
+        "demographic_filter": validate_demographic_filter(
+            demographic_filter, ctx),
     }

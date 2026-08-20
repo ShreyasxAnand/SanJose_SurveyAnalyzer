@@ -2,6 +2,7 @@ import type {
   AppendResponse,
   AskAnswerRequest,
   AskAnswerResponse,
+  AskDemographicsResponse,
   AskQuestionOut,
   AskRouteResponse,
   DatasetHistoryOut,
@@ -22,10 +23,44 @@ async function unwrap<T>(res: Response): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+/* Admin passcode. When the server has ADMIN_PASSCODE configured, the
+   dataset-changing endpoints (upload, reshape, append, discard, metadata
+   edit, export, pipeline run/cancel) answer 401 without it. The passcode is
+   kept per browser tab (sessionStorage); on a 401 the stored value is
+   cleared, the user is asked once, and the request retries. When the server
+   has no passcode configured, the header is simply absent and everything
+   works as before. */
+const ADMIN_KEY = "admin_passcode";
+
+function adminHeaders(): Record<string, string> {
+  const p = sessionStorage.getItem(ADMIN_KEY);
+  return p ? { "X-Admin-Passcode": p } : {};
+}
+
+async function adminFetch(url: string, init: RequestInit = {}): Promise<Response> {
+  const send = (extra: Record<string, string>) =>
+    fetch(url, {
+      ...init,
+      headers: { ...(init.headers as Record<string, string> | undefined), ...extra },
+    });
+  let res = await send(adminHeaders());
+  if (res.status === 401) {
+    sessionStorage.removeItem(ADMIN_KEY);
+    const entered = window.prompt(
+      "This action needs the admin passcode.\nEnter it to continue:",
+    );
+    if (entered && entered.trim()) {
+      sessionStorage.setItem(ADMIN_KEY, entered.trim());
+      res = await send({ "X-Admin-Passcode": entered.trim() });
+    }
+  }
+  return res;
+}
+
 export async function uploadDataset(file: File): Promise<UploadResponse> {
   const form = new FormData();
   form.append("file", file);
-  const res = await fetch(`${BASE}/datasets/upload`, {
+  const res = await adminFetch(`${BASE}/datasets/upload`, {
     method: "POST",
     body: form,
   });
@@ -52,13 +87,15 @@ export async function selectColumns(
   respondentIdColumn: string | null,
   questions: QuestionSelection[],
   meta: Partial<DatasetMeta> = {},
+  metadataColumns: QuestionSelection[] = [],
 ): Promise<DatasetOut> {
-  const res = await fetch(`${BASE}/datasets/${datasetId}/columns`, {
+  const res = await adminFetch(`${BASE}/datasets/${datasetId}/columns`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       respondent_id_column: respondentIdColumn,
       questions,
+      metadata_columns: metadataColumns,
       dataset_description: meta.description ?? null,
       dataset_department: meta.department ?? null,
       dataset_notes: meta.notes ?? null,
@@ -74,7 +111,7 @@ export async function appendToDataset(
   uploadDatasetId: number,
   note: string | null = null,
 ): Promise<AppendResponse> {
-  const res = await fetch(`${BASE}/datasets/${targetDatasetId}/append`, {
+  const res = await adminFetch(`${BASE}/datasets/${targetDatasetId}/append`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ upload_dataset_id: uploadDatasetId, note }),
@@ -83,7 +120,9 @@ export async function appendToDataset(
 }
 
 export async function discardDataset(datasetId: number): Promise<void> {
-  const res = await fetch(`${BASE}/datasets/${datasetId}`, { method: "DELETE" });
+  const res = await adminFetch(`${BASE}/datasets/${datasetId}`, {
+    method: "DELETE",
+  });
   if (!res.ok) {
     const body = await res.text();
     throw new Error(`${res.status} ${res.statusText}: ${body}`);
@@ -96,14 +135,17 @@ export function discardDatasetOnClose(datasetId: number): void {
      response handling possible. The server refuses to delete anything that
      isn't a provisional (status "uploaded"), so a race with an in-flight
      commit can never delete ingested data. */
+  // adminHeaders, not adminFetch: the page is closing, so there is nobody to
+  // prompt — send the stored passcode if there is one and accept best effort
   void fetch(`${BASE}/datasets/${datasetId}`, {
     method: "DELETE",
     keepalive: true,
+    headers: adminHeaders(),
   });
 }
 
 export async function exportDataset(datasetId: number): Promise<DatasetOut> {
-  const res = await fetch(`${BASE}/datasets/${datasetId}/export`, {
+  const res = await adminFetch(`${BASE}/datasets/${datasetId}/export`, {
     method: "POST",
   });
   return unwrap<DatasetOut>(res);
@@ -123,7 +165,7 @@ export async function patchDataset(
   datasetId: number,
   patch: DatasetMetadataPatch,
 ): Promise<DatasetOut> {
-  const res = await fetch(`${BASE}/datasets/${datasetId}`, {
+  const res = await adminFetch(`${BASE}/datasets/${datasetId}`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(patch),
@@ -145,15 +187,32 @@ export async function askQuestions(
   return unwrap<AskQuestionOut[]>(res);
 }
 
+export async function askDemographics(
+  datasetId: number | string,
+  demographicFilter: Record<string, string[]> = {},
+): Promise<AskDemographicsResponse> {
+  const res = await fetch(`${BASE}/datasets/${datasetId}/ask/demographics`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ demographic_filter: demographicFilter }),
+  });
+  return unwrap<AskDemographicsResponse>(res);
+}
+
 export async function askRoute(
   datasetId: number | string,
   question: string,
   questionScope: string[] = [],
+  demographicFilter: Record<string, string[]> = {},
 ): Promise<AskRouteResponse> {
   const res = await fetch(`${BASE}/datasets/${datasetId}/ask/route`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ question, question_scope: questionScope }),
+    body: JSON.stringify({
+      question,
+      question_scope: questionScope,
+      demographic_filter: demographicFilter,
+    }),
   });
   return unwrap<AskRouteResponse>(res);
 }
@@ -186,7 +245,7 @@ export async function pipelineRun(
   batchSize = 60,
   mode: "full" | "incremental" = "full",
 ): Promise<PipelineJob> {
-  const res = await fetch(`${BASE}/datasets/${datasetId}/pipeline/run`, {
+  const res = await adminFetch(`${BASE}/datasets/${datasetId}/pipeline/run`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ batch_size: batchSize, mode }),

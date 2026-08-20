@@ -626,6 +626,11 @@ function ColumnSelectStep({
 }) {
   const [respondentIdColumn, setRespondentIdColumn] = useState<string>("");
   const [selected, setSelected] = useState<Record<string, boolean>>({});
+  // Demographic columns: attributes of the RESPONDENT (District, Age band),
+  // not open-ended text to analyse. Independent of `selected` — a column is
+  // one or the other, and the API rejects picking it as both.
+  const [demoSelected, setDemoSelected] = useState<Record<string, boolean>>({});
+  const [demoLabels, setDemoLabels] = useState<Record<string, string>>({});
   const [labels, setLabels] = useState<Record<string, string>>({});
   const [description, setDescription] = useState("");
   const [department, setDepartment] = useState("");
@@ -675,6 +680,15 @@ function ColumnSelectStep({
       label: labels[c.column].trim(),
     }));
 
+    // A demographic's label may equal its column name ("District" is already
+    // the right display name), unlike a question, which needs real wording.
+    const metadataColumns = upload.columns
+      .filter((c) => demoSelected[c.column] && !selected[c.column])
+      .map((c) => ({
+        column: c.column,
+        label: (demoLabels[c.column] ?? "").trim() || c.column,
+      }));
+
     setBusy(true);
     try {
       const dataset = await selectColumns(
@@ -688,6 +702,7 @@ function ColumnSelectStep({
           surveyStartDate: surveyStart || null,
           surveyEndDate: surveyEnd || null,
         },
+        metadataColumns,
       );
       onDone(dataset);
     } catch (err) {
@@ -824,6 +839,60 @@ function ColumnSelectStep({
             )}
           </div>
         ))}
+      </fieldset>
+
+      <fieldset>
+        <legend>Demographic columns (optional)</legend>
+        <p style={{ margin: "0 0 0.75rem", fontSize: "0.9em", color: "#555" }}>
+          Attributes of the respondent — District, Age band, Own/Rent — used to
+          filter answers later, never analysed as text. Best with{" "}
+          <strong>general groupings rather than exact values</strong>: broad
+          groups give each filter enough respondents for the counts to mean
+          something.
+        </p>
+        {upload.columns.map((c) => {
+          const isQuestion = !!selected[c.column];
+          const on = !!demoSelected[c.column] && !isQuestion;
+          return (
+            <div key={c.column} style={{ marginBottom: "0.4rem" }}>
+              <label
+                style={
+                  isQuestion || c.non_null_count === 0
+                    ? { color: "#999" }
+                    : undefined
+                }
+              >
+                <input
+                  type="checkbox"
+                  checked={on}
+                  disabled={isQuestion || c.non_null_count === 0}
+                  onChange={() =>
+                    setDemoSelected((s) => ({ ...s, [c.column]: !s[c.column] }))
+                  }
+                />{" "}
+                <strong>{c.column}</strong>{" "}
+                {c.non_null_count === 0
+                  ? "(empty)"
+                  : isQuestion
+                    ? "(already a question column)"
+                    : `(${c.non_null_count} non-empty)`}
+              </label>
+              {on && (
+                <div style={{ marginLeft: "1.5rem", marginTop: "0.25rem" }}>
+                  <input
+                    type="text"
+                    value={demoLabels[c.column] ?? ""}
+                    onChange={(e) =>
+                      setDemoLabels((l) => ({ ...l, [c.column]: e.target.value }))
+                    }
+                    placeholder={`Display name (defaults to "${c.column}")`}
+                    style={{ width: "18rem", maxWidth: "100%" }}
+                  />
+                </div>
+              )}
+            </div>
+          );
+        })}
       </fieldset>
 
       <button onClick={handleSubmit} disabled={busy}>

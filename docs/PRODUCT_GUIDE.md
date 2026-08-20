@@ -167,6 +167,49 @@ row). When you upload a file, the system classifies it:
 The matching is deliberately strict (whole-row): a file with reordered or
 renamed columns is treated as new data, because that's what it is.
 
+### 4.4 Demographic columns
+
+Alongside the open-ended question columns you can mark **demographic
+columns** — attributes of the respondent rather than text to analyse:
+District, Age band, Own/Rent, Years in the city. They are stored per
+respondent, exported to `respondents.parquet`, and never fed to any analysis
+prompt or induced into a taxonomy.
+
+Demographic columns work best when they are **general groupings, not
+ultra-specific ones** — "District", "Age band", "Own/Rent", "Years in the
+city" rather than exact age, street address, or ZIP+4. Broad groups give each
+filter enough respondents for the counts to mean something. Nothing stops you
+selecting a fine-grained column; the answers simply get thinner as the groups
+get smaller, until each one rests on a handful of responses. Past 100 distinct
+values the column-selection screen says so and lets you proceed.
+
+Three rules worth knowing:
+
+- **A column is either a question or a demographic, never both.** Picking one
+  as both is rejected — its text would be analysed *and* offered as a filter.
+- **A blank cell is missing data, not a category.** A respondent who skipped
+  the district question has no district; there is no "Unknown" group to filter
+  for, because not answering isn't an answer.
+- **An appended wave need not carry every demographic.** Columns the new file
+  lacks simply have no value for those respondents; the append still succeeds.
+
+**Filtering answers by these values** happens on the ask form: one dropdown
+per demographic field, next to the survey-question scope selector. It is an
+analyst-side filter exactly like the question scope — you pick the values,
+the server validates them against the dataset's own list and applies the
+restriction in code at evidence time. The routing model never chooses or
+alters it (it is only told a restriction is already in place, so a question
+worded "what do women say…" routes its topic instead of refusing). Within
+one field ticked values are OR ("District 3 or 5"); across fields they are
+AND ("…who rent"). The dropdowns are **faceted**: every tick recounts the
+other fields' numbers against your current selection (a field never
+restricts its own list, so an either/or selection can still be extended),
+and a running "N respondents match the current filter" line shows how thin
+you are slicing before you ask. Every filtered answer shows the
+matching/in-scope denominator, how many respondents have no recorded value,
+and — under 10 matching responses — a thin-group caveat; nothing is ever
+blocked. See `docs/DEMOGRAPHICS_PLAN.md` for the design record.
+
 ---
 
 ## 5. Teaching the system the data (the processing pipeline)
@@ -322,9 +365,9 @@ The router picks one based on the question's shape:
 - **Hybrid** — "what's the top complaint and why?" → counts first, then
   explain from responses.
 
-### 6.3 The three filters ("dimensions")
+### 6.3 The filters ("dimensions")
 
-Orthogonal to the strategy, three filters can restrict the evidence. They
+Orthogonal to the strategy, five filters can restrict the evidence. They
 compose with every route and with each other, and each one's denominator is
 computed in code and disclosed:
 
@@ -341,9 +384,24 @@ computed in code and disclosed:
   happened to" filter, because not describing an incident in a one-line
   survey answer is not evidence nothing happened. The answer carries a
   standing caveat saying exactly that.
+- **Time of day** — restrict to responses explicitly mentioning nighttime
+  or daytime ("what makes people feel unsafe at night?"), classified
+  deterministically from the verbatim time phrases the tagging pass
+  extracted. One-directional like events: a response naming no time says
+  nothing about when its experience happened, so there is no filter for it,
+  and the answer says how many responses named any time at all.
+- **Demographics** — restrict to respondents by their demographic values
+  ("what do women aged 18-34 say?"), when the dataset has demographic
+  columns (§4.4). Unlike the four above, this filter is never proposed by
+  the router: you set it yourself on the ask form, and the AI is only told a
+  restriction is already in place. Values within one field are either/or;
+  separate fields combine. The answer states the matching/in-scope
+  denominator, and under 10 matching responses adds a thin-group caveat.
 
-Responses the tagging pass never coded are counted separately as *missing
-data* — never folded into "doesn't match the filter".
+The first four are proposed by the router from your question's wording and
+editable on the review screen. Responses the tagging pass never coded — and
+respondents with no recorded value for a filtered demographic — are counted
+separately as *missing data*, never folded into "doesn't match the filter".
 
 ### 6.4 The review screen
 
@@ -358,8 +416,10 @@ who mentioned several things.
 
 Filters live here too: place checkboxes (split named-places vs place-types),
 a response-type radio (with the real n= for each option), a first-hand
-checkbox, and keyword concepts — each showing what selecting it costs in
-evidence.
+checkbox, a time-of-day radio, and keyword concepts — each showing what
+selecting it costs in evidence. The demographic filter is the exception: it
+is set on the ask form before routing and echoed here read-only — to change
+it, go back and re-ask.
 
 If the router says the question isn't answerable from this data, the review
 screen says so and *doesn't* offer the category tree — inviting you to force
@@ -370,8 +430,9 @@ categories onto an unanswerable question would undercut promise #3.
 Once you approve, plain code:
 
 1. Collects every response in the selected categories, applies the filters
-   in fixed order (location → actionability → events), computing each
-   denominator against what the previous filters left.
+   in fixed order (location → actionability → events → time →
+   demographics), computing each denominator against what the previous
+   filters left.
 2. Computes every count that will appear in the answer.
 3. Selects quotes under a budget (50 per category, 500 total — about 15k
    tokens of typical survey text). When a category is bigger than its
@@ -425,6 +486,7 @@ data/
   uploads/{ds}/...                    original files, byte-for-byte, never touched
   exports/{ds}/responses.parquet      the working corpus (typed)
   exports/{ds}/responses.csv          human-readable copy (opens in Excel)
+  exports/{ds}/respondents.parquet    demographics sidecar (respondent, field, value) — only when marked
   exports/{ds}/manifest.json          how the source became the output
   taxonomy/{ds}/{q}/{run}/            category systems, versioned per run
   labels/{ds}/{q}/{run}/              tagging results, versioned per run
@@ -506,7 +568,8 @@ Beyond the design promises (§2), the system has been audited:
 ## 10. Running it
 
 Prereqs: the `surveyanalyzer` conda env (Python 3.12), Node.js for the
-frontend, and `GEMINI_API_KEY` in the environment or a repo-root `.env`.
+frontend, and Google Application Default Credentials (`gcloud auth
+application-default login`, once per machine) — there are no API keys.
 
 ```bash
 # backend (from backend/, inside the conda env)
@@ -544,11 +607,12 @@ python -m scripts.reset                           # wipe everything (dev only)
   size limit, SQLite's write concurrency. Sharing it beyond one trusted
   machine needs at minimum a shared-secret header on the API — and no public
   tunnels before that exists.
-- **No demographic breakdowns yet.** The ingest flow has no "metadata
-  column" role, so "how do District 3 residents differ?" isn't answerable.
-  (The production survey file contains no demographic columns, so this has
-  been deliberately deferred; the router's filter architecture already has
-  the seam where it will plug in.)
+- **Demographic filtering restricts; it does not yet group.** Asking "what
+  do District 3 residents say?" works via the respondent filter on the ask
+  form; "how do District 3 and District 7 *differ*?" as one grouped answer
+  is phase 3 of `docs/DEMOGRAPHICS_PLAN.md` and not built. (The production
+  survey file contains no demographic columns, so there is nothing to
+  backfill there.)
 - **The parks question (`q25oe`) of the production survey was never
   ingested** — it's in the uploaded file but hasn't been run through the
   pipeline.
@@ -583,7 +647,8 @@ python -m scripts.reset                           # wipe everything (dev only)
 | **Lexicon** | Corpus-derived keyword dictionary matched without AI |
 | **Concept** | One lexicon entry (a group of related terms) or one canonical place |
 | **Route** | The answer strategy: retrieval, aggregate, comparative, hybrid |
-| **Dimension / filter** | Evidence restriction composing with any route: location, actionability, events |
+| **Dimension / filter** | Evidence restriction composing with any route: location, actionability, events, time of day, demographics |
+| **Demographic column** | Respondent attribute marked at ingest (district, age band…) — stored, filterable, never analysed as text |
 | **Denominator** | The disclosed "out of how many" every filtered count carries |
 | **Composite sampling** | Quote selection = guaranteed signal coverage + random typicality, both disclosed |
 | **Signal tags** | Per-response metadata used for coverage: co-categories, places, actionability, events, length |

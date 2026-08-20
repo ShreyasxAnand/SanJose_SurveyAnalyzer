@@ -119,7 +119,19 @@ def ask_ctx(tmp_path, monkeypatch):
             lexicon={}, valid_concepts=set(), texts=texts,
             keys_by_question={"2": list(texts)}, members=members,
             actionability=actionability, actionability_counts=counts,
-            events=events, event_coded=coded)
+            events=events, event_coded=coded,
+            # demographics: respondents 1:0/1:2 are Female (18-24/65+),
+            # 1:1 is Male (18-24); all three have both fields recorded
+            demographic_members={
+                "Sex": {"Female": {"1:2:0", "1:2:2"}, "Male": {"1:2:1"}},
+                "Age": {"18-24": {"1:2:0", "1:2:1"}, "65+": {"1:2:2"}}},
+            demographic_coded={"Sex": {"1:2:0", "1:2:1", "1:2:2"},
+                               "Age": {"1:2:0", "1:2:1", "1:2:2"}},
+            demographic_values={"Sex": [("Female", 2), ("Male", 1)],
+                                "Age": [("18-24", 2), ("65+", 1)]},
+            demographic_respondents={
+                "Sex": {"Female": {"1:0", "1:2"}, "Male": {"1:1"}},
+                "Age": {"18-24": {"1:0", "1:1"}, "65+": {"1:2"}}})
 
     monkeypatch.setattr(ask_service, "load_context", fake_load)
     return tmp_path
@@ -253,6 +265,12 @@ def test_ask_cache_serves_stored_route_and_answer(client, monkeypatch):
         "reason": "r",
         "selected": [{"label_id": "2_001", "relevance": "high", "rationale": "x"}],
     }
+    # punctuation and case are not part of the question — a re-typed variant
+    # lands on the same entry
+    r3 = client.post("/api/datasets/1/ask/route",
+                     json={"question": "What about theft... cached??"})
+    assert r3.status_code == 200 and r3.json()["cached"] is True
+
     a1 = client.post("/api/datasets/1/ask/answer", json=body)
     assert a1.status_code == 200 and a1.json()["cached"] is False
     a2 = client.post("/api/datasets/1/ask/answer", json=body)
@@ -266,6 +284,26 @@ def test_ask_cache_serves_stored_route_and_answer(client, monkeypatch):
               + [{"label_id": "2_002", "relevance": "low", "rationale": "y"}]}
     with pytest.raises(IndexError):
         client.post("/api/datasets/1/ask/answer", json=edited)
+
+
+def test_ask_cache_key_strips_punctuation_but_not_meaning():
+    from app import ask_cache
+
+    def same(a, b):
+        return (ask_cache.route_key("ctx", a, [], "m")
+                == ask_cache.route_key("ctx", b, [], "m"))
+
+    assert same("What are demographic issues?", "what are demographic issues")
+    assert same("what's unsafe", "whats unsafe")          # apostrophe vanishes
+    assert same("don’t", "donʼt")               # curly + phone-keyboard forms too
+    assert same("theft/vandalism", "theft vandalism")     # separator -> space
+    assert same("what_are_issues", "what are issues")     # underscore is punctuation
+    # NFC vs NFD (typed vs pasted accents) — built explicitly so a formatter
+    # can never normalize the two literals into the same bytes
+    import unicodedata
+    assert same("café issues",
+                unicodedata.normalize("NFD", "café issues"))
+    assert not same("top 1.5 percent", "top 15 percent")  # numbers never merge
 
 
 def test_route_returns_enriched_candidates(client, monkeypatch):
@@ -508,6 +546,147 @@ def test_answer_actionability_ignored_when_labels_lack_the_field(
     assert body["actionability_denominator"] is None
     assert body["counts"] == {"2_001": 2}       # unfiltered
     assert body["counts_unfiltered"] == {}
+
+
+def test_ask_demographics_lists_fields_and_respondent_counts(client):
+    r = client.post("/api/datasets/1/ask/demographics", json={})
+    assert r.status_code == 200
+    assert r.json() == {
+        "fields": [
+            {"field": "Age", "values": [
+                {"value": "18-24", "n_respondents": 2},
+                {"value": "65+", "n_respondents": 1}]},
+            {"field": "Sex", "values": [
+                {"value": "Female", "n_respondents": 2},
+                {"value": "Male", "n_respondents": 1}]},
+        ],
+        "n_matching_respondents": None,
+    }
+
+
+def test_ask_demographics_facets_the_other_fields(client):
+    """Ticking a value must recount every OTHER dropdown against it — the
+    field's own list stays unrestricted so an OR selection can be extended."""
+    r = client.post("/api/datasets/1/ask/demographics",
+                    json={"demographic_filter": {"Sex": ["Female"]}})
+    assert r.status_code == 200
+    body = r.json()
+    by_field = {f["field"]: f["values"] for f in body["fields"]}
+    # the two Female respondents are one 18-24 and one 65+
+    assert by_field["Age"] == [{"value": "18-24", "n_respondents": 1},
+                               {"value": "65+", "n_respondents": 1}]
+    # Sex's own counts are NOT restricted by its own selection
+    assert by_field["Sex"] == [{"value": "Female", "n_respondents": 2},
+                               {"value": "Male", "n_respondents": 1}]
+    assert body["n_matching_respondents"] == 2
+    # both fields selected: the running total is the AND of the two
+    r = client.post("/api/datasets/1/ask/demographics",
+                    json={"demographic_filter": {"Sex": ["Female"],
+                                                 "Age": ["65+"]}})
+    body = r.json()
+    assert body["n_matching_respondents"] == 1
+    by_field = {f["field"]: f["values"] for f in body["fields"]}
+    # Age's list is faceted by Sex only; Sex's list by Age only
+    assert by_field["Age"] == [{"value": "18-24", "n_respondents": 1},
+                               {"value": "65+", "n_respondents": 1}]
+    assert by_field["Sex"] == [{"value": "Female", "n_respondents": 1},
+                               {"value": "Male", "n_respondents": 0}]
+    # unknown fields are a 422, same as everywhere else
+    r = client.post("/api/datasets/1/ask/demographics",
+                    json={"demographic_filter": {"District": ["3"]}})
+    assert r.status_code == 422
+
+
+def test_answer_demographic_filter_restricts_evidence(client, monkeypatch,
+                                                      ask_ctx):
+    """The analyst's respondent filter, applied like the other evidence
+    filters: counts narrow, the denominator discloses, and the manifest
+    records what was asked for."""
+    _fake_gemini(monkeypatch, json.dumps(
+        {"answer_markdown": "Women report theft [1]."}))
+    r = client.post("/api/datasets/1/ask/answer", json={
+        "question": "what do women say feels unsafe?", "route": "retrieval",
+        "selected": [{"label_id": "2_001"}, {"label_id": "2_002"}],
+        "demographic_filter": {"Sex": ["Female"]},
+    })
+    assert r.status_code == 200
+    body = r.json()
+    # 2_001 = {1:2:0, 1:2:1}, 2_002 = {1:2:1}; Female = {1:2:0, 1:2:2}
+    assert body["counts"] == {"2_001": 1, "2_002": 0}
+    assert body["counts_unfiltered"] == {"2_001": 2, "2_002": 1}
+    assert body["demographic_filter"] == {"Sex": ["Female"]}
+    assert body["demographic_denominator"] == {
+        "in_scope": 2, "coded": 2, "matching": 1}
+    assert body["demographic_thin"] is True     # 1 < DEMOGRAPHIC_NOTICE_N
+    assert [s["response_key"] for s in body["sources"]] == ["1:2:0"]
+    assert "Sex = Female: 1 of 2 in-scope responses" in body["process_note"]
+    assert "CAUTION: only 1 response matches" in body["process_note"]
+    manifest = json.loads(
+        (ask_ctx / "answers/1" / body["run_id"] / "manifest.json")
+        .read_text(encoding="utf-8"))
+    assert manifest["evidence"]["demographic_filter"] == {"Sex": ["Female"]}
+    assert manifest["route"]["demographic_filter"] == {"Sex": ["Female"]}
+
+
+def test_aggregate_direct_tally_honours_the_demographic_filter(client,
+                                                               monkeypatch):
+    """A filtered tally answered over everyone would be silently wrong — the
+    deterministic route must narrow its scope and disclose the denominator.
+    Zero model calls: the fake client has no replies to give."""
+    _fake_gemini(monkeypatch)
+    r = client.post("/api/datasets/1/ask/answer", json={
+        "question": "how many women describe an incident?",
+        "route": "aggregate_direct", "aggregate_target": "event",
+        "selected": [],
+        "demographic_filter": {"Sex": ["Female"]},
+    })
+    assert r.status_code == 200
+    body = r.json()
+    # q2 has 3 coded responses; Female = {1:2:0, 1:2:2}; of those only
+    # 1:2:0 recounts an incident
+    assert body["demographic_filter"] == {"Sex": ["Female"]}
+    assert body["demographic_denominator"] == {
+        "in_scope": 3, "coded": 3, "matching": 2}
+    assert body["aggregate"]["in_scope"] == 2
+    assert body["aggregate"]["reported_incident"] == 1
+    assert "restricted to respondents with Sex = Female" \
+        in body["answer_markdown"]
+
+
+def test_answer_rejects_unknown_demographic_field_and_value(client,
+                                                            monkeypatch):
+    _fake_gemini(monkeypatch, SYNTH_REPLY)
+    r = client.post("/api/datasets/1/ask/answer", json={
+        "question": "q?", "route": "retrieval",
+        "selected": [{"label_id": "2_001"}],
+        "demographic_filter": {"District": ["3"]},
+    })
+    assert r.status_code == 422
+    assert "District" in r.json()["detail"]
+    r = client.post("/api/datasets/1/ask/answer", json={
+        "question": "q?", "route": "retrieval",
+        "selected": [{"label_id": "2_001"}],
+        "demographic_filter": {"Sex": ["Nonexistent"]},
+    })
+    assert r.status_code == 422
+    assert "Nonexistent" in r.json()["detail"]
+
+
+def test_validate_demographic_filter_normalizes_and_gates():
+    ctx = ask_service.AskContext(
+        dataset_id="1", summary={}, summary_text="", index={}, valid_ids=set(),
+        question_ids=[], question_totals={}, lexicon={}, valid_concepts=set(),
+        texts={}, keys_by_question={}, members={},
+        demographic_members={"Age": {"18-24": {"k"}, "65+": {"j"}}})
+    # dedup + sort + strip; empty value lists and blank fields drop out
+    assert ask_service.validate_demographic_filter(
+        {"Age": ["65+", "18-24", "18-24", " "], "": ["x"], "Other": []},
+        ctx) == {"Age": ["18-24", "65+"]}
+    assert ask_service.validate_demographic_filter(None, ctx) == {}
+    with pytest.raises(ValueError):
+        ask_service.validate_demographic_filter({"Sex": ["Female"]}, ctx)
+    with pytest.raises(ValueError):
+        ask_service.validate_demographic_filter({"Age": ["25-34"]}, ctx)
 
 
 def test_answer_event_filter_restricts_to_first_hand_incidents(
@@ -808,3 +987,37 @@ def test_invalidate_drops_the_entry(real_ctx):
     assert _load(description="d").context_source == "cache"
     ask_service.invalidate_context_cache("1")
     assert _load(description="d").context_source == "computed"
+
+
+def test_load_context_joins_the_demographics_sidecar(real_ctx, monkeypatch):
+    """The real loader joins respondents.parquet to the corpus on
+    respondent_key; a blank value is missing data — no bucket, not coded."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from app import induction
+
+    monkeypatch.setattr(induction, "DATA_DIR", real_ctx)
+    pq.write_table(pa.table({
+        "response_key": ["1:2:0", "1:2:1", "1:2:2"],
+        "respondent_key": ["1:0", "1:1", "1:2"],
+    }), real_ctx / "export.parquet")
+    side_dir = real_ctx / "exports" / "1"
+    side_dir.mkdir(parents=True, exist_ok=True)
+    pq.write_table(pa.table({
+        "respondent_key": ["1:0", "1:1", "1:2", "1:0"],
+        "field": ["Sex", "Sex", "Sex", "Age"],
+        "value": ["Female", "Male", "  ", "65+"],
+    }), side_dir / "respondents.parquet")
+
+    ctx = _load(description="d")
+    assert ctx.demographic_members == {
+        "Sex": {"Female": {"1:2:0"}, "Male": {"1:2:1"}},
+        "Age": {"65+": {"1:2:0"}}}
+    assert ctx.demographic_coded == {"Sex": {"1:2:0", "1:2:1"},
+                                     "Age": {"1:2:0"}}
+    assert ctx.demographic_values == {
+        "Sex": [("Female", 1), ("Male", 1)], "Age": [("65+", 1)]}
+    assert ctx.demographic_respondents == {
+        "Sex": {"Female": {"1:0"}, "Male": {"1:1"}},
+        "Age": {"65+": {"1:0"}}}

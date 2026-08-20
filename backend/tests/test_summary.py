@@ -97,23 +97,40 @@ def test_render_and_index():
     assert summary.label_index(s)["2_001"]["question_id"] == "2"
 
 
-def test_render_location_block():
-    s = {
+def _loc_summary(question_ids=("2",)):
+    return {
         "dataset_description": "",
-        "questions": [],
+        "questions": [{"question_id": q, "question_text": f"q{q}?",
+                       "n_responses": 222, "n_uncategorized": 0, "entries": []}
+                      for q in question_ids],
         "lexicon_concepts": [],
         "location_concepts": [
             {"name": "downtown", "kind": "named", "n_spans": 3, "count": 61},
             {"name": "streets", "kind": "type", "n_spans": 4, "count": 94},
         ],
         "location_coverage": {
-            "2": {"responses": 222, "responses_with_location": 75}},
+            "2": {"responses": 222, "responses_with_location": 75},
+            "5": {"responses": 400, "responses_with_location": 380}},
     }
-    text = summary.render_summary(s)
+
+
+def test_render_location_block():
+    text = summary.render_summary(_loc_summary(("2", "5")))
     assert "named places: downtown (n=61)" in text
     assert "place types: streets (n=94)" in text
     assert "q2: 75/222" in text
+    assert "q5: 380/400" in text
     assert "denominator" in text
+
+
+def test_location_coverage_is_scoped_to_the_rendered_questions():
+    """A question-scoped ask re-renders with questions filtered. An unscoped
+    coverage line would quote q5's strong 380/400 at a router that cannot
+    select from q5 — and coverage is exactly what it weighs when deciding
+    group_by=location."""
+    text = summary.render_summary(_loc_summary(("2",)))
+    assert "q2: 75/222" in text
+    assert "q5" not in text
 
 
 def test_build_summary_reads_location_artifact(data_dirs):

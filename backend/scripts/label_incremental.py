@@ -14,9 +14,10 @@ them via same_run_id and every downstream consumer picks them up as "latest"
 with zero changes. Prior run dirs are never touched.
 
 New labels (if the uncovered pool is big enough to induce over) carry
-provenance {"source": "incremental"} and needs_review=True — scripts.review
-is still the quality gate; this pass just refuses to leave appended rows
-sitting in uncategorized when the taxonomy has an obvious gap.
+provenance {"source": "incremental"} and needs_review=True so they are easy
+to find later — scripts.review remains the optional repair loop for them;
+this pass just refuses to leave appended rows sitting in uncategorized when
+the taxonomy has an obvious gap.
 """
 from __future__ import annotations
 

@@ -77,6 +77,69 @@ def test_unquoted_or_uncited_text_is_not_checked():
     assert _viol("They want a “cleaner, safer downtown” overall.") == []
 
 
+def test_citation_inside_a_bold_span_is_not_read_as_a_count():
+    """LIVE false positive (run 2026-08-17T16-25-33Z, affordability): the model
+    bolds a whole finding sentence and ends it with its citation, so the
+    bold-number scan read the citation number as a stated count. Six of that
+    answer's eight "could not be verified" statements were [18] [33] [36] [42]
+    [68] [75] — citations, not claims."""
+    md = ("**Skyrocketing rent prices and predatory landlord practices are "
+          "cited as major cost burdens for tenants [18].**")
+    assert _viol(md) == []
+    # multi-citation brackets too, in both spellings
+    assert _viol("**Rents are the biggest burden [12][19][23].**") == []
+    assert _viol("**Rents are the biggest burden [12, 19].**") == []
+
+
+def test_a_real_invented_count_still_flags_alongside_a_citation():
+    """The citation strip must not become a way to smuggle a bad number in."""
+    md = "**383 responses** raise removal [7]."
+    v = _viol(md)
+    assert len(v) == 1 and v[0]["kind"] == "number" and v[0]["value"] == 383
+
+
+def test_section_regex_counts_every_section_not_just_the_first():
+    """LIVE false positive, same run: `^### (.+)$` under re.S let the heading
+    group run past its own line and swallow the rest of the document, so a
+    9-section answer measured as 1 and was reported as a structure defect."""
+    body = "\n\n".join(
+        f"### Section {i}\n**{n} responses** cover it.\n- a bullet [7]"
+        for i, n in enumerate([1048, 872, 160], start=1))
+    plan = ("1. Removal — 1048 responses\n"
+            "2. Housing — 872 responses\n"
+            "3. Everything else — 160 responses\n")
+    assert verify.plan_structure_violations(body, plan) == []
+
+
+def test_structure_violation_still_fires_when_sections_are_actually_missing():
+    body = "### Only One\n**1048 responses** cover it."
+    plan = "1. Removal — 1048 responses\n2. Housing — 872 responses\n"
+    v = verify.plan_structure_violations(body, plan)
+    assert len(v) == 1 and v[0]["kind"] == "structure"
+    assert "2 lines" in v[0]["detail"] and "1 sections" in v[0]["detail"]
+
+
+def test_verify_logic_hash_covers_the_detection_code():
+    """The hash gates the ask cache. While it covered only the repair prompts,
+    fixing a guard left every stored answer serving the old, wrong verdict."""
+    import re as _re
+    h = verify.verify_logic_hash()
+    assert len(h) == 16
+    src = verify.verify_logic_hash.__doc__ or ""
+    assert src  # documented why it is over-inclusive
+    # the patterns a guard fix would touch are part of the blob
+    for pat in (verify._SECTION_RE.pattern, verify._CITE_SPAN_RE.pattern):
+        assert isinstance(pat, str) and pat
+    saved = verify._SECTION_RE
+    try:
+        verify._SECTION_RE = _re.compile(r"^#### ([^\n]+)\n(.*?)(?=^### |\Z)",
+                                         _re.M | _re.S)
+        assert verify.verify_logic_hash() != h, "a regex edit must roll the hash"
+    finally:
+        verify._SECTION_RE = saved
+    assert verify.verify_logic_hash() == h
+
+
 def test_repair_returns_fixed_markdown():
     class FakeClient:
         model_id = "fake"

@@ -77,8 +77,26 @@ ANSWER TO REPAIR:
 
 def verify_logic_hash() -> str:
     """Folded into the ask cache key: a change to the verifier changes what
-    answers say, so stored answers from the old verifier must not be served."""
-    blob = (REPAIR_SYSTEM + REPAIR_USER + str(MIN_CHECKED_NUMBER)).encode("utf-8")
+    answers say, so stored answers from the old verifier must not be served.
+
+    Covers the DETECTION code, not just the repair prompts. It used to hash
+    only REPAIR_SYSTEM/REPAIR_USER/MIN_CHECKED_NUMBER, which meant a fix to a
+    guard left every stored answer carrying the old verdict — the two 2026-08-17
+    false-positive bugs (citations read as counts, the section regex) would have
+    been fixed in code and still displayed as "8 statements could not be
+    verified" on every cached answer. Deliberately over-inclusive: the patterns
+    are listed explicitly because a regex edit does not change any function's
+    source text."""
+    import inspect as _inspect
+    blob = "".join([
+        REPAIR_SYSTEM, REPAIR_USER, str(MIN_CHECKED_NUMBER),
+        _inspect.getsource(legit_numbers),
+        _inspect.getsource(find_violations),
+        _inspect.getsource(_placement_violations),
+        _inspect.getsource(plan_structure_violations),
+        _BOLD_RE.pattern, _UNIT_RE.pattern, _QUOTE_RE.pattern,
+        _CITE_SPAN_RE.pattern, _SECTION_RE.pattern, _PLAN_COUNT_RE.pattern,
+    ]).encode("utf-8")
     return hashlib.sha256(blob).hexdigest()[:16]
 
 
@@ -107,7 +125,8 @@ def legit_numbers(evidence: dict, lex_counts: list[dict],
     for u in evidence.get("uncovered_categories") or []:
         add(u.get("count"))
     for key in ("location_denominator", "actionability_denominator",
-                "event_denominator", "time_denominator"):
+                "event_denominator", "time_denominator",
+                "demographic_denominator"):
         d = evidence.get(key) or {}
         vals = [v for v in d.values() if isinstance(v, int)]
         for v in vals:
@@ -133,6 +152,13 @@ def legit_numbers(evidence: dict, lex_counts: list[dict],
 
 # claim-carrying number forms: bold spans, and "N responses/respondents/..."
 _BOLD_RE = re.compile(r"\*\*([^*]+)\*\*")
+# Citations that land INSIDE a bold span. The model routinely bolds a whole
+# finding sentence, ending it with its citation — "**…burdens for tenants
+# [18].**" — and the bold-number scan then read 18 as a stated count and
+# flagged it as untraceable. Six of the eight residual violations on the
+# 2026-08-17 affordability answer were citation numbers, not claims. Stripped
+# before any number is read out of a bold span.
+_CITE_SPAN_RE = re.compile(r"\[\d{1,4}(?:\s*,\s*\d{1,4})*\]")
 _UNIT_RE = re.compile(
     r"\b([\d,]{2,7})\s+(?:responses|respondents|coded|mentions|members)\b",
     re.IGNORECASE)
@@ -154,7 +180,7 @@ def find_violations(answer_body: str, evidence: dict, lex_counts: list[dict],
 
     stated: set[int] = set()
     for m in _BOLD_RE.finditer(answer_body):
-        for n in re.findall(r"[\d,]{2,7}", m.group(1)):
+        for n in re.findall(r"[\d,]{2,7}", _CITE_SPAN_RE.sub(" ", m.group(1))):
             if "," in n or len(n) >= 2:
                 try:
                     stated.add(int(n.replace(",", "")))
@@ -223,7 +249,12 @@ def _tokens(name: str) -> set[str]:
             for w in re.findall(r"[a-z]+", name.lower()) if w not in stop}
 
 
-_SECTION_RE = re.compile(r"^### (.+)$\n(.*?)(?=^### |\Z)", re.M | re.S)
+# The heading group is `[^\n]+`, NOT `.+`: re.S makes `.` match newlines, so a
+# greedy `.+` ran the heading past its own line and swallowed the rest of the
+# document — the 2026-08-17 affordability answer has 9 "### " sections and this
+# pattern found 1, reporting a structure defect against a correct answer. re.S
+# is still required for the BODY group, which does span lines.
+_SECTION_RE = re.compile(r"^### ([^\n]+)\n(.*?)(?=^### |\Z)", re.M | re.S)
 
 
 def _placement_violations(answer_body: str, evidence: dict,

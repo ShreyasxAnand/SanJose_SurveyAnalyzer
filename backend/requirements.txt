@@ -6,4 +6,5 @@ openpyxl==3.1.5
 pyarrow==18.1.0
 ftfy==6.3.1
 python-multipart==0.0.20
-pydantic==2.10.4
+pydantic==2.13.4
+google-genai==2.19.0

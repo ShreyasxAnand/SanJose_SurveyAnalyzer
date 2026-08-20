@@ -1076,3 +1076,158 @@ def test_history_endpoint(client, tmp_path):
     assert len(healed["entries"]) == 1
     assert healed["entries"][0]["kind"] == "created"
     assert healed["entries"][0]["filename"] == "survey.csv"
+
+
+# --- demographics (phase 1: ingest + storage + export) ---------------------
+
+DEMO_CSV = (
+    "respondent_id,better_city,unsafe,district,tenure\n"
+    "1,More parks,Dark streets,District 3,10+ years\n"
+    "2,Lower rent,,District 3,Under 2 years\n"
+    "3,Cleaner streets,Speeding cars,District 7,\n"
+    "4,More housing,Bad lighting,,10+ years\n"
+)
+
+DEMO_BODY = {
+    "respondent_id_column": "respondent_id",
+    "questions": [
+        {"column": "better_city", "label": "What would make the city better?"},
+        {"column": "unsafe", "label": "What makes it feel unsafe?"},
+    ],
+    "metadata_columns": [
+        {"column": "district", "label": "District"},
+        {"column": "tenure", "label": "Years in the city"},
+    ],
+}
+
+
+def test_demographic_columns_are_stored_with_their_value_counts(client):
+    ds_id = _upload(client, DEMO_CSV)["dataset_id"]
+    body = client.post(f"/api/datasets/{ds_id}/columns", json=DEMO_BODY).json()
+
+    cols = {m["label"]: m for m in body["metadata_columns"]}
+    assert set(cols) == {"District", "Years in the city"}
+
+    district = {v["value"]: v["n_respondents"] for v in cols["District"]["values"]}
+    assert district == {"District 3": 2, "District 7": 1}
+    assert cols["District"]["n_distinct"] == 2
+    assert cols["District"]["high_cardinality"] is False
+
+
+def test_a_blank_demographic_cell_is_missing_not_a_category(client):
+    """Row 4 has no district and row 3 no tenure. Absence must not become an
+    "Unknown" bucket someone could filter FOR — the same asymmetry
+    event_occurred and time_context enforce."""
+    ds_id = _upload(client, DEMO_CSV)["dataset_id"]
+    body = client.post(f"/api/datasets/{ds_id}/columns", json=DEMO_BODY).json()
+    cols = {m["label"]: m for m in body["metadata_columns"]}
+
+    values = {v["value"] for v in cols["District"]["values"]}
+    assert "" not in values and "Unknown" not in values
+    # 4 respondents, only 3 have a district
+    assert sum(v["n_respondents"] for v in cols["District"]["values"]) == 3
+    assert sum(v["n_respondents"] for v in cols["Years in the city"]["values"]) == 3
+
+
+def test_high_cardinality_warns_but_never_blocks(client):
+    """Decided 2026-08-17: no hard blocks. A fine-grained column is stored and
+    usable; the analyst is told it is fine-grained and decides."""
+    rows = "\n".join(
+        f"{i},Answer {i},Unsafe {i},id-{i}" for i in range(1, 130)
+    )
+    csv = "respondent_id,better_city,unsafe,exact_id\n" + rows + "\n"
+    ds_id = _upload(client, csv)["dataset_id"]
+    resp = client.post(
+        f"/api/datasets/{ds_id}/columns",
+        json={
+            **DEMO_BODY,
+            "metadata_columns": [{"column": "exact_id", "label": "Exact id"}],
+        },
+    )
+    assert resp.status_code == 200, resp.text          # NOT a 422
+    col = resp.json()["metadata_columns"][0]
+    assert col["n_distinct"] == 129
+    assert col["high_cardinality"] is True             # flagged, not refused
+
+
+def test_a_column_cannot_be_both_question_and_demographic(client):
+    ds_id = _upload(client, DEMO_CSV)["dataset_id"]
+    resp = client.post(
+        f"/api/datasets/{ds_id}/columns",
+        json={
+            **DEMO_BODY,
+            "metadata_columns": [{"column": "better_city", "label": "Better city"}],
+        },
+    )
+    assert resp.status_code == 400
+    assert "both a question and a demographic" in resp.json()["detail"]
+
+
+def test_respondents_parquet_sidecar_is_written(client, tmp_path):
+    ds_id = _upload(client, DEMO_CSV)["dataset_id"]
+    client.post(f"/api/datasets/{ds_id}/columns", json=DEMO_BODY)
+
+    path = tmp_path / "data" / "exports" / str(ds_id) / "respondents.parquet"
+    assert path.exists()
+    df = pq.read_table(path).to_pandas()
+    assert set(df.columns) == {"respondent_key", "source_row_index", "field", "value"}
+    # 3 districts + 3 tenures, blanks absent
+    assert len(df) == 6
+    assert set(df["field"]) == {"District", "Years in the city"}
+    # respondent_key joins to the response export
+    resp_df = pq.read_table(
+        tmp_path / "data" / "exports" / str(ds_id) / "responses.parquet"
+    ).to_pandas()
+    assert set(df["respondent_key"]) <= set(resp_df["respondent_key"])
+
+
+def test_no_sidecar_when_the_dataset_has_no_demographics(client, tmp_path):
+    """A dataset without metadata columns must be byte-for-byte the same
+    ingest it was before this feature existed."""
+    ds_id = _upload(client, CSV_CONTENT)["dataset_id"]
+    body = client.post(f"/api/datasets/{ds_id}/columns", json=INGEST_BODY).json()
+    assert body["metadata_columns"] == []
+    assert not (tmp_path / "data" / "exports" / str(ds_id) / "respondents.parquet").exists()
+
+
+def test_reselecting_keeps_ids_and_drops_removed_columns(client):
+    ds_id = _upload(client, DEMO_CSV)["dataset_id"]
+    first = client.post(f"/api/datasets/{ds_id}/columns", json=DEMO_BODY).json()
+    ids = {m["label"]: m["id"] for m in first["metadata_columns"]}
+
+    second = client.post(
+        f"/api/datasets/{ds_id}/columns",
+        json={**DEMO_BODY,
+              "metadata_columns": [{"column": "district", "label": "District"}]},
+    ).json()
+    cols = second["metadata_columns"]
+    assert len(cols) == 1
+    assert cols[0]["id"] == ids["District"]          # surviving column keeps its id
+    assert cols[0]["values"]                          # and its stored values
+
+
+def test_appended_file_missing_a_demographic_column_is_not_an_error(client):
+    """An appended wave need not carry every demographic the first file had.
+    Those respondents have no value — missing data, not a failed ingest."""
+    ds_id = _upload(client, DEMO_CSV)["dataset_id"]
+    client.post(f"/api/datasets/{ds_id}/columns", json=DEMO_BODY)
+
+    # same columns minus `tenure`, one genuinely new row
+    extended = (
+        "respondent_id,better_city,unsafe,district\n"
+        "1,More parks,Dark streets,District 3\n"
+        "5,Bus lanes,Broken lights,District 9\n"
+    )
+    prov = _upload(client, extended, filename="wave2.csv")
+    resp = client.post(
+        f"/api/datasets/{ds_id}/append",
+        json={"upload_dataset_id": prov["dataset_id"]},
+    )
+    assert resp.status_code == 200, resp.text
+
+    after = client.get(f"/api/datasets/{ds_id}").json()
+    cols = {m["label"]: m for m in after["metadata_columns"]}
+    district = {v["value"]: v["n_respondents"] for v in cols["District"]["values"]}
+    assert district.get("District 9") == 1            # new wave's value stored
+    # tenure was absent from wave 2 — its respondents simply have no value
+    assert sum(v["n_respondents"] for v in cols["Years in the city"]["values"]) == 3

@@ -6,10 +6,13 @@ From backend/, inside the surveyanalyzer conda env:
     python -m scripts.induce --question q4oe --dry-run    # plan + cost, no API
     python -m scripts.induce --question q4oe              # real run
 
-Needs GEMINI_API_KEY (or GOOGLE_API_KEY) for real runs, taken from the
-environment or from the gitignored .env at the repo root.
+Needs Google Application Default Credentials for real runs — run
+`gcloud auth application-default login` once on this machine. The project
+comes from GOOGLE_CLOUD_PROJECT (environment or the gitignored repo-root
+.env) or the ADC file's quota project.
 Output: data/taxonomy/{dataset_id}/{question_id}/{run_id}/
-        candidate_taxonomy.json  <- hand-edit this, it is the review artifact
+        candidate_taxonomy.json  <- hand-editable; labeling uses the latest
+                                    run as-is, edits are optional
         manifest.json            <- audit record, do not edit
 """
 from __future__ import annotations
@@ -163,7 +166,9 @@ def main() -> None:
     induction.print_diagnostics(taxonomy, report, usage_line)
     print(f"\nwrote: {out_dir / 'candidate_taxonomy.json'}")
     print(f"       {out_dir / 'manifest.json'}")
-    print("Next: hand-review candidate_taxonomy.json (see review_instructions inside).")
+    print("Next: scripts.label uses this run as-is; hand-editing "
+          "candidate_taxonomy.json first is optional (see review_instructions "
+          "inside).")
 
 
 if __name__ == "__main__":

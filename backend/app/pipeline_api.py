@@ -12,9 +12,10 @@ queueing a second billed run nobody watched start would be worse than refusing.
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
 from . import pipeline
+from .auth import require_admin
 from .schemas import (
     PipelineEstimate,
     PipelineJobOut,
@@ -54,7 +55,8 @@ def pipeline_estimate(dataset_id: str, mode: str = "full") -> PipelineEstimate:
         raise HTTPException(status_code=400, detail=str(exc))
 
 
-@router.post("/run", response_model=PipelineJobOut)
+@router.post("/run", response_model=PipelineJobOut,
+             dependencies=[Depends(require_admin)])
 def pipeline_run(dataset_id: str, req: PipelineRunRequest) -> PipelineJobOut:
     try:
         job = pipeline.start_job(dataset_id, batch_size=req.batch_size,
@@ -86,7 +88,8 @@ def pipeline_processed(dataset_id: str) -> dict:
             "is_processed": pipeline.is_processed(dataset_id)}
 
 
-@router.post("/cancel", response_model=PipelineJobOut)
+@router.post("/cancel", response_model=PipelineJobOut,
+             dependencies=[Depends(require_admin)])
 def pipeline_cancel(dataset_id: str) -> PipelineJobOut:
     """Stop after the current stage. The running stage is allowed to finish —
     killing it mid-write is how a half-written assignments.json ends up looking
