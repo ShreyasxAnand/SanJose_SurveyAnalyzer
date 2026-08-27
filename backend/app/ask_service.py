@@ -21,6 +21,7 @@ import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
+from . import dates as dates_mod
 from . import induction, labeling, llm, locations as locations_mod, router, subthemes, summary, verify
 from .llm import ModelClient
 
@@ -254,6 +255,10 @@ def _context_key(dataset_id: str, description: str) -> str:
               # rewrites it without touching responses.parquet, and a stale
               # hit would answer a filtered ask from the previous selection
               induction.DATA_DIR / "exports" / str(dataset_id) / "respondents.parquet",
+              # the manifest carries the date-period config (metadata_columns
+              # value_type + date_ranges) that reshapes demographic facets —
+              # an edited config must not serve yesterday's periods
+              induction.DATA_DIR / "exports" / str(dataset_id) / "manifest.json",
               summary.LOCATIONS_DIR / str(dataset_id) / "locations.json",
               summary.LEXICON_DIR / str(dataset_id) / "lexicon.json"):
         try:
@@ -446,6 +451,32 @@ def load_context(dataset_id: str, parquet: str | None = None,
             demographic_values = {
                 f: sorted(vals.items(), key=lambda t: (-t[1], t[0]))
                 for f, vals in n_respondents.items()}
+
+            # Date-typed fields hold raw ISO dates — thousands of distinct
+            # facet values nobody can filter on. Collapse them into period
+            # labels ("2023 Q3", or the analyst's named ranges) derived from
+            # the manifest's config at read time, so re-cutting periods is a
+            # metadata edit, never a re-ingest. The manifest travels in the
+            # same _write_exports as the sidecar, so the two never disagree.
+            manifest_path = (induction.DATA_DIR / "exports" / dataset_id
+                             / "manifest.json")
+            date_fields: set[str] = set()
+            date_config = None
+            if manifest_path.exists():
+                try:
+                    manifest = json.loads(manifest_path.read_text("utf-8"))
+                    date_fields = {
+                        m["label"]
+                        for m in manifest.get("metadata_columns", [])
+                        if m.get("value_type") == "date"
+                    }
+                    date_config = manifest.get("date_ranges")
+                except (OSError, json.JSONDecodeError, KeyError):
+                    pass  # older/hand-damaged manifest: raw dates, no crash
+            dates_mod.apply_period_labels(
+                date_fields, date_config, demographic_values,
+                demographic_members, demographic_coded,
+                demographic_respondents)
 
     ctx = AskContext(
         dataset_id=dataset_id,
@@ -841,7 +872,6 @@ def answer(
     proposed_label_ids: list[str] | None = None,
     route_stats: dict | None = None,
     synth_client: ModelClient | None = None,
-    skip_verification: bool = False,
 ) -> dict:
     """Step 2: evidence + synthesis + artifacts, from an approved route.
 
@@ -915,46 +945,41 @@ def answer(
                                   ctx.question_texts or None)
     answer_body, cited, n_invalid = router.resolve_citations(raw_answer, evidence)
 
-    # Verification: deterministic guards on every answer (free); one repair
-    # call ONLY when a guard fails — see verify.py. Whatever survives repair
-    # is disclosed, never silently shipped.
+    # Verification: deterministic guards on every answer, always — and nothing
+    # is ever rewritten. What the guards flag is DISCLOSED, so the text an
+    # analyst reads is exactly what the synth model produced from the
+    # evidence, and the manifest's provenance means what it says.
+    #
+    # A model repair call used to sit here. Removed 2026-08-25: across the six
+    # stored answers that reached it, it cleared the flags exactly once, and
+    # its own instructions licensed it to reword a quotation ("quote what it
+    # actually says") — the one edit this pipeline must never make, since a
+    # model that has just fabricated a quote cannot be trusted to author its
+    # replacement. A wrong answer now ships visibly wrong instead of quietly
+    # rewritten.
+    # The SAME plan text the answer was written against feeds both guards: its
+    # numbers are computed in code, so they are legitimate to state (the
+    # union-counted "Everything else" line exists nowhere in `evidence`), and
+    # its lines are the structure the answer must have.
+    plan_str = router.render_section_plan(evidence)
     violations = verify.find_violations(answer_body, evidence, lex_counts,
-                                        ctx.question_totals)
-    verification = {"checked": True, "violations": violations,
-                    "repaired": False, "residual": []}
-    if violations and not skip_verification:
-        plan_str = router.render_section_plan(evidence)
-        fixed = verify.repair(
-            synth, answer_body, violations,
-            router.render_counts_block(evidence, lex_counts,
-                                       ctx.question_totals,
-                                       ctx.question_texts or None),
-            router.render_quotes_block(evidence, ctx.index),
-            question=question,
-            section_plan=plan_str)
-        residual = violations
-        if fixed:
-            f_body, f_cited, f_invalid = router.resolve_citations(fixed, evidence)
-            f_residual = verify.find_violations(f_body, evidence, lex_counts,
-                                                ctx.question_totals)
-            if len(f_residual) < len(violations):
-                answer_body, cited, n_invalid = f_body, f_cited, f_invalid
-                verification["repaired"] = True
-                # the repairer is told to preserve the plan; verify it did —
-                # structure breakage is disclosed, never silently accepted
-                residual = f_residual + verify.plan_structure_violations(
-                    f_body, plan_str)
-        verification["residual"] = residual
-    elif violations:
-        verification["residual"] = violations
+                                        ctx.question_totals, plan_str)
+    # The structure guard used to run ONLY on a repaired answer, so a draft
+    # that stated the wrong counts but quoted cleanly was never checked at
+    # all — which is how the 2026-08-25 trash answer reached an analyst with
+    # five of its ten sections understating their category by leading with a
+    # sub-theme's count. Counts are what an analyst quotes onward; they get
+    # the same unconditional check as everything else.
+    violations += verify.plan_structure_violations(answer_body, plan_str)
+    verification = {"checked": True, "violations": violations}
 
     # the single-document form (body + Sources) goes to answer.md and the
     # CLI; the API returns the body and the sources as separate fields
     answer_md = answer_body + router.render_sources_section(cited)
     note = process_note(route, evidence, ctx, len(cited), lex_counts)
-    if verification["residual"]:
-        note += (f" CAUTION: {len(verification['residual'])} statement"
-                 f"{'' if len(verification['residual']) == 1 else 's'} could "
+    if violations:
+        note += (f" CAUTION: {len(violations)} statement"
+                 f"{'' if len(violations) == 1 else 's'} could "
                  f"not be verified against the computed data — see the "
                  f"verification record.")
     stats = {

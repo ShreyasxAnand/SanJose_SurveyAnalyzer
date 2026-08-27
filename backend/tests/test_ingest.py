@@ -472,17 +472,18 @@ def test_export_joins_latest_labels(client, tmp_path):
     assert manifest["labels_unmatched_keys"] == 1
 
 
-def test_export_schema_is_v2(client):
-    # Pins the schema-v2 field set: sentiment is gone (labeling v2 never
-    # produces it), child_category_ids became label_ids, and the labeling v2
-    # fields all exist.
+def test_export_schema_is_v3(client):
+    # Pins the schema-v3 field set: sentiment is gone (labeling v2 never
+    # produces it), child_category_ids became label_ids, the labeling v2
+    # fields all exist, and v3 added response_date (the respondent's ISO
+    # survey-completion date; None when the dataset tracks none).
     names = [f.name for f in ingest_module.RESPONSE_PARQUET_SCHEMA]
     assert names == [
         "dataset_id", "question_id", "question_label", "source_column",
         "source_row_index", "response_key", "respondent_key", "respondent_id",
         "response_text", "raw_text_original", "was_encoding_repaired",
         "is_nonanswer", "label_ids", "uncategorized", "fit", "locations",
-        "time_context", "actionability", "event_occurred",
+        "time_context", "actionability", "event_occurred", "response_date",
     ]
 
 

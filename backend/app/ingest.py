@@ -15,6 +15,7 @@ from fastapi.responses import FileResponse
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from app import dates as dates_module
 from app import rowhash
 from app.auth import require_admin
 from app.db import DATA_DIR, EXPORTS_DIR, UPLOADS_DIR, get_db
@@ -60,7 +61,13 @@ REPO_ROOT = DATA_DIR.parent
 # "never labeled" and "labeled, no category" stay distinguishable. Exports
 # are wipe-and-rewrite artifacts and load_question inspects the actual
 # schema, so v1 exports keep working until regenerated.
-EXPORT_SCHEMA_VERSION = 2
+# v3 added response_date: the respondent's ISO survey-completion date from
+# the dataset's date-typed metadata column (the first, by position, if
+# several), None when the dataset has none. It joins the fixed schema —
+# unlike per-dataset demographics — because its name and meaning are the
+# same for every dataset, and "% by wave" analysis straight off the flat
+# file was the point of ingesting dates at all.
+EXPORT_SCHEMA_VERSION = 3
 LIST_COLUMNS = ("label_ids", "locations", "time_context")
 # Demographics sidecar — see the comment at its write site in _write_exports
 # for why this is a separate file rather than columns on the response schema.
@@ -95,6 +102,8 @@ RESPONSE_PARQUET_SCHEMA = pa.schema(
         ("time_context", pa.list_(pa.string())),
         ("actionability", pa.string()),
         ("event_occurred", pa.bool_()),
+        # v3 — ISO respondent survey-completion date, None when untracked
+        ("response_date", pa.string()),
     ]
 )
 
@@ -331,6 +340,7 @@ def _upsert_upload_metadata(
         if source_column not in df.columns:
             continue
         values = df[source_column].tolist()
+        is_date = col.value_type == "date"
         for global_index in owned:
             local_index = global_index - upload.row_offset
             raw = values[local_index] if 0 <= local_index < len(values) else ""
@@ -339,6 +349,10 @@ def _upsert_upload_metadata(
             # arrive mangled and split one real group into two
             value, _repaired = _repair_mojibake(str(raw).strip())
             value = value.strip()
+            if is_date:
+                # canonical ISO or nothing — an unparseable date cell is
+                # missing data, the same asymmetry a blank cell has
+                value = dates_module.parse_date(value) or ""
             if not value:
                 continue          # blank = missing, never a stored category
             rows.append(
@@ -515,6 +529,29 @@ def _write_exports(db: Session, dataset: Dataset) -> ExportInfo:
     labels_by_key, labels_runs = _load_label_assignments(dataset.id)
     matched_keys = 0
 
+    # Metadata columns drive two things below: the demographics sidecar and
+    # the flat response_date column (from the first date-typed column, which
+    # is per-respondent, so one lookup by row index serves every question).
+    meta_cols = (
+        db.query(MetadataColumn)
+        .filter(MetadataColumn.dataset_id == dataset.id)
+        .order_by(MetadataColumn.position)
+        .all()
+    )
+    date_col = next((m for m in meta_cols if m.value_type == "date"), None)
+    date_by_row: dict[int, str] = {}
+    if date_col is not None:
+        date_by_row = dict(
+            db.query(
+                RespondentAttribute.source_row_index, RespondentAttribute.value
+            )
+            .filter(
+                RespondentAttribute.dataset_id == dataset.id,
+                RespondentAttribute.metadata_column_id == date_col.id,
+            )
+            .all()
+        )
+
     per_question_counts: dict[str, int] = {q.label: 0 for q in questions}
     per_question_nonanswer_counts: dict[str, int] = {q.label: 0 for q in questions}
     encoding_repairs_applied = 0
@@ -550,6 +587,7 @@ def _write_exports(db: Session, dataset: Dataset) -> ExportInfo:
                 "time_context": a.get("time_context") if a else None,
                 "actionability": a.get("actionability") if a else None,
                 "event_occurred": a.get("event_occurred") if a else None,
+                "response_date": date_by_row.get(r.source_row_index),
             }
         )
 
@@ -564,12 +602,8 @@ def _write_exports(db: Session, dataset: Dataset) -> ExportInfo:
     # dataset that has no demographics at all. Long format, one row per
     # (respondent, field) — blanks simply absent. Written only when the
     # dataset has metadata columns, so nothing changes for datasets without.
-    meta_cols = (
-        db.query(MetadataColumn)
-        .filter(MetadataColumn.dataset_id == dataset.id)
-        .order_by(MetadataColumn.position)
-        .all()
-    )
+    # (response_date above is the one deliberate exception: uniform name and
+    # meaning across datasets, so it may live in the fixed schema.)
     if meta_cols:
         label_by_id = {m.id: m.label for m in meta_cols}
         attrs = (
@@ -634,6 +668,25 @@ def _write_exports(db: Session, dataset: Dataset) -> ExportInfo:
             {"question_id": q.id, "source_column": q.source_column, "label": q.label}
             for q in questions
         ],
+        # Which demographic fields the sidecar carries and how each is typed —
+        # the ask layer needs value_type to know a field holds ISO dates whose
+        # facets should be derived period labels, not raw dates.
+        "metadata_columns": [
+            {
+                "source_column": m.source_column,
+                "label": m.label,
+                "value_type": m.value_type,
+                "n_distinct": m.n_distinct,
+            }
+            for m in meta_cols
+        ],
+        # Period-labeling config for date-typed fields (app/dates.py shapes);
+        # null when unconfigured (readers fall back to quarter bucketing).
+        "date_ranges": (
+            json.loads(dataset.date_ranges_json)
+            if dataset.date_ranges_json
+            else None
+        ),
         "per_question_counts": per_question_counts,
         "per_question_nonanswer_counts": per_question_nonanswer_counts,
         "total_row_count": len(records),
@@ -760,6 +813,7 @@ def _dataset_out(db: Session, dataset: Dataset) -> DatasetOut:
                     id=m.id,
                     source_column=m.source_column,
                     label=m.label,
+                    value_type=m.value_type,
                     n_distinct=m.n_distinct,
                     values=vals[:METADATA_VALUES_IN_DTO],
                     high_cardinality=m.n_distinct > METADATA_MAX_DISTINCT,
@@ -779,6 +833,11 @@ def _dataset_out(db: Session, dataset: Dataset) -> DatasetOut:
         notes=dataset.notes,
         survey_start_date=dataset.survey_start_date,
         survey_end_date=dataset.survey_end_date,
+        date_ranges=(
+            json.loads(dataset.date_ranges_json)
+            if dataset.date_ranges_json
+            else None
+        ),
         questions=questions,
         exports=exports,
     )
@@ -1154,6 +1213,10 @@ def update_dataset_metadata(
         new = value.strip() or None
         if new != getattr(dataset, field):
             pending[field] = new
+    if body.date_ranges is not None:
+        new_ranges = json.dumps(body.date_ranges)
+        if new_ranges != dataset.date_ranges_json:
+            pending["date_ranges_json"] = new_ranges
 
     if not pending:
         return _dataset_out(db, dataset)
@@ -1291,6 +1354,19 @@ def select_columns(
         dataset.survey_start_date = body.survey_start_date.strip() or None
     if body.survey_end_date is not None:
         dataset.survey_end_date = body.survey_end_date.strip() or None
+    # Period-labeling config: an explicit config always wins; otherwise a
+    # newly selected date column gets quarter bucketing so it is useful with
+    # zero setup (the analyst can re-cut periods later — read-time derivation
+    # means that is a metadata edit, never a re-ingest).
+    if body.date_ranges is not None:
+        dataset.date_ranges_json = json.dumps(body.date_ranges)
+    elif (
+        any(m.value_type == "date" for m in body.metadata_columns)
+        and not dataset.date_ranges_json
+    ):
+        dataset.date_ranges_json = json.dumps(
+            {"mode": "bucket", "granularity": "quarter"}
+        )
 
     # Upsert QuestionColumn by (dataset_id, source_column) instead of
     # delete-then-insert, so a column that stays selected across re-runs
@@ -1341,16 +1417,35 @@ def select_columns(
     meta_kept: dict[str, MetadataColumn] = {}
     for position, m in enumerate(body.metadata_columns):
         # cardinality measured across every upload, not just the first: a
-        # column is only as coarse as the union of the waves makes it
+        # column is only as coarse as the union of the waves makes it. Date
+        # columns count distinct PARSED dates — the stored values — so a
+        # column of junk that never parses is caught here, not discovered as
+        # an empty filter later.
         distinct: set[str] = set()
         for _u, f in frames:
             if m.column in f.columns:
-                distinct |= {v.strip() for v in f[m.column].tolist() if str(v).strip()}
+                raw_values = {
+                    v.strip() for v in f[m.column].tolist() if str(v).strip()
+                }
+                if m.value_type == "date":
+                    raw_values = {
+                        iso
+                        for iso in (dates_module.parse_date(v) for v in raw_values)
+                        if iso
+                    }
+                distinct |= raw_values
+        if m.value_type == "date" and not distinct:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Date column '{m.column}' has no parseable dates "
+                "(expected e.g. 2023-09-19 or 9/19/2023)",
+            )
         existing = existing_meta.get(m.column)
         if existing is not None:
             existing.label = m.label.strip()
             existing.position = position
             existing.n_distinct = len(distinct)
+            existing.value_type = m.value_type
             meta_kept[m.column] = existing
         else:
             col = MetadataColumn(
@@ -1359,6 +1454,7 @@ def select_columns(
                 label=m.label.strip(),
                 position=position,
                 n_distinct=len(distinct),
+                value_type=m.value_type,
             )
             db.add(col)
             db.flush()

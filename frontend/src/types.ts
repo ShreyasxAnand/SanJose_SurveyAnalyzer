@@ -94,6 +94,9 @@ export interface DatasetOut {
   notes: string | null;
   survey_start_date: string | null; // ISO YYYY-MM-DD
   survey_end_date: string | null;
+  // Period-labeling config for date-typed metadata columns; null when the
+  // dataset has none (or nothing configured).
+  date_ranges: DateRangesConfig | null;
   questions: QuestionColumnOut[];
   metadata_columns: MetadataColumnOut[];
   exports: ExportInfo | null;
@@ -106,14 +109,30 @@ export interface MetadataValueCount {
 
 // A demographic / respondent-attribute column. `high_cardinality` is advisory
 // only — the column is stored and usable either way (no hard blocks).
+// `value_type` "date" marks a response-date column: cells stored as ISO
+// dates, offered to filters as derived period labels ("2023 Q3").
 export interface MetadataColumnOut {
   id: number;
   source_column: string;
   label: string;
+  value_type: "categorical" | "date";
   n_distinct: number;
   values: MetadataValueCount[];
   high_cardinality: boolean;
 }
+
+// Period-labeling config for date-typed columns. Bucket mode labels every
+// date by calendar period; ranges mode maps dates into the analyst's own
+// named spans (dates outside every span show as "(unlabeled)").
+export interface DateRange {
+  label: string;
+  start: string; // ISO YYYY-MM-DD
+  end: string;
+}
+
+export type DateRangesConfig =
+  | { mode: "bucket"; granularity: "quarter" | "month" | "year" }
+  | { mode: "ranges"; ranges: DateRange[] };
 
 // Editable catalog metadata. Omitted/null field = leave unchanged, "" =
 // clear. The description is deliberately absent: it feeds every analysis
@@ -399,13 +418,13 @@ export interface AskAnswerResponse {
   // aggregate_direct answers only: the computed tally as structured data
   aggregate: Record<string, unknown> | null;
   // the answer's inspection record: numbers traced to computed counts,
-  // quoted spans checked against their cited sources; null for
-  // deterministic tallies (nothing model-written to verify)
+  // quoted spans checked against their cited sources, quotes against the
+  // sub-theme they are cited under, sections against their plan count.
+  // Findings are disclosed, never repaired — the answer shown is exactly what
+  // the model produced. Null for deterministic tallies (nothing to verify).
   verification: {
     checked: boolean;
     violations: { kind: string; value: string | number; detail: string }[];
-    repaired: boolean;
-    residual: { kind: string; value: string | number; detail: string }[];
   } | null;
 }
 

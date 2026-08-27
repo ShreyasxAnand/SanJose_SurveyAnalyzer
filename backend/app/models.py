@@ -41,6 +41,11 @@ class Dataset(Base):
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
     survey_start_date: Mapped[str | None] = mapped_column(String, nullable=True)
     survey_end_date: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Period-labeling config for date-typed metadata columns (JSON, see
+    # app/dates.py for the two shapes). Presentation config like the catalog
+    # fields above: editable any time, never fed to prompts, never re-versions
+    # a run — period labels are derived at read time, not stored per row.
+    date_ranges_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String, default="uploaded")
     uploaded_at: Mapped[dt.datetime] = mapped_column(
         DateTime, default=lambda: dt.datetime.now(dt.timezone.utc)
@@ -206,6 +211,13 @@ class MetadataColumn(Base):
     label: Mapped[str] = mapped_column(String, nullable=False)
     position: Mapped[int] = mapped_column(Integer, default=0)
     n_distinct: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    # "categorical" (the default — District, Age band) or "date". Date cells
+    # are parsed at ingest and stored as ISO YYYY-MM-DD in
+    # RespondentAttribute.value; unparseable cells store no row. See
+    # app/dates.py.
+    value_type: Mapped[str] = mapped_column(
+        String, default="categorical", server_default="categorical", nullable=False
+    )
 
     dataset: Mapped["Dataset"] = relationship(back_populates="metadata_columns")
     values: Mapped[list["RespondentAttribute"]] = relationship(

@@ -9,10 +9,12 @@ import {
   selectColumns,
   uploadDataset,
 } from "./api";
+import type { MetadataSelection } from "./api";
 import type {
   AppendResponse,
   DatasetMatch,
   DatasetOut,
+  DateRangesConfig,
   UploadResponse,
 } from "./types";
 import Ask from "./Ask";
@@ -631,6 +633,16 @@ function ColumnSelectStep({
   // one or the other, and the API rejects picking it as both.
   const [demoSelected, setDemoSelected] = useState<Record<string, boolean>>({});
   const [demoLabels, setDemoLabels] = useState<Record<string, string>>({});
+  // Response-date column: cells parsed to ISO at ingest; filters and charts
+  // see derived period labels (quarters by default, or custom named ranges).
+  const [dateColumn, setDateColumn] = useState<string>("");
+  const [dateLabel, setDateLabel] = useState("");
+  const [periodMode, setPeriodMode] = useState<
+    "quarter" | "month" | "year" | "custom"
+  >("quarter");
+  const [customRanges, setCustomRanges] = useState<
+    { label: string; start: string; end: string }[]
+  >([{ label: "", start: "", end: "" }]);
   const [labels, setLabels] = useState<Record<string, string>>({});
   const [description, setDescription] = useState("");
   const [department, setDepartment] = useState("");
@@ -682,12 +694,54 @@ function ColumnSelectStep({
 
     // A demographic's label may equal its column name ("District" is already
     // the right display name), unlike a question, which needs real wording.
-    const metadataColumns = upload.columns
-      .filter((c) => demoSelected[c.column] && !selected[c.column])
+    const metadataColumns: MetadataSelection[] = upload.columns
+      .filter(
+        (c) =>
+          demoSelected[c.column] &&
+          !selected[c.column] &&
+          c.column !== dateColumn,
+      )
       .map((c) => ({
         column: c.column,
         label: (demoLabels[c.column] ?? "").trim() || c.column,
       }));
+
+    let dateRanges: DateRangesConfig | null = null;
+    if (dateColumn) {
+      if (selected[dateColumn]) {
+        onError("The date column is also selected as a question column — it can only be one.");
+        return;
+      }
+      metadataColumns.push({
+        column: dateColumn,
+        label: dateLabel.trim() || "Period",
+        value_type: "date",
+      });
+      if (periodMode === "custom") {
+        const complete = customRanges.filter(
+          (r) => r.label.trim() && r.start && r.end,
+        );
+        if (complete.length === 0) {
+          onError("Add at least one complete period (label, from, to) or pick an automatic bucketing.");
+          return;
+        }
+        const backwards = complete.find((r) => r.start > r.end);
+        if (backwards) {
+          onError(`Period "${backwards.label}" starts after it ends.`);
+          return;
+        }
+        dateRanges = {
+          mode: "ranges",
+          ranges: complete.map((r) => ({
+            label: r.label.trim(),
+            start: r.start,
+            end: r.end,
+          })),
+        };
+      } else {
+        dateRanges = { mode: "bucket", granularity: periodMode };
+      }
+    }
 
     setBusy(true);
     try {
@@ -701,6 +755,7 @@ function ColumnSelectStep({
           notes: notes.trim() || null,
           surveyStartDate: surveyStart || null,
           surveyEndDate: surveyEnd || null,
+          dateRanges,
         },
         metadataColumns,
       );
@@ -797,6 +852,131 @@ function ColumnSelectStep({
         </select>
       </fieldset>
 
+      <fieldset style={{ marginBottom: "1rem" }}>
+        <legend>Response date column (optional)</legend>
+        <p style={{ margin: "0 0 0.75rem", fontSize: "0.9em", color: "#555" }}>
+          When each response was collected (e.g. a survey completion date).
+          Enables filtering and charts by time period — quarterly waves,
+          before/after comparisons. Dates are read in common formats
+          (2023-09-19, 9/19/2023); the period labels can be renamed or re-cut
+          later without re-ingesting.
+        </p>
+        <select
+          value={dateColumn}
+          onChange={(e) => setDateColumn(e.target.value)}
+        >
+          <option value="">— none —</option>
+          {upload.columns.map((c) => (
+            <option
+              key={c.column}
+              value={c.column}
+              disabled={!!selected[c.column] || c.non_null_count === 0}
+            >
+              {c.column}
+              {c.sample_values.length > 0 ? ` (e.g. "${c.sample_values[0]}")` : ""}
+            </option>
+          ))}
+        </select>
+        {dateColumn && (
+          <div style={{ marginTop: "0.5rem" }}>
+            <div style={{ marginBottom: "0.5rem" }}>
+              <label>
+                Filter name{" "}
+                <input
+                  type="text"
+                  value={dateLabel}
+                  onChange={(e) => setDateLabel(e.target.value)}
+                  placeholder='Period'
+                  style={{ width: "12rem" }}
+                />
+              </label>
+            </div>
+            <div style={{ marginBottom: "0.5rem" }}>
+              Label periods{" "}
+              {(["quarter", "month", "year", "custom"] as const).map((m) => (
+                <label key={m} style={{ marginRight: "0.75rem" }}>
+                  <input
+                    type="radio"
+                    name="period-mode"
+                    checked={periodMode === m}
+                    onChange={() => setPeriodMode(m)}
+                  />{" "}
+                  {m === "custom" ? "custom ranges" : `by ${m}`}
+                </label>
+              ))}
+            </div>
+            {periodMode === "custom" && (
+              <div>
+                {customRanges.map((r, i) => (
+                  <div key={i} style={{ marginBottom: "0.35rem" }}>
+                    <input
+                      type="text"
+                      value={r.label}
+                      placeholder={`e.g. Wave ${i + 1}`}
+                      onChange={(e) =>
+                        setCustomRanges((rs) =>
+                          rs.map((x, j) =>
+                            j === i ? { ...x, label: e.target.value } : x,
+                          ),
+                        )
+                      }
+                      style={{ width: "10rem", marginRight: "0.5rem" }}
+                    />
+                    from{" "}
+                    <input
+                      type="date"
+                      value={r.start}
+                      onChange={(e) =>
+                        setCustomRanges((rs) =>
+                          rs.map((x, j) =>
+                            j === i ? { ...x, start: e.target.value } : x,
+                          ),
+                        )
+                      }
+                    />{" "}
+                    to{" "}
+                    <input
+                      type="date"
+                      value={r.end}
+                      onChange={(e) =>
+                        setCustomRanges((rs) =>
+                          rs.map((x, j) =>
+                            j === i ? { ...x, end: e.target.value } : x,
+                          ),
+                        )
+                      }
+                    />{" "}
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setCustomRanges((rs) => rs.filter((_, j) => j !== i))
+                      }
+                      disabled={customRanges.length === 1}
+                    >
+                      remove
+                    </button>
+                  </div>
+                ))}
+                <button
+                  type="button"
+                  onClick={() =>
+                    setCustomRanges((rs) => [
+                      ...rs,
+                      { label: "", start: "", end: "" },
+                    ])
+                  }
+                >
+                  + add period
+                </button>
+                <div style={{ fontSize: "0.85em", color: "#555", marginTop: "0.25rem" }}>
+                  Responses dated outside every period show as “(unlabeled)”.
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </fieldset>
+
       <fieldset>
         <legend>Question columns to ingest</legend>
         {upload.columns.map((c) => (
@@ -852,12 +1032,13 @@ function ColumnSelectStep({
         </p>
         {upload.columns.map((c) => {
           const isQuestion = !!selected[c.column];
-          const on = !!demoSelected[c.column] && !isQuestion;
+          const isDate = c.column === dateColumn;
+          const on = !!demoSelected[c.column] && !isQuestion && !isDate;
           return (
             <div key={c.column} style={{ marginBottom: "0.4rem" }}>
               <label
                 style={
-                  isQuestion || c.non_null_count === 0
+                  isQuestion || isDate || c.non_null_count === 0
                     ? { color: "#999" }
                     : undefined
                 }
@@ -865,7 +1046,7 @@ function ColumnSelectStep({
                 <input
                   type="checkbox"
                   checked={on}
-                  disabled={isQuestion || c.non_null_count === 0}
+                  disabled={isQuestion || isDate || c.non_null_count === 0}
                   onChange={() =>
                     setDemoSelected((s) => ({ ...s, [c.column]: !s[c.column] }))
                   }
@@ -875,7 +1056,9 @@ function ColumnSelectStep({
                   ? "(empty)"
                   : isQuestion
                     ? "(already a question column)"
-                    : `(${c.non_null_count} non-empty)`}
+                    : isDate
+                      ? "(the date column)"
+                      : `(${c.non_null_count} non-empty)`}
               </label>
               {on && (
                 <div style={{ marginLeft: "1.5rem", marginTop: "0.25rem" }}>

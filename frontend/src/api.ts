@@ -8,6 +8,7 @@ import type {
   DatasetHistoryOut,
   DatasetMetadataPatch,
   DatasetOut,
+  DateRangesConfig,
   PipelineEstimate,
   PipelineJob,
   UploadResponse,
@@ -72,6 +73,14 @@ export interface QuestionSelection {
   label: string;
 }
 
+// A demographic or date column selection. value_type defaults to
+// "categorical" server-side; "date" cells are parsed to ISO at ingest.
+export interface MetadataSelection {
+  column: string;
+  label: string;
+  value_type?: "categorical" | "date";
+}
+
 // Catalog metadata collected alongside the column selection. null = leave
 // any previously saved value untouched (the description semantics).
 export interface DatasetMeta {
@@ -80,6 +89,9 @@ export interface DatasetMeta {
   notes: string | null;
   surveyStartDate: string | null;
   surveyEndDate: string | null;
+  // Period-labeling config for a date-typed column. null = keep stored
+  // config (a newly selected date column defaults to quarter bucketing).
+  dateRanges: DateRangesConfig | null;
 }
 
 export async function selectColumns(
@@ -87,7 +99,7 @@ export async function selectColumns(
   respondentIdColumn: string | null,
   questions: QuestionSelection[],
   meta: Partial<DatasetMeta> = {},
-  metadataColumns: QuestionSelection[] = [],
+  metadataColumns: MetadataSelection[] = [],
 ): Promise<DatasetOut> {
   const res = await adminFetch(`${BASE}/datasets/${datasetId}/columns`, {
     method: "POST",
@@ -101,6 +113,7 @@ export async function selectColumns(
       dataset_notes: meta.notes ?? null,
       survey_start_date: meta.surveyStartDate ?? null,
       survey_end_date: meta.surveyEndDate ?? null,
+      date_ranges: meta.dateRanges ?? null,
     }),
   });
   return unwrap<DatasetOut>(res);

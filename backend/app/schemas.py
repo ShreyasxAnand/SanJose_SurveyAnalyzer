@@ -1,7 +1,9 @@
 import datetime as dt
-from typing import Self
+from typing import Literal, Self
 
 from pydantic import BaseModel, ConfigDict, model_validator
+
+from app import dates as dates_module
 
 
 def _validate_survey_dates(start: str | None, end: str | None) -> None:
@@ -112,9 +114,14 @@ class MetadataColumnSelection(BaseModel):
     """A demographic / respondent-attribute column. Unlike a question column
     the label MAY equal the raw column name — "District" is already the right
     display name, whereas a question column needs the actual question wording
-    (a raw header like "Q2oe" tells a reader nothing)."""
+    (a raw header like "Q2oe" tells a reader nothing).
+
+    value_type "date" marks a response-date column ("stopdate"): cells are
+    parsed to ISO at ingest (unparseable → no row) and the ask layer offers
+    derived period labels instead of raw dates — see app/dates.py."""
     column: str
     label: str
+    value_type: Literal["categorical", "date"] = "categorical"
 
     @model_validator(mode="after")
     def _label_required(self) -> Self:
@@ -142,10 +149,16 @@ class SelectColumnsRequest(BaseModel):
     dataset_notes: str | None = None
     survey_start_date: str | None = None
     survey_end_date: str | None = None
+    # Period-labeling config for date-typed metadata columns (app/dates.py
+    # shapes). None = keep whatever is stored (or, when a date column is
+    # newly selected with nothing stored, default to quarter bucketing).
+    date_ranges: dict | None = None
 
     @model_validator(mode="after")
     def _dates_are_valid(self) -> Self:
         _validate_survey_dates(self.survey_start_date, self.survey_end_date)
+        if self.date_ranges is not None:
+            self.date_ranges = dates_module.validate_ranges_config(self.date_ranges)
         return self
 
 
@@ -172,6 +185,7 @@ class MetadataColumnOut(BaseModel):
     id: int
     source_column: str
     label: str
+    value_type: str = "categorical"
     n_distinct: int
     # value -> respondent count, most common first. Capped for transport; the
     # full set always lives in the database.
@@ -195,6 +209,9 @@ class DatasetOut(BaseModel):
     notes: str | None = None
     survey_start_date: str | None = None
     survey_end_date: str | None = None
+    # Validated period-labeling config (app/dates.py shapes); None when the
+    # dataset has no date-typed metadata column or nothing was configured.
+    date_ranges: dict | None = None
     questions: list[QuestionColumnOut]
     metadata_columns: list[MetadataColumnOut] = []
     exports: ExportInfo | None = None
@@ -215,12 +232,18 @@ class DatasetMetadataPatch(BaseModel):
     notes: str | None = None
     survey_start_date: str | None = None
     survey_end_date: str | None = None
+    # Period-labeling config (app/dates.py shapes). None = leave unchanged.
+    # Editable here because period labels are presentation config derived at
+    # read time — changing them re-exports but never re-versions a run.
+    date_ranges: dict | None = None
 
     @model_validator(mode="after")
     def _validate(self) -> Self:
         if self.name is not None and not self.name.strip():
             raise ValueError("Dataset name cannot be blank")
         _validate_survey_dates(self.survey_start_date, self.survey_end_date)
+        if self.date_ranges is not None:
+            self.date_ranges = dates_module.validate_ranges_config(self.date_ranges)
         return self
 
 
@@ -449,9 +472,6 @@ class AskAnswerRequest(BaseModel):
     demographic_filter: dict[str, list[str]] = {}
     proposed_label_ids: list[str] = []
     aggregate_target: str = ""
-    # debugging escape hatch: run the deterministic verification but skip the
-    # repair call when a guard fails (the violations still get disclosed)
-    skip_verification: bool = False
 
     @model_validator(mode="after")
     def _selection_required(self) -> Self:
@@ -555,10 +575,11 @@ class AskAnswerResponse(BaseModel):
     # aggregate_direct answers only: the computed tally itself (target,
     # in_scope, per-place/time/event counts) as structured data
     aggregate: dict | None = None
-    # {checked, violations, repaired, residual} — the answer's inspection
-    # record: numbers traced to computed counts, quoted spans checked against
-    # their cited sources, repair applied when a guard failed. None for
-    # deterministic tallies (nothing model-written to verify).
+    # {checked, violations} — the answer's inspection record: numbers traced
+    # to computed counts, quoted spans checked against their cited sources,
+    # quotes checked against the sub-theme they are cited under, sections
+    # against their plan count. Findings are DISCLOSED; the answer is never
+    # rewritten. None for deterministic tallies (nothing model-written).
     verification: dict | None = None
     sampling_notes: dict[str, str]
     lexicon_counts: list[AskLexiconCountOut] = []
