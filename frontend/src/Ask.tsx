@@ -1828,27 +1828,18 @@ function AnswerView({
             ↺ Saved answer — identical every time until the data changes
           </span>
         )}
-        {(result.verification?.residual.length ?? 0) > 0 && (
+        {(result.verification?.violations.length ?? 0) > 0 && (
           <span
             className="ask-chip ask-chip-warn"
-            title={result.verification!.residual
+            title={result.verification!.violations
               .map((v) => `${v.value}: ${v.detail}`)
               .join("\n")}
           >
-            ⚠ {result.verification!.residual.length} statement
-            {result.verification!.residual.length === 1 ? "" : "s"} could not
+            ⚠ {result.verification!.violations.length} statement
+            {result.verification!.violations.length === 1 ? "" : "s"} could not
             be verified against the data
           </span>
         )}
-        {result.verification?.repaired &&
-          result.verification.residual.length === 0 && (
-            <span
-              className="ask-chip"
-              title="A draft statement didn't match the computed counts or quoted sources; it was corrected before you saw it."
-            >
-              ✓ auto-corrected against the data
-            </span>
-          )}
         {result.invalid_citations > 0 && (
           <span className="ask-chip ask-chip-warn">
             ⚠ {result.invalid_citations} unresolved citation

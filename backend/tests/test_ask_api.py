@@ -224,14 +224,18 @@ def test_context_key_sees_every_dataset_change(ask_ctx, monkeypatch):
     assert ask_service.context_cache_key("2", "desc") != k9
 
 
-def test_answer_repair_fires_only_on_violations(client, monkeypatch):
-    """A draft with an invented count triggers exactly one repair call; the
-    served answer is the corrected one and the verification record says so."""
+def test_answer_discloses_violations_and_never_rewrites(client, monkeypatch):
+    """A draft with an invented count is SERVED AS WRITTEN, with the defect
+    named in the verification record and the process note.
+
+    The repair call this replaces was removed 2026-08-25: it cleared the flags
+    on one of the six stored answers that reached it, and its own instructions
+    licensed it to reword a quotation — the one edit this pipeline must never
+    make. So the contract is now exactly two model calls (route + synth), and
+    the bytes an analyst reads are the bytes the model produced."""
     bad = json.dumps({"answer_markdown":
                       "**999 responses** report theft [1]."})
-    fixed = json.dumps({"answer_markdown":
-                        "**2 responses** report theft [1]."})
-    fake = _fake_gemini(monkeypatch, ROUTE_REPLY, bad, fixed)
+    fake = _fake_gemini(monkeypatch, ROUTE_REPLY, bad)
     client.post("/api/datasets/1/ask/route", json={"question": "verify me?"})
     r = client.post("/api/datasets/1/ask/answer", json={
         "question": "verify me?", "route": "retrieval", "reason": "r",
@@ -239,12 +243,12 @@ def test_answer_repair_fires_only_on_violations(client, monkeypatch):
     })
     assert r.status_code == 200
     body = r.json()
-    assert not fake.replies, "route + synth + one repair, nothing more"
-    assert "**2 responses**" in body["answer_markdown"]
-    assert "999" not in body["answer_markdown"]
+    assert not fake.replies, "route + synth only — no repair call"
+    assert "**999 responses**" in body["answer_markdown"], "served as written"
     v = body["verification"]
-    assert v["checked"] and v["repaired"] and v["residual"] == []
-    assert v["violations"][0]["value"] == 999
+    assert v["checked"] and v["violations"][0]["value"] == 999
+    assert "repaired" not in v and "residual" not in v
+    assert "could not be verified" in body["process_note"]
 
 
 def test_ask_cache_serves_stored_route_and_answer(client, monkeypatch):

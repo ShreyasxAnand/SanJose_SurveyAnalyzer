@@ -310,9 +310,9 @@ def ask_route(dataset_id: str, req: AskRouteRequest) -> AskRouteResponse:
 
 @router.post("/answer", response_model=AskAnswerResponse)
 def ask_answer(dataset_id: str, req: AskAnswerRequest) -> AskAnswerResponse:
-    """Step 2: synthesize from the analyst-approved selection. One synthesis
-    call, plus a repair call only when verification flags a violation (and
-    zero calls on an aggregate_direct tally). Counts and quotes are recomputed
+    """Step 2: synthesize from the analyst-approved selection. Exactly one
+    synthesis call (zero on an aggregate_direct tally); the verifier is pure
+    code and never rewrites what it checks. Counts and quotes are recomputed
     here — the request carries choices, never evidence."""
     description = _dataset_description(dataset_id)
     ctx = _load_context(dataset_id, description)
@@ -351,7 +351,7 @@ def ask_answer(dataset_id: str, req: AskAnswerRequest) -> AskAnswerResponse:
             description=description,
             proposed_label_ids=req.proposed_label_ids or None,
             synth_client=synth_client,
-            skip_verification=req.skip_verification)
+            )
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc))
 

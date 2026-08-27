@@ -86,10 +86,9 @@ STAGES: list[tuple[str, str, str, list[tuple[str, str]]]] = [
      "reads the store. No ruling and a failed call both mean NO fusion.",
      [("RULING_SYSTEM", "system"), ("RULING_USER", "user")]),
 
-    ("Stage 6 — Verify / repair", "app.verify",
-     "Deterministic guards run FIRST; the model is called only when a guard "
-     "fires. Note this is the one prompt with no dataset-context preamble.",
-     [("REPAIR_SYSTEM", "system"), ("REPAIR_USER", "user")]),
+    # Verification has no stage here on purpose: app.verify is pure code. Its
+    # repair prompt was removed 2026-08-25, so the answer pipeline's last word
+    # is SYNTH — nothing rewrites what the model wrote.
 ]
 
 # Prompt surface that is BUILT, not templated. Named here so the doc cannot
@@ -102,10 +101,14 @@ BUILT_SURFACE = [
      "Locations list. ROUTE's rules refer to these as \"(if shown)\"; both "
      "sections are conditional on the corresponding artifact existing."),
     ("app.router", "render_section_plan",
-     "Produces the SECTION PLAN inside SYNTH_USER (and is passed through to "
-     "REPAIR_USER). Code decides the answer's structure from full-coverage "
-     "counts; the model only narrates. Two grains, chosen by how many "
-     "categories the router selected."),
+     "Produces the SECTION PLAN inside SYNTH_USER. Code decides the answer's "
+     "structure from full-coverage counts; the model only narrates. Two "
+     "grains, chosen by how many categories the router selected."),
+    ("app.router", "render_counts_block",
+     "Produces the COMPUTED COUNTS block inside SYNTH_USER — the only numbers "
+     "the answer may state. Sub-theme lines are indented under a single "
+     "header and never repeat the category name, so no line but the CATEGORY "
+     "TOTAL reads as a statement about the category."),
     ("app.router", "build_synth_prompts",
      "Appends conditional guidance sentences to ROUTE_GUIDANCE for "
      "multi-question evidence and each active filter."),
@@ -162,8 +165,8 @@ def render() -> str:
     w("")
     w("Two conventions apply throughout:")
     w("")
-    w("- **`{dataset_context}`** — leads every system prompt except "
-      "`REPAIR_SYSTEM`. Rendered by `induction.context_block()` as "
+    w("- **`{dataset_context}`** — leads every system prompt. "
+      "Rendered by `induction.context_block()` as "
       "`\"Survey context:\\n{description}\\n\\n\"`, or the empty string when "
       "no description exists.")
     w(f"- **The JSON retry nudge** — on unparseable output every call retries "
