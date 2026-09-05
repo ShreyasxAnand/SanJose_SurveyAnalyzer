@@ -1,4 +1,5 @@
-"""Run the induce -> label -> lexicon -> locations pipeline from the browser.
+"""Run the induce -> label -> subthemes -> lexicon -> locations pipeline from
+the browser.
 
 Until now every stage after ingest was CLI-only: an analyst could upload a file
 through the UI, get an export, and then hit a 409 on the Ask tab forever,
@@ -16,11 +17,19 @@ log for auditing. Cost comes from each stage's own run manifest, never from
 scraping stdout.
 
 **Cost is estimated before anything is spent.** `estimate_dataset` runs only
-free code (`induction.plan_dry_run` plus a projection for labeling) so the
-analyst approves a figure before the first billed call. Which figures are
-*planned* and which are *projected* is marked per row and must stay marked: a
-projection presented as a plan is exactly the kind of invented number this
-project refuses to produce.
+free code — prompt tokens come from Vertex's countTokens, which does not run
+the model, and everything else from rates `calibration` measured over runs
+that already finished here. The analyst approves a figure before the first
+billed call. Which figures are *planned* and which are *projected* is marked
+per row and must stay marked: a projection presented as a plan is exactly the
+kind of invented number this project refuses to produce.
+
+**The sub-theme pass is part of processing.** It was CLI-only for a while,
+which meant a dataset processed by this button answered with less depth than
+one processed from a terminal, and its cost was invisible in the plan. It runs
+after labeling (it reads the latest labels run to find which categories
+cleared the member floor) and costs nothing on a corpus where no category
+clears it.
 
 Job state is in memory with `status.json` mirrored to disk at every transition.
 A server restart (e.g. uvicorn --reload) kills an in-flight run, and the status
@@ -39,18 +48,46 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from . import ask_service, induction
+from . import (ask_service, calibration, induction, labeling, llm,
+               subthemes, tokens)
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 JOBS_DIR = induction.DATA_DIR / "jobs"
 
-# Measured on the test dataset and the 30k production run: ~$0.10 per 500
-# responses for labeling. Used only for the pre-run
-# projection, and only when no taxonomy exists yet to plan against — labeling's
-# own dry-run needs one. Always surfaced as "projected", never as a plan.
+# countTokens round-trips one whole estimate may spend, across every question
+# and all three per-question stages. A person is waiting on a free planning
+# step, so this trades latency for precision: ~0.15s per call, and the shared
+# ratio pool means a stage that runs out of budget is still measured rather
+# than dropped to characters/4. Sized for a five-question dataset paying four
+# calls for the first stage and two for each of the other fourteen.
+COUNT_CALL_BUDGET = 36
+
+# The batch size the run will really use — `_build_stages` passes 60 to
+# scripts.label, so the estimate must plan the same batching or its batch
+# count (and therefore its call count) is wrong. Batch 80 produced
+# deterministic malformed-JSON failures on the 30k run; 60 is the setting.
+LABEL_BATCH_SIZE = 60
+
+# What `scripts.subthemes` defaults to, and therefore what the estimate must
+# plan against for its batch count to match the run.
+SUBTHEME_BATCH_SIZE = subthemes.DEFAULT_BATCH_SIZE
+
+# Superseded by `calibration`, which learns per-response token rates from this
+# install's own completed runs and prices them at the configured rate. Kept
+# because a caller may still want the old flat figure, and because it is the
+# number every older estimate in the job history was built on.
+#
+# It was measured once, on the test dataset and the 30k production run: ~$0.10
+# per 500 responses. Pooled over every production labeling run since, the real
+# figure is ~$0.00012 per response — the old constant runs about 1.7x high,
+# which is most of the "~25% high" the UI used to warn about.
 LABEL_USD_PER_RESPONSE = 0.10 / 500
-# One grouping call each, bounded by MAX_CANDIDATES / MAX_SPANS rather than by
-# corpus size, so these do not scale with the file.
+# Likewise superseded by `calibration.flat_stage_usd`, which interpolates the
+# real cost of these two stages against corpus size. One grouping call each,
+# bounded by MAX_CANDIDATES / MAX_SPANS rather than by corpus size — but "does
+# not scale with the file" turned out to be true only for the lexicon: the
+# locations stage tracks the number of distinct place spans, and on the 30k
+# corpus it cost $0.0141, fourteen times this constant.
 FLAT_STAGE_USD = 0.001
 
 
@@ -163,23 +200,181 @@ def _incremental_plan(dataset_id: str, rows_by_q: dict) -> dict[str, dict]:
     return plan
 
 
+def _new_rows(dataset_id: str, question_id: str, rows: list) -> list:
+    """The rows this question's latest labels run has never seen.
+
+    The same filter `_incremental_plan` counts, but returning the rows
+    themselves so their real prompts can be built and counted rather than
+    multiplied by a rate.
+    """
+    prior = _prior_label_keys(dataset_id, question_id)
+    if prior is None:
+        return list(rows)
+    return [r for r in rows if r.response_key not in prior]
+
+
+def _latest_taxonomy(dataset_id: str, question_id: str) -> dict | None:
+    """The question's newest taxonomy, for building real labeling prompts.
+
+    Returns None when there is none — which is the normal case for a fresh
+    dataset, where induction has not run yet and the labeling estimate must
+    fall back to a measured rate.
+    """
+    from .summary import latest_run_dir
+
+    run = latest_run_dir(
+        induction.TAXONOMY_DIR / str(dataset_id) / str(question_id),
+        "candidate_taxonomy.json")
+    if run is None:
+        return None
+    try:
+        parsed = json.loads(
+            (run / "candidate_taxonomy.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _label_plan_item(rows, meta, qid: str, dataset_id: str, description: str,
+                     batch_size: int, counter, cal, prices) -> dict:
+    """One labeling row of the estimate, with the best basis available.
+
+    When the question already has a taxonomy the real batch prompts get built
+    and counted; otherwise the token counts come from the calibrated
+    per-unique-response rates. Either way the row reports which it was, and
+    either way the dollars come from the configured price for the configured
+    model.
+    """
+    taxonomy = _latest_taxonomy(dataset_id, qid)
+    plan = labeling.plan_labeling(
+        [(r.response_key, r.text) for r in rows], taxonomy,
+        batch_size=batch_size, dataset_description=description,
+        counter=counter, cal=cal)
+    dup = plan["n_responses"] - plan["n_unique"]
+    detail = (f"{plan['n_responses']} responses"
+              + (f" ({plan['n_unique']} distinct texts, {dup} duplicates "
+                 f"labelled once)" if dup else "")
+              + f", {plan['n_batches']} batches")
+    if plan["input_basis"] == "projected":
+        detail += " — no taxonomy yet, tokens from the measured rate"
+    return _priced_item(
+        stage="label", question_id=qid, question_text=meta["question_text"],
+        detail=detail, responses=plan["n_responses"], plan=plan, prices=prices)
+
+
+def _latest_label_facts(dataset_id: str, question_id: str
+                        ) -> tuple[dict[str, int], list[dict]]:
+    """`(label_counts, assignments)` from the question's latest labels run.
+
+    Both empty when there is no run — the fresh-dataset case, where sub-theme
+    eligibility cannot be known because labeling has not happened yet.
+    """
+    from .summary import LABELS_DIR, latest_run_dir
+
+    run = latest_run_dir(LABELS_DIR / str(dataset_id) / str(question_id),
+                         "assignments.json")
+    if run is None:
+        return {}, []
+    try:
+        assignments = json.loads(
+            (run / "assignments.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}, []
+    if not isinstance(assignments, list):
+        return {}, []
+    counts: dict[str, int] = {}
+    for a in assignments:
+        for label_id in (a.get("label_ids") or []):
+            counts[label_id] = counts.get(label_id, 0) + 1
+    return counts, assignments
+
+
+def _subtheme_plan_item(rows, meta, qid: str, dataset_id: str,
+                        description: str, counter, cal, prices) -> dict | None:
+    """One sub-theme row of the estimate, or None when the pass would do
+    nothing at all for this question.
+
+    Returning None rather than a zero row is deliberate: a question too small
+    to have any eligible category is not "$0.00 of sub-theming", it is a
+    stage that does not apply, and a table full of zero rows buries the ones
+    that cost money.
+    """
+    taxonomy = _latest_taxonomy(dataset_id, qid)
+    counts, assignments = _latest_label_facts(dataset_id, qid)
+    plan = subthemes.plan_subthemes(
+        rows, taxonomy if counts else None, counts or None, assignments,
+        question_text=meta["question_text"], dataset_description=description,
+        batch_size=SUBTHEME_BATCH_SIZE, counter=counter, cal=cal)
+    if plan["total_calls"] <= 0:
+        return None
+    return _priced_item(
+        stage="subthemes", question_id=qid,
+        question_text=meta["question_text"], detail=plan["detail"],
+        responses=plan["n_members"], plan=plan, prices=prices)
+
+
+def _priced_item(*, stage: str, question_id: str, question_text: str,
+                 detail: str, responses: int, plan: dict, prices) -> dict:
+    """Turn a token plan into a priced estimate row."""
+    tokens_in = int(plan["est_input_tokens"])
+    tokens_out = int(plan["est_output_tokens"])
+    cost = prices.usd(tokens_in, tokens_out)
+    return {
+        "stage": stage,
+        "question_id": question_id,
+        "question_text": question_text,
+        "detail": detail,
+        "responses": responses,
+        "est_input_tokens": tokens_in,
+        "est_output_tokens": tokens_out,
+        "est_cost_usd": round(cost, 4),
+        # "planned" when the prompts that drive it were actually built and
+        # counted; "projected" when a measured rate stood in for them
+        "basis": "planned" if plan["input_basis"] in {"counted", "sampled"}
+                 else "projected",
+        "input_basis": plan["input_basis"],
+    }
+
+
+class _Prices:
+    """The configured rate for the configured model, or none at all."""
+
+    def __init__(self, model_id: str) -> None:
+        self.model_id = model_id
+        rate = llm.prices_per_mtok().get(model_id)
+        self.known = rate is not None
+        self.price_in, self.price_out = rate if rate else (0.0, 0.0)
+
+    def usd(self, tokens_in: int, tokens_out: int) -> float:
+        return tokens_in / 1e6 * self.price_in + tokens_out / 1e6 * self.price_out
+
+
 def estimate_dataset(dataset_id: str, chunk_size: int = 120, seed: int = 7,
-                     price_in: float = 0.30, price_out: float = 2.50,
+                     price_in: float | None = None,
+                     price_out: float | None = None,
                      description: str = "", mode: str = "full") -> dict:
     """The plan the analyst approves. Runs only free code.
 
-    In full mode, induction's plan is exact (real chunking, real prompt sizes)
-    while labeling is a *projection* from a measured rate, because its real
-    dry-run needs a taxonomy that does not exist yet on a fresh dataset —
-    flagged as such in `basis` so the UI can say which is which.
+    Nothing here is billed: prompt tokens are measured with Vertex's
+    countTokens, which does not run the model, and everything else comes from
+    completed runs' manifests via `calibration`.
 
-    In incremental mode (after an append), every labeling figure is a
-    projection: the new rows are labeled at the measured rate, and the
-    pool-induction step's size — the uncovered rows among them — is only
-    determined at run time. The ONE exception is a question that has no
-    taxonomy at all (a newly selected column): that gets full induction, whose
-    plan is exact for the same reason it is in full mode, so it is correctly
-    tagged `basis: "planned"`. Nothing else in incremental mode may claim it.
+    **`basis` still means what it always meant** — "planned" when the figure
+    came from prompts this run will really send, "projected" when a measured
+    rate stood in for them — but more rows can now earn "planned". Labeling
+    against an existing taxonomy is counted rather than extrapolated, because
+    the prompts are fully determined. Labeling on a fresh dataset still cannot
+    be: its taxonomy is produced by the stage before it.
+
+    In incremental mode every labeling row stays "projected" regardless. The
+    new rows' prompts are countable, but rows the existing taxonomy cannot
+    place add a proposal call and a relabel of that pool, and how many there
+    are is a run-time fact. A number that omits a step it knows may happen is
+    not a plan.
+
+    `price_in` / `price_out` override the configured rate for the resolved
+    model; leaving them None — which is what the API does — reads
+    config.json, so re-pricing is a settings edit.
     """
     if mode not in {"full", "incremental"}:
         raise ValueError(f"Unknown pipeline mode: {mode!r}")
@@ -193,8 +388,17 @@ def estimate_dataset(dataset_id: str, chunk_size: int = 120, seed: int = 7,
     rows_by_q = induction.load_questions_bulk(
         parquet, [q["question_id"] for q in questions])
 
+    cal = calibration.active()
+    model_id = llm.resolve_model()
+    prices = _Prices(model_id)
+    if price_in is not None and price_out is not None:
+        prices.known = True
+        prices.price_in, prices.price_out = price_in, price_out
+    # One counter for the whole estimate so its call budget is spent across
+    # every question rather than exhausted on the first.
+    counter = tokens.TokenCounter(model_id, max_calls=COUNT_CALL_BUDGET)
+
     items: list[dict] = []
-    total = 0.0
     n_new_responses = 0
     if mode == "incremental":
         inc_plan = _incremental_plan(dataset_id, rows_by_q)
@@ -204,96 +408,113 @@ def estimate_dataset(dataset_id: str, chunk_size: int = 120, seed: int = 7,
             facts = inc_plan[qid]
             if not facts["has_taxonomy"]:
                 # a newly selected column: full induce + full label, as ever
-                plan = induction.plan_dry_run(rows, meta, chunk_size, seed,
-                                              price_in, price_out, description)
-                items.append({
-                    "stage": "induce", "question_id": qid,
-                    "question_text": meta["question_text"],
-                    "detail": f"no taxonomy yet — full induction, "
-                              f"{plan['n_chunks']} chunk(s)",
-                    "responses": plan["responses_usable"],
-                    "est_cost_usd": plan["est_cost_usd"],
-                    "basis": "planned",
-                })
-                total += plan["est_cost_usd"]
+                plan = induction.plan_dry_run(
+                    rows, meta, chunk_size, seed, prices.price_in,
+                    prices.price_out, description, counter=counter, cal=cal)
+                items.append(_priced_item(
+                    stage="induce", question_id=qid,
+                    question_text=meta["question_text"],
+                    detail=f"no taxonomy yet — full induction, "
+                           f"{plan['n_chunks']} chunk(s)",
+                    responses=plan["responses_usable"], plan=plan,
+                    prices=prices))
             if not facts["has_labels"]:
-                cost = round(facts["n_rows"] * LABEL_USD_PER_RESPONSE, 4)
-                items.append({
-                    "stage": "label", "question_id": qid,
-                    "question_text": meta["question_text"],
-                    "detail": f"no labels run yet — all {facts['n_rows']} "
-                              f"responses at the measured rate (~$0.10 per 500)",
-                    "responses": facts["n_rows"],
-                    "est_cost_usd": cost,
-                    "basis": "projected",
-                })
-                total += cost
+                item = _label_plan_item(
+                    rows, meta, qid, dataset_id, description,
+                    LABEL_BATCH_SIZE, counter, cal, prices)
+                item["detail"] = f"no labels run yet — {item['detail']}"
+                # the pool step below makes any incremental labeling figure a
+                # floor, not a plan
+                item["basis"] = "projected"
+                items.append(item)
                 n_new_responses += facts["n_rows"]
             elif facts["n_new"] > 0:
-                cost = round(facts["n_new"] * LABEL_USD_PER_RESPONSE, 4)
-                items.append({
-                    "stage": "label_incr", "question_id": qid,
-                    "question_text": meta["question_text"],
-                    "detail": f"{facts['n_new']} new responses at the measured "
-                              f"rate; rows the taxonomy can't place (count known "
-                              f"only at run time, at most {facts['n_new']}) add "
-                              f"one proposal call and a relabel of that pool",
-                    "responses": facts["n_new"],
-                    "est_cost_usd": cost,
-                    "basis": "projected",
-                })
-                total += cost
+                new_rows = _new_rows(dataset_id, qid, rows)
+                item = _label_plan_item(
+                    new_rows, meta, qid, dataset_id, description,
+                    LABEL_BATCH_SIZE, counter, cal, prices)
+                item["stage"] = "label_incr"
+                item["detail"] = (
+                    f"{item['detail']}; rows the taxonomy can't place (count "
+                    f"known only at run time, at most {facts['n_new']}) add one "
+                    f"proposal call and a relabel of that pool")
+                item["basis"] = "projected"
+                items.append(item)
                 n_new_responses += facts["n_new"]
+            sub = _subtheme_plan_item(rows, meta, qid, dataset_id,
+                                      description, counter, cal, prices)
+            if sub is not None:
+                sub["basis"] = "projected"
+                sub["detail"] += "; already-covered categories are carried, not redone"
+                items.append(sub)
     else:
         for q in questions:
             qid = q["question_id"]
             rows, meta, _filtered = rows_by_q[qid]
-            plan = induction.plan_dry_run(rows, meta, chunk_size, seed,
-                                          price_in, price_out, description)
-            items.append({
-                "stage": "induce", "question_id": qid,
-                "question_text": meta["question_text"],
-                "detail": f"{plan['n_chunks']} chunk(s), ~{plan['total_calls']} calls",
-                "responses": plan["responses_usable"],
-                "est_cost_usd": plan["est_cost_usd"],
-                "basis": "planned",
-            })
-            total += plan["est_cost_usd"]
+            plan = induction.plan_dry_run(
+                rows, meta, chunk_size, seed, prices.price_in,
+                prices.price_out, description, counter=counter, cal=cal)
+            items.append(_priced_item(
+                stage="induce", question_id=qid,
+                question_text=meta["question_text"],
+                detail=f"{plan['n_chunks']} chunk(s), ~{plan['total_calls']} calls",
+                responses=plan["responses_usable"], plan=plan, prices=prices))
+            items.append(_label_plan_item(
+                rows, meta, qid, dataset_id, description, LABEL_BATCH_SIZE,
+                counter, cal, prices))
+            sub = _subtheme_plan_item(rows, meta, qid, dataset_id,
+                                      description, counter, cal, prices)
+            if sub is not None:
+                # always projected in full mode: the taxonomy this pass groups
+                # inside is produced by the induce stage above it, so today's
+                # categories are not the ones it will see
+                sub["basis"] = "projected"
+                items.append(sub)
 
-            n = plan["responses_usable"]
-            label_cost = round(n * LABEL_USD_PER_RESPONSE, 4)
-            items.append({
-                "stage": "label", "question_id": qid,
-                "question_text": meta["question_text"],
-                "detail": f"{n} responses at the measured rate "
-                          f"(~$0.10 per 500)",
-                "responses": n,
-                "est_cost_usd": label_cost,
-                "basis": "projected",
-            })
-            total += label_cost
-
+    n_responses = sum(len(rows) for rows, _m, _f in rows_by_q.values())
     for key, label in (("lexicon", "keyword lexicon"),
                        ("locations", "location concepts")):
+        cost = round(cal.flat_stage_usd(key, n_responses), 4)
         items.append({
             "stage": key, "question_id": "", "question_text": "",
-            "detail": "one grouping call, does not scale with the file",
-            "responses": 0, "est_cost_usd": FLAT_STAGE_USD, "basis": "projected",
+            "detail": f"one grouping call over the whole dataset, "
+                      f"{cal.source} rate for a corpus this size",
+            "responses": 0,
+            "est_input_tokens": 0, "est_output_tokens": 0,
+            "est_cost_usd": cost,
+            "basis": "projected", "input_basis": "projected",
         })
-        total += FLAT_STAGE_USD
 
+    total = sum(i["est_cost_usd"] for i in items)
+    low, high = cal.spread
     already = [q["question_id"] for q in questions
                if _taxonomy_exists(dataset_id, q["question_id"])]
+    counted = sum(1 for i in items if i["input_basis"] in {"counted", "sampled"})
     return {
         "dataset_id": str(dataset_id),
         "dataset_description": description,
         "parquet": str(parquet),
         "mode": mode,
         "n_questions": len(questions),
-        "n_responses": sum(len(rows) for rows, _m, _f in rows_by_q.values()),
+        "n_responses": n_responses,
         "n_new_responses": n_new_responses,
         "items": items,
         "est_total_usd": round(total, 4),
+        # The honest width of "about this much": the 10th-90th percentile
+        # spread of per-run rates around the pooled one, from the same
+        # manifests the rates came from. Not a guarantee — a band.
+        "est_low_usd": round(total * low, 4),
+        "est_high_usd": round(total * high, 4),
+        "model_id": model_id,
+        # tokens are known even when the model has no configured price; say so
+        # rather than showing $0.00 as if it were free
+        "priced": prices.known,
+        "est_input_tokens": sum(i["est_input_tokens"] for i in items),
+        "est_output_tokens": sum(i["est_output_tokens"] for i in items),
+        "calibration_source": cal.source,
+        "calibration_measured_utc": cal.measured_utc,
+        "count_calls": counter.calls_made,
+        "stages_counted": counted,
         # a question that already has a taxonomy will be induced again, adding a
         # new versioned run — say so rather than letting the analyst assume the
         # button is a no-op on a processed dataset
@@ -320,8 +541,28 @@ def _build_stages(dataset_id: str, parquet: Path, question_ids: list[str],
         # malformed-JSON failures on the 30k run
         command=["-m", "scripts.label", "--parquet", pq, "--all",
                  "--batch-size", str(batch_size)]))
+    _append_subtheme_stage(stages, pq)
     _append_cheap_stages(stages, pq)
     return stages
+
+
+def _append_subtheme_stage(stages: list[Stage], pq: str) -> None:
+    """The sub-theme pass — the second level inside each large category.
+
+    Must come after labeling: it reads the latest labels run to find which
+    categories cleared the member floor, and refuses to run without one. It
+    is a no-op on a corpus where nothing clears the floor, which is why a
+    small dataset can carry this stage and still spend nothing on it.
+
+    `ask_service` has loaded this layer since the sub-theme answer work
+    landed; until now nothing in the browser produced it, so a dataset
+    processed by the button answered without the depth a CLI-processed one
+    had. Estimating it without running it would have been the same gap with
+    a bigger number attached.
+    """
+    stages.append(Stage(
+        key="subthemes", label="Build sub-themes inside large categories",
+        command=["-m", "scripts.subthemes", "--parquet", pq, "--all"]))
 
 
 def _append_cheap_stages(stages: list[Stage], pq: str) -> None:
@@ -366,6 +607,11 @@ def _build_incremental_stages(dataset_id: str, parquet: Path,
         raise ValueError(
             "Nothing to process incrementally — every question's responses are "
             "already labelled.")
+    # scripts.subthemes carries by default: categories whose sub-themes are
+    # still valid are reused rather than re-induced, so this is cheap after an
+    # append and expensive only where new rows pushed a category over the
+    # floor for the first time. That is exactly the work an append creates.
+    _append_subtheme_stage(stages, pq)
     _append_cheap_stages(stages, pq)
     return stages
 

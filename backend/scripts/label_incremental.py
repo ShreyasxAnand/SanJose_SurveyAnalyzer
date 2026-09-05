@@ -27,7 +27,7 @@ import sys
 import time
 from pathlib import Path
 
-from app import incremental, induction, labeling
+from app import incremental, induction, labeling, llm
 from app.llm import GeminiClient
 from app.summary import LABELS_DIR, latest_run_dir
 from scripts.label import latest_taxonomy
@@ -184,9 +184,15 @@ def main() -> None:
     ap.add_argument("--description", default=None,
                     help="default: the export manifest's dataset_description")
     ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--price-in", type=float, default=0.30)
-    ap.add_argument("--price-out", type=float, default=2.50)
+    ap.add_argument("--price-in", type=float, default=None)
+    ap.add_argument("--price-out", type=float, default=None)
     args = ap.parse_args()
+    # $/MTok: the flags when given, otherwise the configured rate for the
+    # model this run will actually use. Every script used to default these
+    # to a hand-copied 0.30/2.50, which was silently wrong the moment
+    # --model pointed elsewhere and never tracked config.json at all.
+    args.price_in, args.price_out = llm.resolve_prices(
+        llm.resolve_model(args.model), args.price_in, args.price_out)
 
     if not args.question and not args.all:
         ap.error("pass --question or --all")

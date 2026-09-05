@@ -942,3 +942,239 @@ def load_sub_context(
                     if sid in sub_names:
                         sub_members[lid].setdefault(sid, []).append(key)
     return sub_members, sub_names, sub_coded, runs_used
+
+
+# ---------------------------------------------------------------------------
+# Cost planning — what this pass would spend, before it spends it
+# ---------------------------------------------------------------------------
+
+# Structure of one category's work, mirroring `induce_subthemes` and
+# `run_sublabeling` so the plan and the run cannot disagree about call counts.
+# The two factors come from `scripts.subthemes.estimate_category`: SUBMAP
+# proposes about 7 candidates per chunk, and the exact-merge keeps roughly 60%
+# of them before the dedup pass batches whatever is left.
+CANDIDATES_PER_CHUNK = 7
+EXACT_MERGE_SURVIVAL = 0.6
+DEDUP_BATCH = 40
+
+
+def plan_category_calls(n_members: int, n_unique: int, batch_size: int) -> dict:
+    """Model calls for one eligible category: SUBMAP, dedup, then sub-labeling.
+
+    Each category pays its own MAP and dedup passes, which is why the plan
+    needs a per-category breakdown rather than one corpus-wide figure — ten
+    categories of 500 members cost noticeably more than one of 5,000.
+    """
+    n_map = max(1, -(-n_members // SUB_CHUNK_SIZE))
+    candidates = n_map * CANDIDATES_PER_CHUNK * EXACT_MERGE_SURVIVAL
+    n_dedup = max(1, -(-int(candidates) // DEDUP_BATCH))
+    if candidates > DEDUP_BATCH:
+        n_dedup += 1                      # the survivors round
+    n_batches = max(1, -(-max(1, n_unique) // max(1, batch_size)))
+    return {"map": n_map, "dedup": n_dedup, "sublabel": n_batches,
+            "total": n_map + n_dedup + n_batches}
+
+
+def plan_subthemes(rows: list[ResponseRow], taxonomy: dict | None = None,
+                   label_counts: dict[str, int] | None = None,
+                   assignments: list[dict] | None = None,
+                   question_text: str = "", dataset_description: str = "",
+                   min_n: int = DEFAULT_MIN_N,
+                   batch_size: int = DEFAULT_BATCH_SIZE, *,
+                   counter=None, cal=None) -> dict:
+    """Token and call plan for the sub-theme pass over one question.
+
+    Two accuracy levels, as everywhere else in the estimate:
+
+    * **With labels on disk** the eligible categories are known exactly —
+      `label_counts` says how many responses landed in each, which is what
+      min_n is tested against — so the real SUBMAP and sub-labeling prompts
+      get built and counted.
+    * **Without them** (a fresh dataset, where labeling is the stage before
+      this one) eligibility cannot be known, so the work is projected from a
+      measured membership share and priced at measured per-call rates.
+
+    The cheapest gate matters most: a question with fewer responses than
+    `min_n` cannot have a single eligible category, so its sub-theme cost is
+    exactly zero rather than a small positive guess. Every smoke-test dataset
+    on this machine is in that bucket, and charging them for this pass would
+    be wrong in the direction nobody checks.
+    """
+    from . import tokens
+    if cal is None:
+        from .calibration import active
+        cal = active()
+    if counter is None:
+        counter = tokens.TokenCounter()
+
+    n_rows = len(rows)
+    if n_rows < min_n:
+        return {
+            "n_eligible_categories": 0, "n_members": 0, "total_calls": 0,
+            "est_input_tokens": 0, "est_output_tokens": 0,
+            "input_basis": "projected", "count_calls": 0,
+            "detail": f"no category can reach {min_n} members in {n_rows} "
+                      f"responses — nothing to sub-code",
+        }
+
+    if taxonomy is not None and label_counts:
+        return _plan_from_labels(
+            rows, taxonomy, label_counts, assignments or [], question_text,
+            dataset_description, min_n, batch_size, counter, cal)
+    # Duplication is a property of THIS corpus and the rows are in hand, so it
+    # is measured rather than taken from the calibrated average. It matters:
+    # sub-labeling batches deduped texts, so a corpus of 400 responses with 17
+    # distinct ones is one batch, not thirteen.
+    unique_ratio = len({r.text for r in rows}) / max(1, n_rows)
+    return _project_subthemes(n_rows, min_n, batch_size, cal, unique_ratio)
+
+
+def _project_subthemes(n_rows: int, min_n: int, batch_size: int, cal,
+                       unique_ratio: float) -> dict:
+    """The fresh-dataset path: no labels yet, so eligibility is a projection."""
+    members = round(n_rows * cal.eligible_memberships_per_response)
+    if members <= 0:
+        return {"n_eligible_categories": 0, "n_members": 0, "total_calls": 0,
+                "est_input_tokens": 0, "est_output_tokens": 0,
+                "input_basis": "projected", "count_calls": 0,
+                "detail": "no eligible categories projected"}
+    n_cats = max(1, round(members / cal.members_per_eligible_category))
+    per_cat = max(1, members // n_cats)
+    # projected categories are modelled as equal-sized: the real spread is
+    # long-tailed, but call count is near-linear in members either way
+    per_cat_unique = max(1, round(per_cat * unique_ratio))
+    per_cat_calls = plan_category_calls(
+        per_cat, per_cat_unique, batch_size)["total"]
+    calls = n_cats * per_cat_calls
+    return {
+        "n_eligible_categories": n_cats,
+        "n_members": members,
+        "total_calls": calls,
+        "est_input_tokens": round(calls * cal.subtheme_input_per_call),
+        "est_output_tokens": round(calls * cal.subtheme_output_per_call),
+        "input_basis": "projected",
+        "count_calls": 0,
+        "detail": f"~{n_cats} categor{'y' if n_cats == 1 else 'ies'} over "
+                  f"{min_n} members projected ({members:,} memberships at the "
+                  f"measured share), ~{calls} calls at the measured per-call "
+                  f"rate",
+    }
+
+
+def _plan_from_labels(rows, taxonomy, label_counts, assignments, question_text,
+                      dataset_description, min_n, batch_size, counter,
+                      cal) -> dict:
+    """The re-processing path: real categories, real prompts, counted."""
+    eligible = eligible_categories(taxonomy, label_counts, min_n)
+    if not eligible:
+        return {"n_eligible_categories": 0, "n_members": 0, "total_calls": 0,
+                "est_input_tokens": 0, "est_output_tokens": 0,
+                "input_basis": "counted", "count_calls": 0,
+                "detail": f"no category reaches {min_n} members"}
+
+    texts = {r.response_key: r.text for r in rows}
+    members_by_label: dict[str, list[ResponseRow]] = {}
+    for a in assignments:
+        for label_id in a.get("label_ids", []) or []:
+            text = texts.get(a.get("response_key"))
+            if text:
+                members_by_label.setdefault(label_id, []).append(
+                    ResponseRow(response_key=a["response_key"], text=text))
+
+    started = counter.calls_made
+    total_calls = total_in = total_members = 0
+    # The worst basis any prompt in this question got. Derived from the
+    # estimates themselves rather than from "did we spend a call here": once
+    # the shared ratio pool is warm, a stage that spends nothing is still
+    # measured, and reporting it as a chars/4 guess understates the estimate.
+    bases: list[str] = []
+    for category in eligible:
+        label_id = category["label_id"]
+        member_rows = members_by_label.get(label_id) or []
+
+        if not member_rows:
+            # the counts say this category is eligible but the assignments do
+            # not list its rows; price it from the count rather than drop it
+            # silently out of the plan
+            n_members = int(label_counts.get(label_id, 0))
+            calls = plan_category_calls(
+                n_members, max(1, round(n_members * cal.unique_ratio)),
+                batch_size)
+            total_calls += calls["total"]
+            total_members += n_members
+            total_in += round(calls["total"] * cal.subtheme_input_per_call)
+            continue
+
+        n_members = len(member_rows)
+        unique_texts = {r.text for r in member_rows}
+        calls = plan_category_calls(n_members, len(unique_texts), batch_size)
+        total_calls += calls["total"]
+        total_members += n_members
+
+        # SUBMAP: one system prompt per category, one user block per chunk
+        chunks = [member_rows[i: i + SUB_CHUNK_SIZE]
+                  for i in range(0, n_members, SUB_CHUNK_SIZE)]
+        map_system, map_users = "", []
+        for chunk in chunks:
+            system, user, _ = build_submap_prompts(
+                question_text, category, chunk, dataset_description)
+            map_system = system
+            map_users.append(user)
+        map_estimate = counter.estimate(map_system, map_users)
+        total_in += map_estimate.tokens
+        bases.append(map_estimate.basis)
+
+        # Sub-labeling: the sub-taxonomy this prompt renders does not exist
+        # yet, so it is stood in for by placeholders of realistic shape — the
+        # same stand-in scripts.subthemes' own dry run uses.
+        placeholders = [
+            {"sub_label_id": f"{label_id}s{i:02d}",
+             "name": "placeholder sub-theme name",
+             "description": "placeholder description of the sub-theme."}
+            for i in range(1, CANDIDATES_PER_CHUNK + 1)
+        ]
+        seen: set[str] = set()
+        unique_rows: list[tuple[str, str]] = []
+        for row in member_rows:
+            if row.text not in seen:
+                seen.add(row.text)
+                unique_rows.append((row.response_key, row.text))
+        batches = [unique_rows[i: i + batch_size]
+                   for i in range(0, len(unique_rows), batch_size)]
+        lab_system, lab_users = "", []
+        for batch in batches:
+            system, user = build_sublabel_prompts(
+                question_text, category, placeholders, batch,
+                dataset_description)
+            lab_system = system
+            lab_users.append(user)
+        lab_estimate = counter.estimate(lab_system, lab_users)
+        total_in += lab_estimate.tokens
+        bases.append(lab_estimate.basis)
+
+        # the dedup prompts are built from candidates that do not exist yet,
+        # so they stay on the measured per-call rate
+        total_in += round(calls["dedup"] * cal.subtheme_input_per_call)
+
+    spent = counter.calls_made - started
+    # ranked worst-first: one unmeasured prompt makes the whole row a guess
+    for candidate in ("heuristic", "sampled", "counted"):
+        if candidate in bases:
+            worst = candidate
+            break
+    else:
+        worst = "heuristic"
+    return {
+        "n_eligible_categories": len(eligible),
+        "n_members": total_members,
+        "total_calls": total_calls,
+        "est_input_tokens": total_in,
+        # no output token can be counted ahead of time, here or anywhere
+        "est_output_tokens": round(total_calls * cal.subtheme_output_per_call),
+        "input_basis": worst,
+        "count_calls": spent,
+        "detail": f"{len(eligible)} categor"
+                  f"{'y' if len(eligible) == 1 else 'ies'} at or over {min_n} "
+                  f"members ({total_members:,} memberships), "
+                  f"~{total_calls} calls",
+    }

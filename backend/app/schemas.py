@@ -634,8 +634,16 @@ class PipelineEstimateItem(BaseModel):
     question_text: str = ""
     detail: str = ""
     responses: int = 0
+    est_input_tokens: int = 0
+    est_output_tokens: int = 0
     est_cost_usd: float
     basis: str
+    # How the input tokens above were arrived at, one level finer than
+    # `basis`: "counted" (every prompt measured with countTokens), "sampled"
+    # (measured prompts scaled by a measured tokens-per-character ratio),
+    # "heuristic" (4 characters per token — countTokens was unavailable), or
+    # "projected" (no prompts to measure; a calibrated per-response rate).
+    input_basis: str = "projected"
 
 
 class PipelineEstimate(BaseModel):
@@ -652,6 +660,26 @@ class PipelineEstimate(BaseModel):
     n_new_responses: int = 0
     items: list[PipelineEstimateItem]
     est_total_usd: float
+    # The 10th-90th percentile band around the total, from the spread of
+    # per-run rates in the manifests the rates were measured from. Shown as a
+    # range because a single figure implies a precision no estimate has.
+    est_low_usd: float = 0.0
+    est_high_usd: float = 0.0
+    est_input_tokens: int = 0
+    est_output_tokens: int = 0
+    # the model these figures are priced for, and whether a price for it is
+    # configured at all — an unpriced model still has known token counts, and
+    # showing $0.00 for it would read as "free"
+    model_id: str = ""
+    priced: bool = True
+    # "measured" once this install has recalibrated from its own completed
+    # runs, "builtin" until then
+    calibration_source: str = "builtin"
+    calibration_measured_utc: str = ""
+    # countTokens round-trips this estimate spent (free, and not model calls),
+    # and how many rows came back measured rather than extrapolated
+    count_calls: int = 0
+    stages_counted: int = 0
     # questions that already have a taxonomy: running again adds a new
     # versioned run rather than doing nothing, so the analyst should know
     questions_with_existing_taxonomy: list[str] = []
@@ -688,3 +716,175 @@ class PipelineRunRequest(BaseModel):
     # "full" | "incremental" — incremental is the post-append path: label only
     # never-labeled rows, extend the taxonomy from the uncovered pool
     mode: str = "full"
+
+
+# --- server settings (config.json) -----------------------------------------
+
+
+class ModelPriceOut(BaseModel):
+    """One model's rate, in the units the pricing page publishes them."""
+    model_config = ConfigDict(protected_namespaces=())
+
+    model_id: str
+    input_per_mtok: float
+    output_per_mtok: float
+    # True when this rate comes from config.json rather than the built-in
+    # table, so the UI can show which rows the operator is responsible for
+    overridden: bool = False
+
+
+class CalibrationOut(BaseModel):
+    """What the cost estimate's rates were measured from."""
+    source: str = "builtin"           # "measured" | "builtin"
+    measured_utc: str = ""
+    # runs behind each stage's figure — a rate from two runs deserves less
+    # confidence than one from twenty, and only this says which it is
+    sample: dict[str, int] = {}
+    label_input_tokens_per_response: float = 0.0
+    label_output_tokens_per_response: float = 0.0
+    induce_output_tokens_per_chunk: float = 0.0
+    candidates_per_response: float = 0.0
+    spread_low: float = 1.0
+    spread_high: float = 1.0
+
+
+class ConfigOut(BaseModel):
+    """The server's settings, as the Settings screen shows them.
+
+    The passcode itself is never returned — only whether one is set and where
+    it came from. A settings page that echoes the secret it protects turns
+    every screenshot and every shoulder into a leak.
+    """
+    model_config = ConfigDict(protected_namespaces=())
+
+    admin_passcode_set: bool
+    # "config" | "env" | "" — which source won, so someone who cannot change
+    # the passcode from this screen is told why
+    admin_passcode_source: str = ""
+    default_model: str
+    synth_model: str
+    # Vertex project and location, twice over: what is CONFIGURED (null when
+    # nothing is) and what a run will actually USE once the fallbacks apply.
+    # Both, because the screen prefills its boxes from the configured value
+    # and shows the effective one as the placeholder — prefilling with the
+    # effective value would make a plain Save silently pin the ADC-derived
+    # project into the file, so it stops following `gcloud config`.
+    vertex_project: str | None = None
+    vertex_project_effective: str | None = None
+    vertex_location: str | None = None
+    vertex_location_effective: str = "global"
+    prices: list[ModelPriceOut]
+    calibration: CalibrationOut
+    # absolute path of the file being edited, so the operator can find it
+    config_path: str
+    config_exists: bool
+    # set when an environment variable is overriding the file: the screen can
+    # save happily and change nothing, which needs saying out loud
+    env_overrides: list[str] = []
+
+
+class ModelPriceIn(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+
+    model_id: str
+    input_per_mtok: float
+    output_per_mtok: float
+
+    @model_validator(mode="after")
+    def _check(self) -> Self:
+        if not self.model_id.strip():
+            raise ValueError("A price row needs a model id.")
+        for field in ("input_per_mtok", "output_per_mtok"):
+            if getattr(self, field) < 0:
+                raise ValueError(f"{field} cannot be negative.")
+        return self
+
+
+class ConfigPatch(BaseModel):
+    """Settings to write. Every field is optional — omitted means "leave it".
+
+    The passcode has three states, which is why it is a string and not a bool:
+    omitted (unchanged), "" (cleared, turning the gate off), or a value (set).
+    The two Vertex fields work the same way — "" clears the override and hands
+    the choice back to ADC (project) or the global endpoint (location) — which
+    is why they are not covered by the blank check below.
+    """
+    model_config = ConfigDict(protected_namespaces=())
+
+    admin_passcode: str | None = None
+    default_model: str | None = None
+    synth_model: str | None = None
+    vertex_project: str | None = None
+    vertex_location: str | None = None
+    prices: list[ModelPriceIn] | None = None
+
+    @model_validator(mode="after")
+    def _check(self) -> Self:
+        for field in ("default_model", "synth_model"):
+            value = getattr(self, field)
+            if value is not None and not value.strip():
+                raise ValueError(
+                    f"{field} cannot be blank — omit it to leave it unchanged."
+                )
+        if self.prices is not None:
+            seen = set()
+            for row in self.prices:
+                key = row.model_id.strip()
+                if key in seen:
+                    raise ValueError(f"Duplicate price row for '{key}'.")
+                seen.add(key)
+        return self
+
+
+# --- permanent dataset deletion --------------------------------------------
+
+
+class DeletionPreviewRoot(BaseModel):
+    """One artifact tree that would be removed."""
+    key: str
+    label: str
+    # what the analyst loses, in their words rather than in directory names
+    describes: str = ""
+    exists: bool = True
+    files: int = 0
+    bytes: int = 0
+    runs: int = 0
+    spent_usd: float = 0.0
+
+
+class DeletionPreview(BaseModel):
+    """Everything a permanent delete would destroy, counted before it happens.
+
+    `total_spent_usd` is the number that matters most in the dialog. Rows and
+    questions read like something you could upload again; recorded model spend
+    reads like what it is — money already paid that a re-run would have to pay
+    again.
+    """
+    dataset_id: int
+    dataset_name: str
+    status: str
+    n_responses: int = 0
+    n_questions: int = 0
+    n_metadata_columns: int = 0
+    n_uploads: int = 0
+    roots: list[DeletionPreviewRoot] = []
+    total_files: int = 0
+    total_bytes: int = 0
+    total_spent_usd: float = 0.0
+    # a pipeline job is mid-write in these directories; the delete will 409
+    blocked_by_running_job: bool = False
+
+
+class UndeletedRoot(BaseModel):
+    key: str
+    error: str
+
+
+class DeletionResult(BaseModel):
+    dataset_id: int
+    dataset_name: str
+    deleted: bool
+    # Empty is the expected result and the whole point of reporting it: the
+    # next upload reuses this dataset id, so any directory left behind would
+    # later be adopted by unrelated data. A non-empty list needs hand cleanup.
+    undeleted_roots: list[UndeletedRoot] = []

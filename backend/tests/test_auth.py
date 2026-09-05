@@ -65,16 +65,18 @@ def test_upload_requires_passcode_when_configured(client, monkeypatch):
     assert _upload(client, {"X-Admin-Passcode": "open-sesame"}).status_code == 200
 
 
-def test_passcode_read_from_dotenv_fallback(client, monkeypatch):
-    # env var absent (autouse fixture), .env carries the passcode
-    monkeypatch.setattr(auth, "load_dotenv", lambda *a, **k: {"ADMIN_PASSCODE": "s3cret"})
+def test_passcode_read_from_config_file(client, monkeypatch):
+    # env var absent (autouse fixture), config.json carries the passcode
+    monkeypatch.setattr(auth, "load_config",
+                        lambda *a, **k: {"admin_passcode": "s3cret"})
     assert _upload(client).status_code == 401
     assert _upload(client, {"X-Admin-Passcode": "s3cret"}).status_code == 200
 
 
-def test_env_var_wins_over_dotenv(client, monkeypatch):
+def test_env_var_wins_over_the_config_file(client, monkeypatch):
     monkeypatch.setenv("ADMIN_PASSCODE", "from-env")
-    monkeypatch.setattr(auth, "load_dotenv", lambda *a, **k: {"ADMIN_PASSCODE": "from-file"})
+    monkeypatch.setattr(auth, "load_config",
+                        lambda *a, **k: {"admin_passcode": "from-file"})
     assert _upload(client, {"X-Admin-Passcode": "from-file"}).status_code == 401
     assert _upload(client, {"X-Admin-Passcode": "from-env"}).status_code == 200
 
@@ -113,3 +115,35 @@ def test_other_mutating_endpoints_are_gated(client, monkeypatch):
     select = client.post(f"/api/datasets/{dataset_id}/columns", json=body, headers=ok)
     assert select.status_code == 200
     assert client.delete(f"/api/datasets/{dataset_id}", headers=ok).status_code in (204, 409)
+
+
+def test_a_non_ascii_passcode_never_500s(client, monkeypatch):
+    """A non-ASCII passcode must fail closed, not crash.
+
+    `secrets.compare_digest` raises TypeError on a str containing any
+    non-ASCII character, so comparing without encoding first turned an
+    accented passcode into a 500 on every gated request — locking the operator
+    out of the very screen that would let them change it. `config.json` now
+    refuses to store one, but it can still arrive from a hand-edited file or
+    an environment variable, so the gate has to cope.
+
+    Note there is no "and the right passcode gets in" case here, because there
+    isn't one: an HTTP header is bytes, and the round trip does not preserve
+    the string (`café` arrives as `cafÃ©`). That is precisely why
+    setting one is refused — see test_config_api.
+    """
+    monkeypatch.setenv("ADMIN_PASSCODE", "café-señor")
+
+    for attempt in (None, {"X-Admin-Passcode": "wrong"},
+                    {"X-Admin-Passcode": "café-señor".encode("utf-8")}):
+        res = _upload(client, attempt)
+        assert res.status_code == 401, f"{attempt!r} gave {res.status_code}"
+
+
+def test_a_non_ascii_attempt_against_an_ascii_passcode_is_a_clean_401(
+        client, monkeypatch):
+    # the other half of the same bug: a non-ASCII ATTEMPT must be refused,
+    # not crash the request
+    monkeypatch.setenv("ADMIN_PASSCODE", "open-sesame")
+    res = _upload(client, {"X-Admin-Passcode": "café".encode("utf-8")})
+    assert res.status_code == 401

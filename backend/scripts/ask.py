@@ -101,8 +101,8 @@ def main() -> None:
                          "none (any). There is no 'no incident' option — not "
                          "describing one is not evidence none occurred")
     ap.add_argument("--seed", type=int, default=7)
-    ap.add_argument("--price-in", type=float, default=0.30)
-    ap.add_argument("--price-out", type=float, default=2.50)
+    ap.add_argument("--price-in", type=float, default=None)
+    ap.add_argument("--price-out", type=float, default=None)
     # Default None means "look the rate up in llm.PRICES_PER_MTOK by model
     # id"; only needed when running a model that table doesn't know.
     ap.add_argument("--synth-price-in", type=float, default=None,

@@ -14,7 +14,7 @@ import time
 
 import pandas as pd
 
-from app import induction, locations as loc
+from app import induction, llm, locations as loc
 from app.llm import GeminiClient
 
 
@@ -29,9 +29,15 @@ def main() -> None:
     ap.add_argument("--show-spans", action="store_true", help="print spans and exit")
     ap.add_argument("--max-spans", type=int, default=loc.MAX_SPANS,
                     help="cap on spans in the grouping prompt (top-N by count)")
-    ap.add_argument("--price-in", type=float, default=0.30)
-    ap.add_argument("--price-out", type=float, default=2.50)
+    ap.add_argument("--price-in", type=float, default=None)
+    ap.add_argument("--price-out", type=float, default=None)
     args = ap.parse_args()
+    # $/MTok: the flags when given, otherwise the configured rate for the
+    # model this run will actually use. Every script used to default these
+    # to a hand-copied 0.30/2.50, which was silently wrong the moment
+    # --model pointed elsewhere and never tracked config.json at all.
+    args.price_in, args.price_out = llm.resolve_prices(
+        llm.resolve_model(args.model), args.price_in, args.price_out)
 
     parquet = induction.discover_parquet(args.parquet)
     args.description = induction.resolve_description(args.description, parquet)

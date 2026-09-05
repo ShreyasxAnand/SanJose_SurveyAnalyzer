@@ -19,6 +19,8 @@ import type {
 } from "./types";
 import Ask from "./Ask";
 import Catalog from "./Catalog";
+import PasscodeGate from "./PasscodeGate";
+import Settings from "./Settings";
 
 /* The analyst chose upfront whether this file is a new dataset or an append
    to a known target; the server's duplicate check still runs either way as a
@@ -38,7 +40,11 @@ type Step =
 type View =
   | { name: "catalog" }
   | { name: "ingest"; step: Step }
-  | { name: "ask"; datasetId: number; datasetName: string };
+  | { name: "ask"; datasetId: number; datasetName: string }
+  // Server settings. Carries no state of its own — the back button block
+  // below already handles any non-catalog view, and provisionalUploadId
+  // returns null for anything that is not an ingest step.
+  | { name: "settings" };
 
 /* Steps during which a provisional dataset exists server-side (created by
    upload, not yet consumed by commit/append/discard). */
@@ -89,6 +95,9 @@ export default function App() {
 
   return (
     <main style={{ maxWidth: 720, margin: "2rem auto", fontFamily: "sans-serif" }}>
+      {/* Always mounted: any view can trip the admin gate, and the dialog it
+          registers with api.ts is what replaces the old window.prompt. */}
+      <PasscodeGate />
       <h1>Survey Analyzer</h1>
       {view.name !== "catalog" && (
         <p>
@@ -123,9 +132,12 @@ export default function App() {
               mode: { kind: "append", targetId: target.id, targetName: target.name },
             })
           }
+          onOpenSettings={() => setView({ name: "settings" })}
           onError={setError}
         />
       )}
+
+      {view.name === "settings" && <Settings onError={setError} />}
 
       {view.name === "ask" && (
         // key resets in-flight ask state when the dataset changes

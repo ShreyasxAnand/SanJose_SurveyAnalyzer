@@ -13,6 +13,16 @@
   --cat-amber-ink: #8a5c00;
   --cat-amber-bg: #fbf3df;
   --cat-amber-line: #ebd9ae;
+  /* The app had no red at all before this: even pipeline failures are amber,
+     because a failed stage is recoverable. These exist for exactly one thing
+     — permanent deletion — and they are pitched in the same desaturated
+     register as the amber set so the palette still reads as one system. Using
+     them anywhere recoverable would spend the only alarm colour there is. */
+  --cat-danger-ink: #8f2020;
+  --cat-danger: #a83232;
+  --cat-danger-hover: #8f2020;
+  --cat-danger-bg: #fbeaea;
+  --cat-danger-line: #eec9c9;
   --cat-shadow: 0 8px 28px rgba(31, 46, 43, 0.14);
 
   /* break out of the app shell's narrow column for the card grid */
@@ -233,6 +243,9 @@
 }
 .cat-field input[type="text"],
 .cat-field input[type="date"],
+/* the Settings screen's passcode fields — without this they render as bare
+   browser-default inputs next to styled ones */
+.cat-field input[type="password"],
 .cat-field textarea {
   width: 100%;
   box-sizing: border-box;
@@ -301,3 +314,135 @@
 }
 .cat-history-date { color: var(--cat-ink-3); font-size: 12px; white-space: nowrap; }
 .cat-history-note { font-style: italic; color: var(--cat-ink-2); font-size: 12.5px; margin: 3px 0 0; }
+
+/* --- destructive actions --------------------------------------------- */
+
+/* Both selectors carry an extra class so they outrank `.cat-menu button`,
+   which sets colour, and `.cat-menu button:hover`, which sets the teal
+   background. */
+.cat-menu-sep {
+  height: 1px;
+  background: var(--cat-line);
+  margin: 4px 0;
+}
+.cat-menu button.cat-menu-danger {
+  color: var(--cat-danger-ink);
+}
+.cat-menu button.cat-menu-danger:hover {
+  background: var(--cat-danger-bg);
+}
+
+.cat-btn-danger {
+  background: var(--cat-danger);
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  padding: 7px 14px;
+  font-size: 13.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.cat-btn-danger:hover:not(:disabled) {
+  background: var(--cat-danger-hover);
+}
+.cat-btn-danger:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+/* .cat-btn-secondary had no :disabled rule, so a Cancel button disabled
+   during an in-flight delete looked clickable. */
+.cat-btn-secondary:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* --- the delete confirmation ----------------------------------------- */
+
+.cat-del-lede {
+  margin: 0 0 12px;
+  font-size: 13.5px;
+}
+.cat-del-lede strong {
+  color: var(--cat-danger-ink);
+}
+
+.cat-del-list {
+  list-style: none;
+  margin: 0 0 12px;
+  padding: 0;
+  border: 1px solid var(--cat-danger-line);
+  background: var(--cat-danger-bg);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.cat-del-list li {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  padding: 7px 12px;
+  font-size: 13px;
+  border-top: 1px solid var(--cat-danger-line);
+}
+.cat-del-list li:first-child {
+  border-top: none;
+}
+.cat-del-what {
+  color: var(--cat-ink);
+}
+.cat-del-what small {
+  display: block;
+  color: var(--cat-ink-2);
+  font-size: 11.5px;
+}
+.cat-del-count {
+  color: var(--cat-ink-2);
+  font-size: 12.5px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The sunk-cost line. Given its own weight because it is the fact most
+   likely to change someone's mind: rows can be re-uploaded, model spend
+   cannot be un-spent. */
+.cat-del-spend {
+  border: 1px solid var(--cat-danger-line);
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin: 0 0 12px;
+  font-size: 13.5px;
+  color: var(--cat-danger-ink);
+}
+.cat-del-spend strong {
+  font-size: 16px;
+}
+
+.cat-del-confirm {
+  margin-top: 4px;
+}
+.cat-del-confirm input[type="text"] {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid var(--cat-danger-line);
+  border-radius: 6px;
+  padding: 7px 10px;
+  font-size: 13.5px;
+  font-family: inherit;
+  color: var(--cat-ink);
+}
+
+.cat-del-blocked {
+  background: var(--cat-amber-bg);
+  border: 1px solid var(--cat-amber-line);
+  color: var(--cat-amber-ink);
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-size: 13px;
+  margin: 0 0 12px;
+}
+
+.cat-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}

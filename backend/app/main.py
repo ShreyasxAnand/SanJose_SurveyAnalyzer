@@ -6,6 +6,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.ask_api import router as ask_router
+from app.config_api import router as config_router
 from app.db import REPO_ROOT, init_db
 from app.ingest import router as datasets_router
 from app.pipeline_api import router as pipeline_router
@@ -41,6 +42,7 @@ app.add_middleware(
 app.include_router(datasets_router, prefix=API_PREFIX)
 app.include_router(pipeline_router, prefix=API_PREFIX)
 app.include_router(ask_router, prefix=API_PREFIX)
+app.include_router(config_router, prefix=API_PREFIX)
 
 
 @app.get("/health")

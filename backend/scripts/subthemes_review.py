@@ -18,7 +18,7 @@ import json
 import sys
 import time
 
-from app import induction, subthemes, summary
+from app import induction, llm, subthemes, summary
 from app.llm import GeminiClient
 
 SUBTHEMES_DIR = induction.DATA_DIR / "subthemes"
@@ -155,9 +155,16 @@ def main() -> None:
                          "marked reviewed_auto (e.g. after strengthening the "
                          "review prompt)")
     ap.add_argument("--min-interval", type=float, default=0.1)
-    ap.add_argument("--price-in", type=float, default=0.30)
-    ap.add_argument("--price-out", type=float, default=2.50)
+    ap.add_argument("--price-in", type=float, default=None)
+    ap.add_argument("--price-out", type=float, default=None)
     args = ap.parse_args()
+    # $/MTok: the flags when given, otherwise the configured rate for the
+    # model this run will actually use. Every script used to default these
+    # to a hand-copied 0.30/2.50, which was silently wrong the moment
+    # --model pointed elsewhere and never tracked config.json at all.
+    args.price_in, args.price_out = llm.resolve_prices(
+        llm.resolve_model(args.model), args.price_in, args.price_out)
+
     if not args.question and not args.all:
         ap.error("pass --question or --all")
 

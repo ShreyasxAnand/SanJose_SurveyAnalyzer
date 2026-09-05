@@ -1,6 +1,12 @@
 import { useEffect, useRef, useState } from "react";
-import { getDatasetHistory, listDatasets, patchDataset } from "./api";
-import type { DatasetHistoryOut, DatasetOut } from "./types";
+import {
+  deleteDatasetPermanently,
+  deletionPreview,
+  getDatasetHistory,
+  listDatasets,
+  patchDataset,
+} from "./api";
+import type { DatasetHistoryOut, DatasetOut, DeletionPreview } from "./types";
 import "./catalog.css";
 
 /* Google Drive-style dataset catalog: the home page. Cards are ingested
@@ -12,17 +18,20 @@ export default function Catalog({
   onOpenDataset,
   onStartNewUpload,
   onStartAppend,
+  onOpenSettings,
   onError,
 }: {
   onOpenDataset: (d: DatasetOut) => void;
   onStartNewUpload: () => void;
   onStartAppend: (target: DatasetOut) => void;
+  onOpenSettings: () => void;
   onError: (msg: string) => void;
 }) {
   const [datasets, setDatasets] = useState<DatasetOut[] | null>(null);
   const [chooserOpen, setChooserOpen] = useState(false);
   const [editFor, setEditFor] = useState<DatasetOut | null>(null);
   const [historyFor, setHistoryFor] = useState<DatasetOut | null>(null);
+  const [deleteFor, setDeleteFor] = useState<DatasetOut | null>(null);
 
   useEffect(() => {
     listDatasets()
@@ -38,9 +47,20 @@ export default function Catalog({
     <div className="cat">
       <div className="cat-header">
         <h2>Datasets</h2>
-        <button className="cat-upload-btn" onClick={() => setChooserOpen(true)}>
-          Upload
-        </button>
+        {/* .cat-header is space-between with two children; a third would
+            spread them, so the right-hand controls share one box. */}
+        <div className="cat-header-actions">
+          <button
+            className="cat-btn-secondary"
+            onClick={onOpenSettings}
+            title="Admin passcode, models, token prices"
+          >
+            ⚙ Settings
+          </button>
+          <button className="cat-upload-btn" onClick={() => setChooserOpen(true)}>
+            Upload
+          </button>
+        </div>
       </div>
 
       {ingested.length === 0 ? (
@@ -56,6 +76,7 @@ export default function Catalog({
               onOpen={() => onOpenDataset(d)}
               onEdit={() => setEditFor(d)}
               onHistory={() => setHistoryFor(d)}
+              onDelete={() => setDeleteFor(d)}
             />
           ))}
         </div>
@@ -95,6 +116,20 @@ export default function Catalog({
           onError={onError}
         />
       )}
+      {deleteFor && (
+        <DeleteModal
+          dataset={deleteFor}
+          onDeleted={(id) => {
+            /* Local-state surgery rather than a refetch, matching the
+               metadata modal — and correct here for the same reason: the
+               server has already told us the row is gone. */
+            setDatasets((ds) => (ds ? ds.filter((d) => d.id !== id) : ds));
+            setDeleteFor(null);
+          }}
+          onClose={() => setDeleteFor(null)}
+          onError={onError}
+        />
+      )}
     </div>
   );
 }
@@ -116,11 +151,13 @@ function DatasetCard({
   onOpen,
   onEdit,
   onHistory,
+  onDelete,
 }: {
   dataset: DatasetOut;
   onOpen: () => void;
   onEdit: () => void;
   onHistory: () => void;
+  onDelete: () => void;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement | null>(null);
@@ -199,6 +236,16 @@ function DatasetCard({
             }}
           >
             View history
+          </button>
+          <div className="cat-menu-sep" />
+          <button
+            className="cat-menu-danger"
+            onClick={() => {
+              setMenuOpen(false);
+              onDelete();
+            }}
+          >
+            Delete dataset…
           </button>
         </div>
       )}
@@ -494,6 +541,184 @@ function HistoryModal({
           Close
         </button>
       </div>
+    </Modal>
+  );
+}
+
+function formatBytes(n: number): string {
+  if (n <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  const i = Math.min(units.length - 1, Math.floor(Math.log(n) / Math.log(1024)));
+  const value = n / 1024 ** i;
+  return `${value < 10 && i > 0 ? value.toFixed(1) : Math.round(value)} ${units[i]}`;
+}
+
+function DeleteModal({
+  dataset,
+  onDeleted,
+  onClose,
+  onError,
+}: {
+  dataset: DatasetOut;
+  onDeleted: (id: number) => void;
+  onClose: () => void;
+  onError: (msg: string) => void;
+}) {
+  /* Two stages, deliberately. The first is the inventory — what exists and
+     what it cost — because "12,000 responses" reads like something you could
+     upload again, while recorded model spend reads like what it is. The
+     second makes you type the name, which is the difference between a slip
+     and a decision. */
+  const [preview, setPreview] = useState<DeletionPreview | null>(null);
+  const [armed, setArmed] = useState(false);
+  const [typed, setTyped] = useState("");
+  const [deleting, setDeleting] = useState(false);
+
+  useEffect(() => {
+    deletionPreview(dataset.id)
+      .then(setPreview)
+      .catch((e) => onError(String(e)));
+  }, [dataset.id, onError]);
+
+  const nameMatches = typed.trim() === dataset.name.trim();
+
+  const handleDelete = async () => {
+    setDeleting(true);
+    try {
+      const result = await deleteDatasetPermanently(dataset.id, typed.trim());
+      if (result.undeleted_roots.length > 0) {
+        /* Not a failure — the rows are gone and the dataset is deleted — but
+           it must be said: this id gets reused by the next upload, and any
+           leftover directory would be adopted by unrelated data. */
+        onError(
+          `Dataset "${result.dataset_name}" was deleted, but these files could ` +
+            `not be removed and should be cleared by hand: ` +
+            result.undeleted_roots
+              .map((r) => `${r.key} (${r.error})`)
+              .join("; "),
+        );
+      }
+      onDeleted(dataset.id);
+    } catch (e) {
+      onError(String(e));
+      setDeleting(false);
+    }
+  };
+
+  return (
+    <Modal title={`Delete "${dataset.name}"?`} onClose={onClose}>
+      {preview === null ? (
+        <p>Checking what this would remove…</p>
+      ) : (
+        <>
+          {preview.blocked_by_running_job && (
+            <p className="cat-del-blocked">
+              A pipeline run is in progress for this dataset. Deleting now would
+              pull files out from under it — cancel the run or wait for it to
+              finish first.
+            </p>
+          )}
+
+          <p className="cat-del-lede">
+            <strong>This cannot be undone.</strong> Everything below is removed
+            permanently — from the database and from disk.
+          </p>
+
+          {preview.total_spent_usd > 0 && (
+            <p className="cat-del-spend">
+              <strong>
+                ${preview.total_spent_usd.toFixed(2)} of model spend
+              </strong>{" "}
+              is recorded against these files. Deleting them does not refund
+              it, and rebuilding this dataset would cost it again.
+            </p>
+          )}
+
+          <ul className="cat-del-list">
+            <li>
+              <span className="cat-del-what">
+                Responses and questions
+                <small>the survey data itself</small>
+              </span>
+              <span className="cat-del-count">
+                {preview.n_responses.toLocaleString()} responses ·{" "}
+                {preview.n_questions} question
+                {preview.n_questions === 1 ? "" : "s"}
+                {preview.n_metadata_columns > 0 &&
+                  ` · ${preview.n_metadata_columns} demographic column${
+                    preview.n_metadata_columns === 1 ? "" : "s"
+                  }`}
+              </span>
+            </li>
+            {preview.roots.map((root) => (
+              <li key={root.key}>
+                <span className="cat-del-what">
+                  {root.label}
+                  {root.describes && <small>{root.describes}</small>}
+                </span>
+                <span className="cat-del-count">
+                  {root.runs > 0 && `${root.runs} run${root.runs === 1 ? "" : "s"} · `}
+                  {root.files.toLocaleString()} file
+                  {root.files === 1 ? "" : "s"} · {formatBytes(root.bytes)}
+                </span>
+              </li>
+            ))}
+          </ul>
+
+          {!armed ? (
+            <div className="cat-modal-actions">
+              <button className="cat-btn-secondary" onClick={onClose}>
+                Cancel
+              </button>
+              <button
+                className="cat-btn-danger"
+                disabled={preview.blocked_by_running_job}
+                onClick={() => setArmed(true)}
+              >
+                Continue
+              </button>
+            </div>
+          ) : (
+            <>
+              <label className="cat-field cat-del-confirm">
+                <span className="cat-field-label">
+                  Type the dataset's name to confirm
+                </span>
+                <input
+                  type="text"
+                  value={typed}
+                  placeholder={dataset.name}
+                  autoFocus
+                  onChange={(e) => setTyped(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && nameMatches && !deleting)
+                      void handleDelete();
+                  }}
+                />
+                <span className="cat-field-hint">
+                  Exactly: {dataset.name}
+                </span>
+              </label>
+              <div className="cat-modal-actions">
+                <button
+                  className="cat-btn-secondary"
+                  onClick={onClose}
+                  disabled={deleting}
+                >
+                  Cancel
+                </button>
+                <button
+                  className="cat-btn-danger"
+                  onClick={handleDelete}
+                  disabled={!nameMatches || deleting}
+                >
+                  {deleting ? "Deleting…" : "Delete forever"}
+                </button>
+              </div>
+            </>
+          )}
+        </>
+      )}
     </Modal>
   );
 }

@@ -1,51 +1,20 @@
-"""Config resolution (.env parsing, project/location discovery) and the
-retry / backoff / throttle behavior of the ADC-based Gemini client.
+"""Vertex project/location discovery and the retry / backoff / throttle
+behavior of the ADC-based Gemini client.
 
 Everything here is offline: the SDK client construction and the generate
 call are patched, so no credentials and no network are needed.
+
+The settings half of this lives in test_config.py, which owns the
+environment > config.json precedence rule. What is left here is the part
+specific to the client: that a missing project is a named, actionable error
+rather than an obscure SDK failure.
 """
 from types import SimpleNamespace
 
 import pytest
 
-from app import llm
+from app import config, llm
 from google.genai import errors as genai_errors
-
-
-def _write(tmp_path, text, encoding="utf-8"):
-    p = tmp_path / ".env"
-    p.write_text(text, encoding=encoding)
-    return p
-
-
-# --- .env parsing (unchanged behavior; auth.py depends on it too) ---------
-
-
-def test_plain_key(tmp_path):
-    assert llm.load_dotenv(_write(tmp_path, "GOOGLE_CLOUD_PROJECT=my-proj\n")) == {
-        "GOOGLE_CLOUD_PROJECT": "my-proj"
-    }
-
-
-def test_bom_does_not_corrupt_the_first_key(tmp_path):
-    # PowerShell Out-File and several editors write a BOM by default on Windows
-    env = _write(tmp_path, "GOOGLE_CLOUD_PROJECT=my-proj\n", encoding="utf-8-sig")
-    assert llm.load_dotenv(env) == {"GOOGLE_CLOUD_PROJECT": "my-proj"}
-
-
-@pytest.mark.parametrize("raw", ['"my-proj"', "'my-proj'", "  my-proj  "])
-def test_quotes_and_padding_are_stripped(tmp_path, raw):
-    env = _write(tmp_path, f"GOOGLE_CLOUD_PROJECT={raw}\n")
-    assert llm.load_dotenv(env)["GOOGLE_CLOUD_PROJECT"] == "my-proj"
-
-
-def test_comments_blanks_and_export_prefix(tmp_path):
-    env = _write(tmp_path, "\n# a comment\nexport GOOGLE_CLOUD_PROJECT=my-proj\nGARBAGE\n\n")
-    assert llm.load_dotenv(env) == {"GOOGLE_CLOUD_PROJECT": "my-proj"}
-
-
-def test_missing_file_is_not_an_error(tmp_path):
-    assert llm.load_dotenv(tmp_path / "nope.env") == {}
 
 
 # --- project / location resolution ----------------------------------------
@@ -53,47 +22,29 @@ def test_missing_file_is_not_an_error(tmp_path):
 
 @pytest.fixture()
 def clean_env(tmp_path, monkeypatch):
+    """Nothing configured anywhere: no environment, no config.json, no ADC."""
     monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
     monkeypatch.delenv("GOOGLE_CLOUD_LOCATION", raising=False)
-    monkeypatch.setattr(llm, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(config, "CONFIG_PATH", tmp_path / "absent.json")
+    monkeypatch.setattr(config, "_cache_stamp", None)
     monkeypatch.setattr(llm, "_adc_quota_project", lambda: None)
     return tmp_path
-
-
-def test_environment_wins_over_dotenv(clean_env, monkeypatch):
-    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "from-env")
-    _write(clean_env, "GOOGLE_CLOUD_PROJECT=from-file\n")
-    assert llm.resolve_project() == "from-env"
-
-
-def test_dotenv_used_when_environment_is_empty(clean_env):
-    _write(clean_env, "GOOGLE_CLOUD_PROJECT=from-file\n")
-    assert llm.resolve_project() == "from-file"
-
-
-def test_explicit_argument_beats_everything(clean_env, monkeypatch):
-    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "from-env")
-    assert llm.resolve_project("explicit") == "explicit"
-
-
-def test_blank_env_var_falls_through_to_dotenv(clean_env, monkeypatch):
-    # `set GOOGLE_CLOUD_PROJECT=` leaves an empty string, which must not count
-    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "   ")
-    _write(clean_env, "GOOGLE_CLOUD_PROJECT=from-file\n")
-    assert llm.resolve_project() == "from-file"
-
-
-def test_adc_quota_project_is_the_last_resort(clean_env, monkeypatch):
-    monkeypatch.setattr(llm, "_adc_quota_project", lambda: "from-adc")
-    assert llm.resolve_project() == "from-adc"
 
 
 def test_location_defaults_to_global(clean_env):
     assert llm.resolve_location() == "global"
 
 
+def test_no_project_anywhere_resolves_to_none(clean_env):
+    assert llm.resolve_project() is None
+
+
 def test_missing_project_names_the_fix(clean_env):
+    """The failure a new install actually hits. The message has to say what to
+    run, because the SDK's own error does not."""
     with pytest.raises(RuntimeError, match="gcloud auth application-default"):
+        llm.GeminiClient()
+    with pytest.raises(RuntimeError, match="GOOGLE_CLOUD_PROJECT"):
         llm.GeminiClient()
 
 

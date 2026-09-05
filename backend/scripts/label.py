@@ -20,7 +20,7 @@ import sys
 import time
 from pathlib import Path
 
-from app import induction, labeling
+from app import induction, labeling, llm
 from app.llm import GeminiClient
 
 LABELS_DIR = induction.DATA_DIR / "labels"
@@ -51,12 +51,21 @@ def label_one(args, question: str) -> dict:
     print(f"  taxonomy: {tax_path.parent.name}")
 
     if args.dry_run:
-        system, user = labeling.build_label_prompts(taxonomy, pairs[: args.batch_size],
-                                                    args.description)
-        est_in = n_batches * (len(system) + len(user)) // 4
-        est_out = n_unique * 35
+        # Delegates to labeling.plan_labeling, which builds the prompts the run
+        # will really send and counts them with Vertex's free countTokens.
+        # What this replaced got two things wrong: it sampled its example
+        # prompt from the RAW rows while the run batches deduped ones, so on
+        # any corpus with repeated answers it measured a prompt that is never
+        # sent; and it extrapolated the first batch's length to every batch,
+        # which is false whenever response lengths vary and always false for
+        # the short final batch.
+        plan = labeling.plan_labeling(
+            pairs, taxonomy, batch_size=args.batch_size,
+            dataset_description=args.description)
+        est_in, est_out = plan["est_input_tokens"], plan["est_output_tokens"]
         cost = est_in / 1e6 * args.price_in + est_out / 1e6 * args.price_out
-        print(f"  DRY RUN — {n_batches} calls, ~{est_in:,} in / ~{est_out:,} out, ~${cost:.3f}")
+        print(f"  DRY RUN — {plan['n_batches']} calls, ~{est_in:,} in "
+              f"({plan['input_basis']}) / ~{est_out:,} out, ~${cost:.3f}")
         return {}
 
     client = GeminiClient(model=args.model, max_output_tokens=args.max_output_tokens,
@@ -159,9 +168,15 @@ def main() -> None:
     ap.add_argument("--description", default=None,
                     help="default: the export manifest's dataset_description")
     ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--price-in", type=float, default=0.30)
-    ap.add_argument("--price-out", type=float, default=2.50)
+    ap.add_argument("--price-in", type=float, default=None)
+    ap.add_argument("--price-out", type=float, default=None)
     args = ap.parse_args()
+    # $/MTok: the flags when given, otherwise the configured rate for the
+    # model this run will actually use. Every script used to default these
+    # to a hand-copied 0.30/2.50, which was silently wrong the moment
+    # --model pointed elsewhere and never tracked config.json at all.
+    args.price_in, args.price_out = llm.resolve_prices(
+        llm.resolve_model(args.model), args.price_in, args.price_out)
 
     if not args.question and not args.all:
         ap.error("pass --question or --all")

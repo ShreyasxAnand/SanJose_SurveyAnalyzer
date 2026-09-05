@@ -40,6 +40,30 @@ function usd(n: number): string {
   return n < 0.01 && n > 0 ? `$${n.toFixed(4)}` : `$${n.toFixed(2)}`;
 }
 
+/* A range formatted to one precision, chosen by the smaller end. Formatting
+   each end independently produced "$0.0070–$0.01", which reads as a typo
+   rather than as a range. */
+function usdRange(low: number, high: number): string {
+  const cents = low >= 0.01;
+  const fmt = (n: number) => (cents ? `$${n.toFixed(2)}` : `$${n.toFixed(4)}`);
+  return `${fmt(low)}–${fmt(high)}`;
+}
+
+/* What the input tokens behind a row were actually derived from. Kept
+   distinct from `basis` (planned vs projected) because they answer different
+   questions: basis says whether the prompts exist yet, this says whether they
+   were measured. A row can be projected and still measured — incremental
+   labeling counts real prompts but cannot see the pool step coming. */
+const INPUT_BASIS_TITLE: Record<string, string> = {
+  counted: "Every prompt for this stage was measured with Vertex's countTokens",
+  sampled:
+    "Prompts measured on a sample and scaled by the measured tokens-per-character ratio",
+  heuristic:
+    "countTokens was unavailable, so input is the old 4-characters-per-token guess",
+  projected:
+    "No prompts exist to measure yet — input comes from a measured per-response rate",
+};
+
 function fmtWhen(stamp: string): string {
   // Job timestamps use filesystem-safe hyphens in the time part
   // ("2026-08-03T23-22-52Z") — restore colons before parsing.
@@ -247,6 +271,12 @@ export default function Pipeline({
                     >
                       {it.basis}
                     </span>
+                    <span
+                      className="pl-input-basis"
+                      title={INPUT_BASIS_TITLE[it.input_basis] ?? it.input_basis}
+                    >
+                      {it.input_basis}
+                    </span>
                   </td>
                   <td className="pl-cost">{usd(it.est_cost_usd)}</td>
                 </tr>
@@ -254,17 +284,50 @@ export default function Pipeline({
             </tbody>
             <tfoot>
               <tr>
-                <td colSpan={4}>estimated total</td>
+                <td colSpan={4}>
+                  estimated total
+                  <span className="pl-sub">
+                    {" "}
+                    · {mode.estimate.est_input_tokens.toLocaleString()} in /{" "}
+                    {mode.estimate.est_output_tokens.toLocaleString()} out tokens
+                  </span>
+                </td>
                 <td className="pl-cost">
-                  <strong>{usd(mode.estimate.est_total_usd)}</strong>
+                  {mode.estimate.priced ? (
+                    <>
+                      <strong>{usd(mode.estimate.est_total_usd)}</strong>
+                      <span className="pl-band">
+                        {usdRange(
+                          mode.estimate.est_low_usd,
+                          mode.estimate.est_high_usd,
+                        )}
+                      </span>
+                    </>
+                  ) : (
+                    <strong className="pl-unpriced">no rate set</strong>
+                  )}
                 </td>
               </tr>
             </tfoot>
           </table>
+          {!mode.estimate.priced && (
+            <p className="pl-warn">
+              ⚠ No token price is configured for{" "}
+              <code>{mode.estimate.model_id}</code>, so the token counts above
+              are real but the dollars are unknown. Add a rate on the Settings
+              screen to price this run.
+            </p>
+          )}
           <p className="pl-hint">
-            An estimate, not a quote — the labeling rows are extrapolated, and
-            the real figure comes from each stage's own manifest as it finishes.
-            On the 30k dataset this projection ran about 25% high.
+            An estimate, not a quote. Prompt tokens were counted with Vertex's
+            countTokens ({mode.estimate.count_calls} free calls, no model runs);
+            output tokens cannot be counted in advance by anyone, so those come
+            from rates measured over{" "}
+            {mode.estimate.calibration_source === "measured"
+              ? "this install's own completed runs"
+              : "built-in defaults — recalibrate on the Settings screen to fit them to your data"}
+            . The range is the 10th–90th percentile spread of those runs; the
+            real figure comes from each stage's own manifest as it finishes.
           </p>
           {mode.estimate.mode === "incremental" && (
             <p className="pl-hint">
@@ -291,7 +354,13 @@ export default function Pipeline({
           )}
           <div className="pl-actions">
             <button onClick={handleRun}>
-              Confirm and run — up to {usd(mode.estimate.est_total_usd)}
+              {/* the TOP of the band, not the headline: "up to" the midpoint
+                  is not an upper bound, and this is the last thing read
+                  before money is spent */}
+              Confirm and run — around {usd(mode.estimate.est_total_usd)}
+              {mode.estimate.priced &&
+                mode.estimate.est_high_usd > mode.estimate.est_total_usd &&
+                `, up to ${usd(mode.estimate.est_high_usd)}`}
             </button>
             <button onClick={() => setMode({ name: "idle" })}>Cancel</button>
           </div>

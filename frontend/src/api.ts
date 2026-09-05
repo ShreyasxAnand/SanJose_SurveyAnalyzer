@@ -5,12 +5,17 @@ import type {
   AskDemographicsResponse,
   AskQuestionOut,
   AskRouteResponse,
+  CalibrationInfo,
+  ConfigPatch,
   DatasetHistoryOut,
   DatasetMetadataPatch,
   DatasetOut,
   DateRangesConfig,
+  DeletionPreview,
+  DeletionResult,
   PipelineEstimate,
   PipelineJob,
+  ServerConfig,
   UploadResponse,
 } from "./types";
 
@@ -38,6 +43,69 @@ function adminHeaders(): Record<string, string> {
   return p ? { "X-Admin-Passcode": p } : {};
 }
 
+/* The Settings screen needs to show whether this tab is unlocked and to let
+   someone unlock it deliberately rather than by tripping a 401. Deliberately
+   still sessionStorage: a passcode that outlives the tab is a passcode
+   somebody else finds on a shared machine. */
+export function hasStoredPasscode(): boolean {
+  return !!sessionStorage.getItem(ADMIN_KEY);
+}
+
+export function setStoredPasscode(passcode: string): void {
+  sessionStorage.setItem(ADMIN_KEY, passcode.trim());
+}
+
+export function clearStoredPasscode(): void {
+  sessionStorage.removeItem(ADMIN_KEY);
+}
+
+/* Asking for the passcode.
+
+   This module has no React, and the 401 handler has to pause mid-request
+   until a person types something — which is why it used to call
+   window.prompt. A browser prompt cannot mask its input, so the passcode was
+   displayed in the clear as it was typed, in the one place the app asks for
+   it most often. PasscodeGate registers a masked dialog here instead.
+
+   There is deliberately no window.prompt fallback: a fallback that leaks the
+   thing it is protecting is not a fallback. With no dialog registered the
+   401 is returned as-is and surfaces as an error telling the user where to
+   set the passcode. */
+export type PasscodeAsker = (context: { reason: string }) => Promise<string | null>;
+
+let askForPasscode: PasscodeAsker | null = null;
+let pendingAsk: Promise<string | null> | null = null;
+
+export function registerPasscodeAsker(fn: PasscodeAsker | null): void {
+  askForPasscode = fn;
+}
+
+async function requestPasscode(reason: string): Promise<string | null> {
+  if (!askForPasscode) return null;
+  /* Concurrent 401s share one dialog. The catalog can fire several admin
+     requests at once, and stacking a modal per request would make the user
+     type the same passcode three times to dismiss them. */
+  if (!pendingAsk) {
+    pendingAsk = askForPasscode({ reason }).finally(() => {
+      pendingAsk = null;
+    });
+  }
+  return pendingAsk;
+}
+
+async function detailOf(res: Response): Promise<string> {
+  // require_admin's 401 detail is written to be shown to a person verbatim,
+  // so prefer it over anything this file could invent. Cloned because the
+  // caller may still want to read the body.
+  try {
+    const body = await res.clone().json();
+    if (body && typeof body.detail === "string") return body.detail;
+  } catch {
+    /* not JSON — fall through to the generic wording */
+  }
+  return "This action needs the admin passcode.";
+}
+
 async function adminFetch(url: string, init: RequestInit = {}): Promise<Response> {
   const send = (extra: Record<string, string>) =>
     fetch(url, {
@@ -47,9 +115,7 @@ async function adminFetch(url: string, init: RequestInit = {}): Promise<Response
   let res = await send(adminHeaders());
   if (res.status === 401) {
     sessionStorage.removeItem(ADMIN_KEY);
-    const entered = window.prompt(
-      "This action needs the admin passcode.\nEnter it to continue:",
-    );
+    const entered = await requestPasscode(await detailOf(res));
     if (entered && entered.trim()) {
       sessionStorage.setItem(ADMIN_KEY, entered.trim());
       res = await send({ "X-Admin-Passcode": entered.trim() });
@@ -278,4 +344,53 @@ export async function pipelineProcessed(
 ): Promise<{ dataset_id: string; is_processed: boolean }> {
   const res = await fetch(`${BASE}/datasets/${datasetId}/pipeline/processed`);
   return unwrap<{ dataset_id: string; is_processed: boolean }>(res);
+}
+
+/* --- server settings ---------------------------------------------------- */
+
+export async function getConfig(): Promise<ServerConfig> {
+  // admin-gated like the writes: this is the only read that describes the
+  // lock rather than the data behind it
+  const res = await adminFetch(`${BASE}/config`);
+  return unwrap<ServerConfig>(res);
+}
+
+export async function putConfig(patch: ConfigPatch): Promise<ServerConfig> {
+  const res = await adminFetch(`${BASE}/config`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+  return unwrap<ServerConfig>(res);
+}
+
+export async function recalibrateCosts(): Promise<CalibrationInfo> {
+  const res = await adminFetch(`${BASE}/config/recalibrate`, { method: "POST" });
+  return unwrap<CalibrationInfo>(res);
+}
+
+/* --- permanent dataset deletion ----------------------------------------- */
+
+export async function deletionPreview(
+  datasetId: number,
+): Promise<DeletionPreview> {
+  const res = await fetch(`${BASE}/datasets/${datasetId}/deletion-preview`);
+  return unwrap<DeletionPreview>(res);
+}
+
+export async function deleteDatasetPermanently(
+  datasetId: number,
+  confirmName: string,
+): Promise<DeletionResult> {
+  /* The name goes in the query string, not a body: DELETE with a body is
+     under-specified and some proxies drop it. It is not a security control —
+     the admin gate already ran — it is the speed bump on the one irreversible
+     action in the app. */
+  const res = await adminFetch(
+    `${BASE}/datasets/${datasetId}/permanently?confirm_name=${encodeURIComponent(
+      confirmName,
+    )}`,
+    { method: "DELETE" },
+  );
+  return unwrap<DeletionResult>(res);
 }

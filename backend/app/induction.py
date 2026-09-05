@@ -86,7 +86,11 @@ DEDUP_MAX_SINGLE = 60
 DEDUP_SUB_BATCH = 40
 # Measured on the 599-respondent test dataset (2026-07): ~0.3 candidates
 # proposed per usable response, roughly flat across chunks. Used only by the
-# dry-run cost estimate.
+# dry-run cost estimate, and now only as the value of last resort —
+# `calibration.Calibration.candidates_per_response` re-derives it from this
+# install's own run_report.candidates_proposed, which on the production data
+# came out closer to 0.15. Kept as the seed for `calibration.BUILTIN` and as
+# the answer when a run has no history to learn from.
 EST_CANDIDATES_PER_RESPONSE = 0.30
 
 # Sentinel-non-answer logic lives in app.nonanswer (shared with ingest,
@@ -1730,46 +1734,79 @@ def print_diagnostics(taxonomy: dict, report: dict, usage_line: str) -> None:
 
 def plan_dry_run(rows: list[ResponseRow], meta: dict, chunk_size: int, seed: int,
                  price_in: float, price_out: float,
-                 dataset_description: str = "") -> dict:
+                 dataset_description: str = "", *,
+                 counter=None, cal=None) -> dict:
     """The dry-run plan as data: call counts, token estimates and cost.
 
     Split out from `estimate_dry_run` (which now just prints this) so the
     pipeline API can show a real plan before spending anything, instead of
-    scraping it back out of stdout. The chunking and prompt sizes here are the
-    actual ones the run will use; only the consolidation stages are modelled,
-    since their size depends on how many candidates MAP returns."""
+    scraping it back out of stdout.
+
+    Where each number comes from, because the mix is the point:
+
+    * **MAP input is counted, not guessed.** The chunking and the prompts are
+      the actual ones the run will send, and `tokens.TokenCounter` puts them
+      through Vertex's free countTokens. This is the half that genuinely varies
+      between corpora — response length is the whole story — so it is the half
+      worth measuring. Without credentials it degrades to characters/4 and says
+      so in `input_basis`.
+    * **Consolidation input is modelled**, as it always was: those prompts are
+      built from the candidates MAP returns, which do not exist yet. The one
+      change is that the candidates-per-response figure now comes from measured
+      history rather than from a constant fitted to one 599-response dataset.
+    * **Output is measured per chunk, for the whole run.** No output token can
+      be counted ahead of time by anyone, so this is calibrated from completed
+      runs' manifests. Note it covers MAP *and* consolidation output together —
+      it is total run output over total chunks — which is why nothing below
+      adds a separate consolidation output term. That is deliberate: the four
+      hand-fitted output constants it replaces (2500 per chunk, 1600 per assign
+      batch, 12 per surviving name, 500 per pass) were the least checkable
+      numbers in this file.
+    """
+    from . import tokens
+    if cal is None:
+        # local import: calibration -> summary -> induction is a cycle
+        from .calibration import active
+        cal = active()
+    if counter is None:
+        counter = tokens.TokenCounter()
+
     chunks = make_chunks(rows, chunk_size, seed)
-    est_in = est_out = 0
+
+    # The MAP system prompt depends only on the question and the dataset
+    # description, so it is byte-identical for every chunk — which is what
+    # lets the counter measure it once and reuse it.
+    map_system = ""
+    map_users: list[str] = []
     for chunk in chunks:
-        system, user, _ = build_map_prompts(meta["question_text"], chunk, dataset_description)
-        est_in += (len(system) + len(user)) // 4
-        est_out += 2500
+        system, user, _ = build_map_prompts(
+            meta["question_text"], chunk, dataset_description)
+        map_system = system
+        map_users.append(user)
+    map_in = counter.estimate(map_system, map_users)
+    est_in = map_in.tokens
+    est_out = round(len(chunks) * cal.induce_output_per_chunk)
 
     n_calls = {"map": len(chunks), "vocab": 0, "assign": 0, "dedup": 0, "cross": 0}
     if len(chunks) > 1:
-        n_cand = max(1, round(len(rows) * EST_CANDIDATES_PER_RESPONSE))
+        n_cand = max(1, round(len(rows) * cal.candidates_per_response))
         n_after_exact = max(1, round(n_cand * 0.95))
         n_calls["vocab"] = 1
         est_in += n_after_exact * 10 + 500
-        est_out += 500
         n_calls["assign"] = -(-n_after_exact // ASSIGN_BATCH_SIZE)
         est_in += n_calls["assign"] * (ASSIGN_BATCH_SIZE * 39 + 1000)
-        est_out += n_calls["assign"] * 1600
         # ~6 themes; per theme either one call or sub-batches + survivors round
         n_themes = 6
         per_theme = max(1, round(n_after_exact * 0.85 / n_themes))
         if per_theme <= DEDUP_MAX_SINGLE:
             n_calls["dedup"] = n_themes
             est_in += n_themes * (per_theme * 39 + 800)
-            est_out += n_themes * (per_theme * 12 + 300)
         else:
             sub = -(-per_theme // DEDUP_SUB_BATCH)
             n_calls["dedup"] = n_themes * (sub + 1)
             est_in += n_themes * (sub + 1) * (DEDUP_SUB_BATCH * 39 + 800)
-            est_out += n_themes * (sub + 1) * (DEDUP_SUB_BATCH * 12 + 300)
         n_calls["cross"] = 1
         est_in += round(n_after_exact * 0.35) * 45 + 800
-        est_out += 500
 
     cost = est_in / 1e6 * price_in + est_out / 1e6 * price_out
     return {
@@ -1784,25 +1821,42 @@ def plan_dry_run(rows: list[ResponseRow], meta: dict, chunk_size: int, seed: int
         "est_input_tokens": est_in,
         "est_output_tokens": est_out,
         "est_cost_usd": round(cost, 4),
+        # "counted" | "sampled" | "heuristic" — how the MAP input tokens above
+        # were arrived at. Travels to the UI so a chars/4 fallback is never
+        # shown as if it were a measurement.
+        "input_basis": map_in.basis,
+        "count_calls": map_in.calls,
     }
 
 
 def estimate_dry_run(rows: list[ResponseRow], meta: dict, chunk_size: int, seed: int,
                      price_in: float, price_out: float,
                      dataset_description: str = "") -> None:
-    """Print the plan `plan_dry_run` computes. Output format unchanged."""
+    """Print the plan `plan_dry_run` computes."""
+    from .calibration import active
+
+    cal = active()
     p = plan_dry_run(rows, meta, chunk_size, seed, price_in, price_out,
-                     dataset_description)
+                     dataset_description, cal=cal)
     n_calls, est_in, est_out = p["calls"], p["est_input_tokens"], p["est_output_tokens"]
-    print(f"DRY RUN — no API calls made, nothing written.")
+    basis = {
+        "counted": "every MAP prompt counted exactly",
+        "sampled": "MAP prompts counted on a sample",
+        "heuristic": "MAP prompts estimated at 4 chars/token — countTokens "
+                     "unavailable",
+    }.get(p["input_basis"], p["input_basis"])
+    print(f"DRY RUN — no billed API calls made, nothing written.")
     print(f"  responses: {p['responses_usable']} usable "
           f"({p['responses_sentinel_filtered']} sentinel non-answers filtered, "
           f"{p['responses_empty']} empty)")
     print(f"  plan: {n_calls['map']} map + {n_calls['vocab']} vocab + "
           f"{n_calls['assign']} assign + ~{n_calls['dedup']} dedup + "
           f"{n_calls['cross']} cross = ~{p['total_calls']} calls")
-    print(f"  est tokens: ~{est_in:,} in / ~{est_out:,} out "
-          f"(consolidation modeled at {EST_CANDIDATES_PER_RESPONSE} candidates/response)")
+    print(f"  est tokens: ~{est_in:,} in / ~{est_out:,} out")
+    print(f"    input:  {basis}; consolidation modelled at "
+          f"{cal.candidates_per_response} candidates/response ({cal.source})")
+    print(f"    output: {cal.induce_output_per_chunk:,.0f}/chunk, measured "
+          f"over completed runs ({cal.source})")
     print(f"  est cost at ${price_in}/M in, ${price_out}/M out: ~${p['est_cost_usd']:.3f}")
 
 

@@ -1,0 +1,112 @@
+/* The masked passcode dialog. Carries its own copy of the shared tokens
+   because it mounts at the app root rather than inside `.cat` — see the note
+   in PasscodeGate.tsx for why it cannot nest there. Values match catalog.css
+   exactly; a theme pass would swap all of them together. */
+
+.pg-backdrop {
+  --pg-surface: #ffffff;
+  --pg-surface-2: #f0f3f0;
+  --pg-ink: #1f2724;
+  --pg-ink-2: #5a6560;
+  --pg-ink-3: #8b958f;
+  --pg-accent: #1f6e68;
+  --pg-accent-ink: #14524d;
+  --pg-line: #e2e7e4;
+
+  position: fixed;
+  inset: 0;
+  /* above .cat-modal-backdrop (10): an action started from inside a modal can
+     trip the gate, and the passcode dialog has to land on top of it */
+  z-index: 20;
+  background: rgba(31, 39, 36, 0.45);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 12vh 16px 16px;
+  font-family: sans-serif;
+  font-size: 14.5px;
+  line-height: 1.5;
+  color: var(--pg-ink);
+}
+
+.pg-dialog {
+  background: var(--pg-surface);
+  border-radius: 8px;
+  box-shadow: 0 8px 28px rgba(31, 46, 43, 0.14);
+  width: min(400px, 100%);
+  padding: 20px 24px;
+}
+.pg-dialog h3 {
+  margin: 0 0 8px;
+  font-size: 17px;
+}
+
+.pg-reason {
+  margin: 0 0 14px;
+  font-size: 13.5px;
+  color: var(--pg-ink-2);
+}
+
+.pg-field {
+  display: block;
+}
+.pg-field > span {
+  display: block;
+  font-weight: 600;
+  font-size: 13px;
+  margin-bottom: 4px;
+}
+.pg-field input {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid var(--pg-line);
+  border-radius: 6px;
+  padding: 7px 10px;
+  font-size: 13.5px;
+  font-family: inherit;
+  color: var(--pg-ink);
+}
+.pg-field input:focus {
+  outline: 2px solid var(--pg-accent);
+  outline-offset: 1px;
+  border-color: var(--pg-accent);
+}
+
+.pg-hint {
+  color: var(--pg-ink-3);
+  font-size: 12px;
+  margin: 6px 0 0;
+}
+
+.pg-actions {
+  display: flex;
+  gap: 10px;
+  justify-content: flex-end;
+  margin-top: 16px;
+}
+.pg-btn {
+  background: var(--pg-surface);
+  border: 1px solid var(--pg-line);
+  border-radius: 6px;
+  padding: 7px 14px;
+  font-size: 13.5px;
+  font-family: inherit;
+  cursor: pointer;
+  color: var(--pg-ink);
+}
+.pg-btn:hover {
+  background: var(--pg-surface-2);
+}
+.pg-btn-primary {
+  background: var(--pg-accent);
+  color: #fff;
+  border: none;
+  font-weight: 600;
+}
+.pg-btn-primary:hover:not(:disabled) {
+  background: var(--pg-accent-ink);
+}
+.pg-btn-primary:disabled {
+  opacity: 0.5;
+  cursor: default;
+}

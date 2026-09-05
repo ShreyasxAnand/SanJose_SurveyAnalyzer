@@ -26,6 +26,8 @@ from google.auth import exceptions as gauth_exceptions
 from google.genai import errors as genai_errors
 from google.genai import types as genai_types
 
+from . import config
+
 # The SDK logs an "automatic function calling is not recommended" advisory on
 # every generate_content call. We never use function calling, and a labeling
 # run makes thousands of calls — that line would drown the job logs.
@@ -51,6 +53,10 @@ def _warn(message: str) -> None:
 
 # The workhorse for anything whose call count scales with the corpus —
 # induction MAP/ASSIGN/DEDUP and labeling. Hundreds to thousands of calls.
+#
+# This is the built-in FALLBACK, not the answer: `resolve_model()` consults
+# GEMINI_MODEL and then config.json's `models.default` first, so changing the
+# model is a settings edit, not a code change.
 DEFAULT_MODEL = "gemini-3.5-flash-lite"
 
 # The answer-writing (SYNTH) model. Kept as a separate constant because
@@ -62,8 +68,9 @@ DEFAULT_MODEL = "gemini-3.5-flash-lite"
 # it narrates the computed counts flash-lite sometimes drops — but it bills
 # thinking tokens at the output rate, ~8x the visible output (552 thoughts vs
 # 69 answer tokens on an identical prompt), taking an ask from ~$0.011 to
-# ~$0.038 and ~6x longer. To try it again, set this to "gemini-3.6-flash" or
-# pass --synth-model / GEMINI_SYNTH_MODEL; nothing else needs to change.
+# ~$0.038 and ~6x longer. To try it again, set `models.synth` in config.json
+# from the Settings screen (or pass --synth-model / GEMINI_SYNTH_MODEL);
+# nothing else needs to change, and the price for it is configurable too.
 DEFAULT_SYNTH_MODEL = DEFAULT_MODEL
 
 # Published USD per 1M tokens, (input, output), checked against the Vertex AI
@@ -72,54 +79,69 @@ DEFAULT_SYNTH_MODEL = DEFAULT_MODEL
 # model absent from this table prices to None rather than to a guess: an
 # unpriced run reports tokens and says the cost is unknown, which is
 # recoverable; a confidently wrong dollar figure is not.
+#
+# These are the built-in rates. config.json's `prices_per_mtok` is merged over
+# them by `prices_per_mtok()`, so a published price change is a settings edit —
+# and a model this table has never heard of becomes priceable by adding it
+# there rather than by editing code.
 PRICES_PER_MTOK: dict[str, tuple[float, float]] = {
     "gemini-3.5-flash-lite": (0.30, 2.50),
     "gemini-3.6-flash": (1.50, 7.50),
 }
 
 
+def prices_per_mtok() -> dict[str, tuple[float, float]]:
+    """The effective price table: built-ins with config.json layered on top."""
+    merged = dict(PRICES_PER_MTOK)
+    merged.update(config.price_overrides())
+    return merged
+
+
 def price_usd(model_id: str, input_tokens: int, output_tokens: int) -> float | None:
-    rate = PRICES_PER_MTOK.get(model_id)
+    rate = prices_per_mtok().get(model_id)
     if rate is None:
         return None
     return input_tokens / 1_000_000 * rate[0] + output_tokens / 1_000_000 * rate[1]
 
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+def resolve_prices(model_id: str, price_in: float | None = None,
+                   price_out: float | None = None) -> tuple[float, float]:
+    """The $/MTok pair to bill a run at: explicit flags first, then the
+    configured rate for this model, then zero.
+
+    Every CLI script used to hardcode 0.30/2.50 as its argparse default — a
+    hand-copy of one row of the price table that was silently wrong the moment
+    `--model` pointed somewhere else, and that no longer tracked config.json at
+    all. Resolving here means the rate a manifest records is the rate the
+    Settings screen shows.
+
+    Zero for an unknown model is deliberate: a run on an unpriced model should
+    record $0.00 and be visibly unpriced, not carry a plausible figure invented
+    from a different model's rate.
+    """
+    rate = prices_per_mtok().get(model_id)
+    fallback_in, fallback_out = rate if rate else (0.0, 0.0)
+    return (fallback_in if price_in is None else price_in,
+            fallback_out if price_out is None else price_out)
 
 
-def load_dotenv(path: Path | None = None) -> dict[str, str]:
-    """Read the repo-root .env into a dict. Deliberately does NOT write to
-    os.environ — callers use it as a fallback, so a real environment variable
-    always wins over the file.
+def resolve_model(explicit: str | None = None) -> str:
+    """The workhorse model id: explicit argument, then GEMINI_MODEL, then
+    config.json's `models.default`, then the built-in default."""
+    if explicit and explicit.strip():
+        return explicit.strip()
+    return config.configured_model("default", "GEMINI_MODEL", DEFAULT_MODEL)
 
-    Kept dependency-free to match the rest of this module. Handles `KEY=value`,
-    an optional `export ` prefix, `#` comments, and surrounding quotes. Reads as
-    utf-8-sig because editors and PowerShell's `Out-File` on this platform write
-    a BOM, which would otherwise corrupt the first key's name. Unparseable
-    lines are skipped rather than raising — a malformed .env should not crash
-    a run that has real environment variables set."""
-    env_path = path or REPO_ROOT / ".env"
-    values: dict[str, str] = {}
-    try:
-        text = env_path.read_text(encoding="utf-8-sig")
-    except (OSError, UnicodeDecodeError):
-        return values
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("export "):
-            line = line[len("export "):].lstrip()
-        key, sep, val = line.partition("=")
-        if not sep:
-            continue
-        key, val = key.strip(), val.strip()
-        if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
-            val = val[1:-1]
-        if key:
-            values[key] = val
-    return values
+
+def resolve_synth_model(explicit: str | None = None) -> str:
+    """The answer-writing model id: explicit argument, then
+    GEMINI_SYNTH_MODEL, then config.json's `models.synth`, then whatever the
+    workhorse resolves to — so setting one model in the Settings screen moves
+    both stages, which is what someone changing "the model" means."""
+    if explicit and explicit.strip():
+        return explicit.strip()
+    return config.configured_model(
+        "synth", "GEMINI_SYNTH_MODEL", resolve_model())
 
 
 def _adc_quota_project() -> str | None:
@@ -139,36 +161,38 @@ def _adc_quota_project() -> str | None:
 
 
 def resolve_project(explicit: str | None = None) -> str | None:
-    """Explicit argument, then environment, then .env, then the ADC file's
-    quota project."""
-    for candidate in (explicit, os.environ.get("GOOGLE_CLOUD_PROJECT")):
-        if candidate and candidate.strip():
-            return candidate.strip()
-    candidate = load_dotenv().get("GOOGLE_CLOUD_PROJECT")
-    if candidate and candidate.strip():
-        return candidate.strip()
+    """Explicit argument, then GOOGLE_CLOUD_PROJECT, then config.json's
+    `vertex.project`, then the ADC file's quota project.
+
+    The ADC fallback is last and is what makes the setting optional: after
+    `gcloud auth application-default login` the right project is already
+    recorded on the machine, so most installs configure nothing here.
+    """
+    if explicit and explicit.strip():
+        return explicit.strip()
+    configured = config.configured_vertex("project", "GOOGLE_CLOUD_PROJECT")
+    if configured:
+        return configured
     return _adc_quota_project()
 
 
 def resolve_location(explicit: str | None = None) -> str:
-    """Explicit argument, then environment, then .env, then the global
-    endpoint — the right default for Gemini on Vertex when nobody has a
-    data-residency reason to pin a region."""
-    for candidate in (explicit, os.environ.get("GOOGLE_CLOUD_LOCATION")):
-        if candidate and candidate.strip():
-            return candidate.strip()
-    candidate = load_dotenv().get("GOOGLE_CLOUD_LOCATION")
-    if candidate and candidate.strip():
-        return candidate.strip()
-    return "global"
+    """Explicit argument, then GOOGLE_CLOUD_LOCATION, then config.json's
+    `vertex.location`, then the global endpoint — the right default for Gemini
+    on Vertex when nobody has a data-residency reason to pin a region."""
+    if explicit and explicit.strip():
+        return explicit.strip()
+    return config.configured_vertex(
+        "location", "GOOGLE_CLOUD_LOCATION") or "global"
 
 
 _ADC_HELP = (
     "Google credentials not found or not usable. Run `gcloud auth "
     "application-default login` on this machine (or attach a service "
-    "account with Vertex AI access in production), and set "
-    "GOOGLE_CLOUD_PROJECT in the environment or the repo-root .env if the "
-    "project cannot be inferred."
+    "account with Vertex AI access in production). If the project cannot be "
+    "inferred from those credentials, set it on the Settings screen (stored "
+    "as `vertex.project` in config.json) or as GOOGLE_CLOUD_PROJECT in the "
+    "environment."
 )
 
 
@@ -218,10 +242,10 @@ class GeminiClient:
 
     No API key exists anywhere in this path: google.auth discovers the
     credentials (gcloud ADC locally, the attached service account in
-    production). The project comes from GOOGLE_CLOUD_PROJECT (environment or
-    .env) or the ADC file's quota project; the location from
-    GOOGLE_CLOUD_LOCATION, defaulting to the global endpoint. Model id is a
-    plain string so new releases need no code change.
+    production). The project comes from GOOGLE_CLOUD_PROJECT, config.json's
+    `vertex.project`, or the ADC file's quota project; the location from the
+    same two settings, defaulting to the global endpoint. Model id is a plain
+    string so new releases need no code change.
     """
 
     def __init__(
@@ -239,8 +263,9 @@ class GeminiClient:
     ) -> None:
         # Pinned to a concrete version, not a "-latest" alias: the manifest
         # records model_id so a run can be reproduced, which an alias silently
-        # breaks when it moves. Override per-run with --model or GEMINI_MODEL.
-        self.model_id = model or os.environ.get("GEMINI_MODEL", DEFAULT_MODEL)
+        # breaks when it moves. Override per-run with --model, GEMINI_MODEL, or
+        # config.json's models.default (in that order of precedence).
+        self.model_id = resolve_model(model)
         self.project = resolve_project(project)
         self.location = resolve_location(location)
         if not self.project:

@@ -19,7 +19,7 @@ import os
 from fastapi import APIRouter, HTTPException
 
 from . import ask_service, induction
-from .llm import DEFAULT_SYNTH_MODEL, GeminiClient
+from .llm import DEFAULT_SYNTH_MODEL, GeminiClient, resolve_synth_model  # noqa: F401
 from . import ask_cache
 from .schemas import (
     AskAnswerRequest,
@@ -120,10 +120,10 @@ def _client() -> GeminiClient:
 def _synth_client() -> GeminiClient:
     """The answer-writing model — one call per question, so it runs on the
     stronger model while routing and the corpus-scale stages stay on the
-    workhorse. Override with GEMINI_SYNTH_MODEL."""
+    workhorse. Override with GEMINI_SYNTH_MODEL or config.json's
+    `models.synth`."""
     try:
-        return GeminiClient(model=os.environ.get("GEMINI_SYNTH_MODEL",
-                                                 DEFAULT_SYNTH_MODEL))
+        return GeminiClient(model=resolve_synth_model())
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
 

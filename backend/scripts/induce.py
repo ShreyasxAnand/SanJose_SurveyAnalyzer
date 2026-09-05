@@ -8,8 +8,8 @@ From backend/, inside the surveyanalyzer conda env:
 
 Needs Google Application Default Credentials for real runs — run
 `gcloud auth application-default login` once on this machine. The project
-comes from GOOGLE_CLOUD_PROJECT (environment or the gitignored repo-root
-.env) or the ADC file's quota project.
+comes from GOOGLE_CLOUD_PROJECT, config.json's `vertex.project`, or the ADC
+file's quota project.
 Output: data/taxonomy/{dataset_id}/{question_id}/{run_id}/
         candidate_taxonomy.json  <- hand-editable; labeling uses the latest
                                     run as-is, edits are optional
@@ -23,7 +23,7 @@ import time
 from collections import Counter
 from pathlib import Path
 
-from app import induction
+from app import induction, llm
 from app.llm import GeminiClient
 
 
@@ -49,9 +49,17 @@ def main() -> None:
     ap.add_argument("--resume", metavar="RUN_DIR",
                     help="resume a run whose MAP phase completed: skip MAP, run "
                          "consolidation from RUN_DIR/candidates_checkpoint.json")
-    ap.add_argument("--price-in", type=float, default=0.30, help="$/MTok input, for cost reporting only")
-    ap.add_argument("--price-out", type=float, default=2.50, help="$/MTok output, for cost reporting only")
+    ap.add_argument("--price-in", type=float, default=None,
+                    help="$/MTok input; default: the configured rate for the model")
+    ap.add_argument("--price-out", type=float, default=None,
+                    help="$/MTok output; default: the configured rate for the model")
     args = ap.parse_args()
+    # $/MTok: the flags when given, otherwise the configured rate for the
+    # model this run will actually use. Every script used to default these
+    # to a hand-copied 0.30/2.50, which was silently wrong the moment
+    # --model pointed elsewhere and never tracked config.json at all.
+    args.price_in, args.price_out = llm.resolve_prices(
+        llm.resolve_model(args.model), args.price_in, args.price_out)
 
     parquet = induction.discover_parquet(args.parquet)
     print(f"parquet: {parquet}")

@@ -3,8 +3,15 @@ __pycache__/
 *.pyc
 .venv/
 *.egg-info/
+# No longer read by the app (settings live in config.json) — still ignored so
+# a leftover copy from an older checkout, which may hold an old passcode or
+# API key, can never be committed.
 *.env
-.env 
+.env
+
+# Server settings — holds the admin passcode and this install's measured cost
+# calibration. config.example.json is the checked-in template.
+/config.json
 
 # Local-first data (uploads, exports, sqlite db) — never commit survey data
 /data/

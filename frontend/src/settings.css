@@ -1,0 +1,179 @@
+/* Settings screen. Rendered inside `.cat`, so it inherits that block's
+   --cat-* tokens, its type scale, and its centred break-out column — the
+   tokens live on `.cat`, not `:root`, so anything outside it renders
+   unstyled. `.set` only narrows the column: a form reads badly at 1100px. */
+
+.set {
+  width: min(720px, calc(100vw - 3rem));
+}
+
+.set-path {
+  font-size: 12px;
+  color: var(--cat-ink-3);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.set-section {
+  border-top: 1px solid var(--cat-line);
+  padding: 18px 0 4px;
+}
+.set-section:first-of-type {
+  border-top: none;
+}
+.set-section h3 {
+  margin: 0 0 6px;
+  font-size: 15px;
+}
+
+/* two fields side by side, stacking rather than squeezing on narrow screens */
+.set-row {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+.set-row > .cat-field {
+  flex: 1 1 260px;
+  margin-bottom: 8px;
+}
+
+.set-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 10px 0;
+  font-size: 13.5px;
+}
+.set-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+}
+.set-dot-on {
+  background: var(--cat-accent);
+}
+/* amber, not red: "no passcode set" is the app's zero-configuration default,
+   not a failure — the palette reserves alarm for the delete dialog */
+.set-dot-off {
+  background: var(--cat-amber-ink);
+}
+
+.set-warn {
+  background: var(--cat-amber-bg);
+  border: 1px solid var(--cat-amber-line);
+  color: var(--cat-amber-ink);
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-size: 13px;
+  margin: 0 0 16px;
+}
+
+.set-danger-note {
+  color: var(--cat-danger-ink);
+  font-size: 13px;
+  margin: 6px 0;
+}
+
+/* a button that reads as a link — used for the low-frequency, low-weight
+   actions (add a row, remove a row, switch to the destructive branch) */
+.set-linkish {
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: 12.5px;
+  font-family: inherit;
+  color: var(--cat-accent-ink);
+  cursor: pointer;
+  text-decoration: underline;
+}
+.set-linkish:hover {
+  color: var(--cat-ink);
+}
+
+.set-prices {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 10px 0 8px;
+  font-size: 13px;
+}
+.set-prices th {
+  text-align: left;
+  font-size: 10.5px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--cat-ink-3);
+  font-weight: 600;
+  padding: 0 8px 6px 0;
+}
+.set-prices td {
+  padding: 4px 8px 4px 0;
+  vertical-align: top;
+}
+.set-prices input {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid var(--cat-line);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: 13px;
+  font-family: inherit;
+  color: var(--cat-ink);
+}
+.set-prices input[type="number"] {
+  /* wide enough for "1234.56" without the spinner clipping the last digit */
+  min-width: 92px;
+}
+.set-per-token {
+  display: block;
+  font-size: 11px;
+  color: var(--cat-ink-3);
+  margin-top: 2px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.set-rates {
+  margin: 10px 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 10px 20px;
+}
+.set-rates > div {
+  background: var(--cat-surface-2);
+  border-radius: 6px;
+  padding: 8px 10px;
+}
+.set-rates dt {
+  font-size: 10.5px;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--cat-ink-3);
+  font-weight: 600;
+}
+.set-rates dd {
+  margin: 3px 0 0;
+  font-size: 13.5px;
+  color: var(--cat-ink);
+}
+
+.set-inline-hint {
+  display: inline;
+  margin-left: 10px;
+}
+
+.set-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  border-top: 1px solid var(--cat-line);
+  padding-top: 16px;
+  margin-top: 18px;
+}
+.set-saved {
+  font-size: 13px;
+  color: var(--cat-accent-ink);
+}
+
+.set-locked {
+  max-width: 360px;
+}

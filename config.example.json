@@ -1,0 +1,75 @@
+{
+  "_comment": [
+    "Copy this file to config.json (same directory) and edit it, or edit it",
+    "from the app's Settings screen. config.json is gitignored because it",
+    "holds the admin passcode.",
+    "",
+    "Precedence for every setting: environment variable > config.json > the",
+    "built-in default. Nothing needs a restart — the file is re-read when its",
+    "timestamp changes.",
+    "",
+    "Delete any key you do not want to override; an absent key means 'use the",
+    "built-in default', which is not the same as null or an empty string."
+  ],
+
+  "_comment_admin_passcode": [
+    "Gates every dataset-changing endpoint: upload, append, column selection,",
+    "metadata edits, export, pipeline runs, and dataset deletion. Reading and",
+    "asking stay open either way. Set it to null or remove the key to turn the",
+    "gate off entirely (the right setting for a single-user desktop install).",
+    "Also readable from the ADMIN_PASSCODE environment variable."
+  ],
+  "admin_passcode": null,
+
+  "_comment_vertex": [
+    "Which Vertex AI project and region the model calls bill to. Both are",
+    "optional and usually absent: the project falls back to the one recorded",
+    "by `gcloud auth application-default login`, and the region to the global",
+    "endpoint. Set them for a second project or for data residency.",
+    "Also readable from GOOGLE_CLOUD_PROJECT / GOOGLE_CLOUD_LOCATION."
+  ],
+  "vertex": {
+    "project": null,
+    "location": null
+  },
+
+  "_comment_models": [
+    "'default' is the workhorse: induction, labeling, sub-themes, routing —",
+    "every stage whose call count scales with the corpus, so hundreds to",
+    "thousands of calls per run. 'synth' writes the answer text, one call per",
+    "analyst question, and is the one place a pricier model is affordable.",
+    "Leave 'synth' out and it follows 'default'.",
+    "",
+    "Any model id the Vertex AI endpoint accepts works here. Add a matching",
+    "prices_per_mtok entry for it or runs on it will report as unpriced."
+  ],
+  "models": {
+    "default": "gemini-3.5-flash-lite",
+    "synth": "gemini-3.5-flash-lite"
+  },
+
+  "_comment_prices_per_mtok": [
+    "USD per 1,000,000 tokens, as published on the Vertex AI pricing page.",
+    "These are merged over the built-in table, so listing a model here",
+    "re-prices it and listing an unknown one makes it priceable.",
+    "",
+    "The output rate is charged on thinking tokens too — the app folds them",
+    "into output_tokens for exactly that reason, so there is no separate",
+    "thinking rate to set here.",
+    "",
+    "Per-token rather than per-1M is available in the Settings screen, which",
+    "shows both; the file always stores per-1M to match the pricing page."
+  ],
+  "prices_per_mtok": {
+    "gemini-3.5-flash-lite": { "input": 0.30, "output": 2.50 },
+    "gemini-3.6-flash": { "input": 1.50, "output": 7.50 }
+  },
+
+  "_comment_cost_calibration": [
+    "Written by the app, not by hand: 'Recalibrate' on the Settings screen",
+    "measures token-per-response rates from this install's own completed run",
+    "manifests and stores them here, so the pre-run estimate is fitted to your",
+    "corpus instead of to the author's. Delete the key to fall back to the",
+    "built-in measured rates. See backend/app/calibration.py."
+  ]
+}

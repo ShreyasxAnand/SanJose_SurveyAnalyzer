@@ -436,12 +436,21 @@ export interface PipelineEstimateItem {
   question_text: string;
   detail: string;
   responses: number;
+  est_input_tokens: number;
+  est_output_tokens: number;
   est_cost_usd: number;
   // "planned"  = from the real chunking and prompt sizes the run will use
   // "projected" = extrapolated from a measured rate, because the real dry-run
   //               needs an artifact that doesn't exist yet
   // The UI must keep these visually distinct.
   basis: string;
+  // One level finer than `basis`, describing the input tokens specifically:
+  // "counted"   — every prompt measured with Vertex's countTokens
+  // "sampled"   — measured prompts scaled by a measured tokens-per-character
+  //               ratio (what a large dataset gets, within the call budget)
+  // "heuristic" — 4 characters per token; countTokens was unavailable
+  // "projected" — no prompts existed to measure; a calibrated per-response rate
+  input_basis: string;
 }
 
 export interface PipelineEstimate {
@@ -456,6 +465,26 @@ export interface PipelineEstimate {
   n_new_responses: number;
   items: PipelineEstimateItem[];
   est_total_usd: number;
+  // The 10th-90th percentile band around the total, from the spread of
+  // per-run rates in the manifests the rates were measured from. Shown as a
+  // range because one figure implies a precision no estimate has.
+  est_low_usd: number;
+  est_high_usd: number;
+  est_input_tokens: number;
+  est_output_tokens: number;
+  // the model these figures are priced for; `priced` is false when no rate is
+  // configured for it, in which case the tokens are known and the dollars are
+  // not — and $0.00 must not be shown as though it meant free
+  model_id: string;
+  priced: boolean;
+  // "measured" once this install has recalibrated from its own runs,
+  // "builtin" until then
+  calibration_source: string;
+  calibration_measured_utc: string;
+  // free countTokens round-trips this estimate spent, and how many rows came
+  // back measured rather than extrapolated
+  count_calls: number;
+  stages_counted: number;
   questions_with_existing_taxonomy: string[];
 }
 
@@ -480,4 +509,105 @@ export interface PipelineJob {
   // summed from each stage's own run manifest — real spend, not the estimate
   cost_usd: number;
   is_processed: boolean;
+}
+
+/* --- server settings (config.json) ------------------------------------- */
+
+export interface ModelPrice {
+  model_id: string;
+  // USD per 1,000,000 tokens, the units the Vertex pricing page publishes.
+  // The Settings screen also shows the per-token figure, which is what people
+  // ask for and what nobody can read at 0.0000003.
+  input_per_mtok: number;
+  output_per_mtok: number;
+  // true when this rate comes from config.json rather than the built-in table
+  overridden: boolean;
+}
+
+export interface CalibrationInfo {
+  source: string; // "measured" | "builtin"
+  measured_utc: string;
+  // runs behind each stage's figure: a rate from two runs deserves less
+  // confidence than one from twenty, and only this says which it is
+  sample: Record<string, number>;
+  label_input_tokens_per_response: number;
+  label_output_tokens_per_response: number;
+  induce_output_tokens_per_chunk: number;
+  candidates_per_response: number;
+  spread_low: number;
+  spread_high: number;
+}
+
+export interface ServerConfig {
+  // the passcode itself is never sent to the browser — only whether one is
+  // set and which source won
+  admin_passcode_set: boolean;
+  admin_passcode_source: string; // "config" | "env" | ""
+  default_model: string;
+  synth_model: string;
+  // what is CONFIGURED (null when nothing is) vs what a run will actually
+  // use once the ADC / global-endpoint fallbacks apply. The screen prefills
+  // from the first and shows the second as a placeholder, so a plain Save
+  // cannot silently pin an ADC-derived project into the file.
+  vertex_project: string | null;
+  vertex_project_effective: string | null;
+  vertex_location: string | null;
+  vertex_location_effective: string;
+  prices: ModelPrice[];
+  calibration: CalibrationInfo;
+  config_path: string;
+  config_exists: boolean;
+  // environment variables outranking the file: saving here changes nothing
+  // for these until they are unset, which the screen has to say out loud
+  env_overrides: string[];
+}
+
+export interface ConfigPatch {
+  // omitted = leave unchanged; "" = clear the passcode and turn the gate off
+  admin_passcode?: string;
+  default_model?: string;
+  synth_model?: string;
+  // same convention: "" clears the override and restores the fallback
+  vertex_project?: string;
+  vertex_location?: string;
+  prices?: { model_id: string; input_per_mtok: number; output_per_mtok: number }[];
+}
+
+/* --- permanent dataset deletion ----------------------------------------- */
+
+export interface DeletionPreviewRoot {
+  key: string;
+  label: string;
+  describes: string;
+  exists: boolean;
+  files: number;
+  bytes: number;
+  runs: number;
+  spent_usd: number;
+}
+
+export interface DeletionPreview {
+  dataset_id: number;
+  dataset_name: string;
+  status: string;
+  n_responses: number;
+  n_questions: number;
+  n_metadata_columns: number;
+  n_uploads: number;
+  roots: DeletionPreviewRoot[];
+  total_files: number;
+  total_bytes: number;
+  // model spend recorded in the manifests about to be deleted — the number
+  // that makes someone stop and read the rest of the dialog
+  total_spent_usd: number;
+  blocked_by_running_job: boolean;
+}
+
+export interface DeletionResult {
+  dataset_id: number;
+  dataset_name: string;
+  deleted: boolean;
+  // expected to be empty; anything here survived the delete and needs
+  // clearing by hand before the id is reused by a future upload
+  undeleted_roots: { key: string; error: string }[];
 }

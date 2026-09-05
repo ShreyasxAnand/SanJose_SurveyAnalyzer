@@ -16,7 +16,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app import dates as dates_module
-from app import rowhash
+from app import purge, rowhash
 from app.auth import require_admin
 from app.db import DATA_DIR, EXPORTS_DIR, UPLOADS_DIR, get_db
 from app.models import (
@@ -39,12 +39,16 @@ from app.schemas import (
     DatasetMatch,
     DatasetMetadataPatch,
     DatasetOut,
+    DeletionPreview,
+    DeletionPreviewRoot,
+    DeletionResult,
     DuplicateCheck,
     ExportInfo,
     MetadataColumnOut,
     MetadataValueCount,
     QuestionColumnOut,
     SelectColumnsRequest,
+    UndeletedRoot,
     UploadHistoryEntry,
     UploadResponse,
 )
@@ -978,21 +982,135 @@ async def upload_dataset(file: UploadFile, db: Session = Depends(get_db)):
 @router.delete("/{dataset_id}", status_code=204,
                dependencies=[Depends(require_admin)])
 def discard_dataset(dataset_id: int, db: Session = Depends(get_db)):
-    """Discard a provisional upload. Only allowed before column selection —
-    an ingested dataset has derived artifacts (taxonomies, labels, answers)
-    and deleting it from a button would orphan them silently."""
+    """Discard a provisional upload. Only allowed before column selection.
+
+    An ingested dataset has derived artifacts (taxonomies, labels, answers)
+    and deleting it from THIS endpoint would orphan them silently — which is
+    why permanent deletion is a separate, explicitly-named endpoint that
+    clears all of them. This one stays narrow on purpose: the frontend fires
+    it from `pagehide` when a tab closes mid-upload, and an abandoned-tab
+    handler must not be able to destroy processed work.
+    """
     dataset = _get_dataset_or_404(db, dataset_id)
     if dataset.status != "uploaded":
         raise HTTPException(
             status_code=409,
             detail=f"Dataset {dataset_id} is '{dataset.status}' — only provisional "
-            "(status 'uploaded') datasets can be discarded.",
+            "(status 'uploaded') datasets can be discarded. To remove an "
+            "ingested dataset and everything derived from it, use "
+            f"DELETE /datasets/{dataset_id}/permanently.",
         )
     db.delete(dataset)
     db.commit()
     upload_dir = UPLOADS_DIR / str(dataset_id)
     if upload_dir.exists():
         shutil.rmtree(upload_dir, ignore_errors=True)
+
+
+@router.get("/{dataset_id}/deletion-preview", response_model=DeletionPreview)
+def deletion_preview(dataset_id: int, db: Session = Depends(get_db)):
+    """Exactly what deleting this dataset would destroy. Reads only.
+
+    The confirm dialog is built from this rather than from guesses, because
+    the numbers are the whole argument: rows and questions read as data you
+    could re-upload, while recorded model spend reads as money already gone.
+    """
+    dataset = _get_dataset_or_404(db, dataset_id)
+    files = purge.preview(dataset.id)
+    n_responses = (
+        db.query(func.count(Response.id))
+        .filter(Response.dataset_id == dataset.id)
+        .scalar() or 0
+    )
+    n_uploads = (
+        db.query(func.count(Upload.id))
+        .filter(Upload.dataset_id == dataset.id)
+        .scalar() or 0
+    )
+    job = purge.running_job(dataset.id)
+    return DeletionPreview(
+        dataset_id=dataset.id,
+        dataset_name=dataset.name,
+        status=dataset.status,
+        n_responses=int(n_responses),
+        n_questions=len(dataset.questions),
+        n_metadata_columns=len(dataset.metadata_columns),
+        n_uploads=int(n_uploads),
+        roots=[
+            DeletionPreviewRoot(**vars(root))
+            for root in files.roots if root.exists
+        ],
+        total_files=files.total_files,
+        total_bytes=files.total_bytes,
+        total_spent_usd=round(files.total_spent_usd, 4),
+        blocked_by_running_job=job is not None,
+    )
+
+
+@router.delete("/{dataset_id}/permanently", response_model=DeletionResult,
+               dependencies=[Depends(require_admin)])
+def delete_dataset_permanently(
+    dataset_id: int, confirm_name: str = "", db: Session = Depends(get_db)
+):
+    """Delete a dataset and every artifact derived from it. Irreversible.
+
+    `confirm_name` must equal the dataset's name. It is not security — the
+    caller already passed the admin gate — it is a speed bump on the one
+    action in this app that cannot be undone, and it makes an accidental
+    DELETE with the wrong id a 400 instead of a catastrophe.
+
+    Order matters. The database rows go first, in child-first bulk statements
+    rather than by ORM cascade: cascading a 30k-response dataset means loading
+    every child row into the identity map and issuing one DELETE per row, and
+    the request would still be running minutes later. Files go second, so a
+    failure to unlink something leaves recoverable orphans rather than rows
+    pointing at data that is already gone. Caches go last, once there is
+    nothing left for them to be repopulated from.
+    """
+    dataset = _get_dataset_or_404(db, dataset_id)
+
+    if confirm_name.strip() != dataset.name.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="The confirmation name does not match this dataset's name "
+            f"('{dataset.name}'). Nothing was deleted.",
+        )
+
+    # Deleting a tree a pipeline subprocess is mid-write in is how you get a
+    # half-removed run that still looks loadable. Same refusal as append.
+    job = purge.running_job(dataset.id)
+    if job is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"A pipeline job is running for dataset {dataset.id} "
+            f"(job {job.job_id}) — cancel it or wait for it to finish before "
+            "deleting. Nothing was deleted.",
+        )
+
+    name = dataset.name
+    for model in (Response, RespondentAttribute, ColumnFingerprint, RowHash,
+                  QuestionColumn, MetadataColumn, Upload):
+        db.query(model).filter(model.dataset_id == dataset.id).delete(
+            synchronize_session=False)
+    db.delete(dataset)
+    db.commit()
+
+    failures = purge.purge_files(dataset_id)
+    purge.forget_in_memory(dataset_id)
+
+    return DeletionResult(
+        dataset_id=dataset_id,
+        dataset_name=name,
+        deleted=True,
+        # An empty list is the whole point of reporting this: a dataset id is
+        # reused by the next upload, so anything left behind would later be
+        # adopted by unrelated data. Say which roots survived so it can be
+        # cleaned up by hand.
+        undeleted_roots=[
+            UndeletedRoot(key=key, error=error)
+            for key, error in sorted(failures.items())
+        ],
+    )
 
 
 @router.post("/{dataset_id}/append", response_model=AppendResponse,

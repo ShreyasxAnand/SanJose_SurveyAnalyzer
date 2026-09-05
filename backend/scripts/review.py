@@ -25,7 +25,7 @@ import sys
 import time
 from pathlib import Path
 
-from app import induction, labeling, review
+from app import induction, labeling, llm, review
 
 REVIEW_DIR = induction.DATA_DIR / "review"
 LABELS_DIR = induction.DATA_DIR / "labels"
@@ -174,9 +174,15 @@ def main() -> None:
     ap.add_argument("--model", default=None)
     ap.add_argument("--description", default=None,
                     help="default: the export manifest's dataset_description")
-    ap.add_argument("--price-in", type=float, default=0.30)
-    ap.add_argument("--price-out", type=float, default=2.50)
+    ap.add_argument("--price-in", type=float, default=None)
+    ap.add_argument("--price-out", type=float, default=None)
     args = ap.parse_args()
+    # $/MTok: the flags when given, otherwise the configured rate for the
+    # model this run will actually use. Every script used to default these
+    # to a hand-copied 0.30/2.50, which was silently wrong the moment
+    # --model pointed elsewhere and never tracked config.json at all.
+    args.price_in, args.price_out = llm.resolve_prices(
+        llm.resolve_model(args.model), args.price_in, args.price_out)
 
     args.description = induction.resolve_description(
         args.description, induction.discover_parquet(args.parquet))

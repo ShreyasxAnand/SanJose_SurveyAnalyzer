@@ -158,7 +158,7 @@ def main() -> int:
             print("  NOTE --host 0.0.0.0 exposes this to your network. No ADMIN_PASSCODE\n"
                   "       is set, so anyone who can reach the port can upload files, run\n"
                   "       billed pipeline jobs, read every dataset, and spend AI credit.\n"
-                  "       Set ADMIN_PASSCODE in the repo-root .env to gate the first two.\n",
+                  "       Set a passcode on the Settings screen to gate the first two.\n",
                   flush=True)
         else:
             print("  NOTE --host 0.0.0.0 exposes this to your network. ADMIN_PASSCODE is\n"

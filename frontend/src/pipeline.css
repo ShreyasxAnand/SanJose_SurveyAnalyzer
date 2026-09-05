@@ -115,3 +115,30 @@
 @media (prefers-reduced-motion: reduce) {
   .pl-st-running .pl-st-icon { animation: none; }
 }
+
+/* The finer-grained "how were these tokens obtained" tag, under the
+   planned/projected badge. Quieter than the badge on purpose: basis is the
+   load-bearing distinction, this is the audit detail behind it. */
+.pl-input-basis {
+  display: block;
+  font-size: 10px;
+  color: var(--pl-ink-3, #8b958f);
+  margin-top: 2px;
+  letter-spacing: 0.04em;
+}
+
+/* The band under the headline. A single figure implies a precision no
+   estimate has; this is the measured spread of the rates behind it. */
+.pl-band {
+  display: block;
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--pl-ink-3, #8b958f);
+  font-variant-numeric: tabular-nums;
+}
+
+.pl-unpriced {
+  color: var(--pl-amber-ink);
+  font-weight: 600;
+  font-size: 12px;
+}

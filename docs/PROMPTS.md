@@ -20,11 +20,11 @@ Braces appear as they do in source: `{{` / `}}` are literal braces surviving `.f
 | Stage | Prompt | Location |
 |---|---|---|
 | Stage 1 | `GROUP` | `backend/app/lexicon.py:61` |
-| Stage 2 | `MAP` | `backend/app/induction.py:147` |
-| Stage 2 | `VOCAB` | `backend/app/induction.py:195` |
-| Stage 2 | `ASSIGN_BATCH` | `backend/app/induction.py:224` |
-| Stage 2 | `DEDUP` | `backend/app/induction.py:254` |
-| Stage 2 | `CROSS` | `backend/app/induction.py:296` |
+| Stage 2 | `MAP` | `backend/app/induction.py:151` |
+| Stage 2 | `VOCAB` | `backend/app/induction.py:199` |
+| Stage 2 | `ASSIGN_BATCH` | `backend/app/induction.py:228` |
+| Stage 2 | `DEDUP` | `backend/app/induction.py:258` |
+| Stage 2 | `CROSS` | `backend/app/induction.py:300` |
 | Stage 3 | `LABEL` | `backend/app/labeling.py:35` |
 | Stage 4 | `SUBMAP` | `backend/app/subthemes.py:75` |
 | Stage 4 | `SUBLABEL` | `backend/app/subthemes.py:121` |
@@ -103,7 +103,7 @@ Five prompts: map → exact-name merge → sort → dedup → cross-theme. MAP r
 
 ### `MAP_SYSTEM` (system)
 
-`backend/app/induction.py:147`
+`backend/app/induction.py:151`
 
 ```
 {dataset_context}You are inducing a candidate coding taxonomy for one open-ended survey question.
@@ -151,7 +151,7 @@ Return ONLY valid JSON, exactly this shape:
 
 ### `MAP_USER` (user)
 
-`backend/app/induction.py:191`
+`backend/app/induction.py:195`
 
 ```
 Responses ({n} total):
@@ -160,7 +160,7 @@ Responses ({n} total):
 
 ### `VOCAB_SYSTEM` (system)
 
-`backend/app/induction.py:195`
+`backend/app/induction.py:199`
 
 ```
 {dataset_context}You are defining broad parent themes for candidate categories induced from one
@@ -189,7 +189,7 @@ Return ONLY valid JSON, exactly this shape:
 
 ### `VOCAB_USER` (user)
 
-`backend/app/induction.py:220`
+`backend/app/induction.py:224`
 
 ```
 Candidate category names ({n} total):
@@ -198,7 +198,7 @@ Candidate category names ({n} total):
 
 ### `ASSIGN_BATCH_SYSTEM` (system)
 
-`backend/app/induction.py:224`
+`backend/app/induction.py:228`
 
 ```
 {dataset_context}You are sorting candidate categories into a FIXED set of parent themes for one
@@ -228,7 +228,7 @@ Return ONLY valid JSON, exactly this shape:
 
 ### `ASSIGN_BATCH_USER` (user)
 
-`backend/app/induction.py:250`
+`backend/app/induction.py:254`
 
 ```
 Candidate categories ({n} total):
@@ -237,7 +237,7 @@ Candidate categories ({n} total):
 
 ### `DEDUP_SYSTEM` (system)
 
-`backend/app/induction.py:254`
+`backend/app/induction.py:258`
 
 ```
 {dataset_context}Several people each read a different sample of responses to the same survey
@@ -275,7 +275,7 @@ Return ONLY valid JSON, exactly this shape:
 
 ### `DEDUP_USER` (user)
 
-`backend/app/induction.py:288`
+`backend/app/induction.py:292`
 
 ```
 Categories under "{parent_name}" ({n} total):
@@ -284,7 +284,7 @@ Categories under "{parent_name}" ({n} total):
 
 ### `CROSS_SYSTEM` (system)
 
-`backend/app/induction.py:296`
+`backend/app/induction.py:300`
 
 ```
 {dataset_context}These categories have already been sorted into themes and deduplicated inside
@@ -313,7 +313,7 @@ Return ONLY valid JSON, exactly this shape:
 
 ### `CROSS_USER` (user)
 
-`backend/app/induction.py:321`
+`backend/app/induction.py:325`
 
 ```
 Surviving categories ({n} total):

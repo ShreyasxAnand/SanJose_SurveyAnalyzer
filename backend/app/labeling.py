@@ -372,6 +372,93 @@ def _label_one_batch(
     return bi, got, stats, None
 
 
+def dedupe_rows(rows: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """The `(key, text)` pairs a run will actually send, one per distinct text.
+
+    Factored out of `run_labeling` so the estimate and the run cannot disagree
+    about what gets batched. That disagreement was real: the CLI's old dry run
+    sampled its example prompt from the *raw* rows, so on any corpus with
+    repeated answers it measured a prompt the run never sends.
+    """
+    rep_of_text: dict[str, str] = {}
+    unique_rows: list[tuple[str, str]] = []
+    for k, t in rows:
+        if t not in rep_of_text:
+            rep_of_text[t] = k
+            unique_rows.append((k, t))
+    return unique_rows
+
+
+def make_batches(unique_rows: list[tuple[str, str]],
+                 batch_size: int) -> list[list[tuple[str, str]]]:
+    """Fixed-size slices of the deduped rows — one model call each. Unlike
+    induction's near-equal chunking, every batch but the last is exactly
+    `batch_size` long."""
+    return [unique_rows[i: i + batch_size]
+            for i in range(0, len(unique_rows), batch_size)]
+
+
+def plan_labeling(rows: list[tuple[str, str]], taxonomy: dict | None = None,
+                  batch_size: int = DEFAULT_BATCH_SIZE,
+                  dataset_description: str = "", *,
+                  counter=None, cal=None) -> dict:
+    """Token and call plan for a labeling run, without making one.
+
+    Two accuracy levels, and the caller is told which it got:
+
+    * **With a taxonomy** the real prompts are built — same dedupe, same
+      batching, same system prompt — and counted with Vertex's free
+      countTokens. `input_basis` is "counted" or "sampled".
+    * **Without one** (a fresh dataset, where the taxonomy is induced by the
+      stage before this one) there is no system prompt to build, so input falls
+      back to a measured tokens-per-unique-response rate. `input_basis` is
+      "projected".
+
+    Output tokens are always a measured rate: no one can count an output
+    ahead of time. Both rates come from `calibration`, so they are this
+    install's own numbers once it has run anything at production scale.
+    """
+    from . import tokens
+    if cal is None:
+        from .calibration import active
+        cal = active()
+    if counter is None:
+        counter = tokens.TokenCounter()
+
+    unique_rows = dedupe_rows(rows)
+    batches = make_batches(unique_rows, max(1, batch_size))
+    n_unique = len(unique_rows)
+
+    if taxonomy is not None and taxonomy.get("labels"):
+        # The system prompt renders the taxonomy and the dataset description,
+        # neither of which varies by batch — identical bytes every call.
+        system = ""
+        users: list[str] = []
+        for batch in batches:
+            system, user = build_label_prompts(
+                taxonomy, batch, dataset_description)
+            users.append(user)
+        measured = counter.estimate(system, users)
+        est_in, input_basis = measured.tokens, measured.basis
+        count_calls = measured.calls
+    else:
+        est_in = round(n_unique * cal.label_input_per_unique)
+        input_basis, count_calls = "projected", 0
+
+    return {
+        "n_responses": len(rows),
+        "n_unique": n_unique,
+        "n_batches": len(batches),
+        # one call per batch in the happy path; a batch that returns
+        # unparseable JSON costs one more, which is not planned for here
+        "total_calls": len(batches),
+        "est_input_tokens": est_in,
+        "est_output_tokens": round(n_unique * cal.label_output_per_unique),
+        "input_basis": input_basis,
+        "count_calls": count_calls,
+    }
+
+
 def run_labeling(
     rows: list[tuple[str, str]],
     taxonomy: dict,
@@ -391,14 +478,8 @@ def run_labeling(
     while making duplicate rows coded identically by construction. The
     collapse count is disclosed in the report."""
     valid_ids = {lab["label_id"] for lab in taxonomy["labels"]}
-    rep_of_text: dict[str, str] = {}
-    unique_rows: list[tuple[str, str]] = []
-    for k, t in rows:
-        if t not in rep_of_text:
-            rep_of_text[t] = k
-            unique_rows.append((k, t))
-    batches = [unique_rows[i : i + batch_size]
-               for i in range(0, len(unique_rows), batch_size)]
+    unique_rows = dedupe_rows(rows)
+    batches = make_batches(unique_rows, batch_size)
     totals = {"invalid_ids": 0, "out_of_range": 0, "missing": 0,
               "invalid_locations": 0, "invalid_time_context": 0}
 
@@ -457,6 +538,9 @@ def run_labeling(
     # the original row order, so the output is indistinguishable from having
     # labelled every row individually (minus the model drift)
     if len(unique_rows) != len(rows):
+        # unique_rows holds the first row seen for each distinct text, so
+        # inverting it gives back the text -> representative-key map
+        rep_of_text = {t: k for k, t in unique_rows}
         by_key = {a["response_key"]: a for a in assignments}
         expanded: list[dict] = []
         for k, t in rows:

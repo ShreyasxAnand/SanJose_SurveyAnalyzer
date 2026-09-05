@@ -38,7 +38,14 @@ def two_questions(monkeypatch, tmp_path):
 def test_stages_cover_every_question_then_the_shared_layers(jobs_dir, two_questions):
     stages = pipeline._build_stages("7", two_questions, ["1", "2"], batch_size=60)
     assert [s.key for s in stages] == [
-        "induce:1", "induce:2", "label", "lexicon", "locations", "summary"]
+        "induce:1", "induce:2", "label", "subthemes",
+        "lexicon", "locations", "summary"]
+    # sub-themes read the latest labels run to find which categories cleared
+    # the member floor, so they must come after labeling and before the
+    # summary that renders them
+    sub = next(s for s in stages if s.key == "subthemes")
+    assert sub.command[:2] == ["-m", "scripts.subthemes"]
+    assert "--all" in sub.command
     # labeling runs once with --all, at the batch size the 30k run proved
     # reliable (80 produced deterministic malformed-JSON failures)
     label = next(s for s in stages if s.key == "label")
@@ -128,30 +135,64 @@ def test_api_does_not_leak_server_paths_to_the_browser(jobs_dir, two_questions):
 def test_estimate_marks_planned_and_projected_separately(jobs_dir, two_questions,
                                                          monkeypatch):
     """A projection presented as a plan is an invented number. Induction's
-    figure is planned; labeling's is extrapolated because its real dry-run
-    needs a taxonomy that doesn't exist yet."""
+    figure is planned; labeling's is extrapolated on a dataset with no
+    taxonomy, because the prompts it would count do not exist yet."""
     monkeypatch.setattr(pipeline.induction, "resolve_description",
                         lambda d, p: "desc")
     monkeypatch.setattr(pipeline.induction, "load_questions_bulk",
-                        lambda p, qs: {q: ([], {"question_id": q,
-                                                "question_text": f"q{q}"}, [])
-                                       for q in qs})
-    monkeypatch.setattr(pipeline.induction, "plan_dry_run",
-                        lambda rows, meta, cs, seed, pi, po, desc: {
-                            "n_chunks": 1, "total_calls": 3,
-                            "responses_usable": 500, "est_cost_usd": 0.05})
+                        lambda p, qs: _rows_by_q({q: [f"7:{q}:{i}"
+                                                      for i in range(4)]
+                                                 for q in qs}))
+    monkeypatch.setattr(pipeline.induction, "plan_dry_run", _fake_plan)
     monkeypatch.setattr(pipeline, "_taxonomy_exists", lambda ds, q: q == "2")
+    # q2 is "already induced" for the disclosure check, but no taxonomy file
+    # exists to plan labeling against, so both labeling rows stay projected
+    monkeypatch.setattr(pipeline, "_latest_taxonomy", lambda ds, q: None)
 
     est = pipeline.estimate_dataset("7")
     basis = {(i["stage"], i["basis"]) for i in est["items"]}
     assert ("induce", "planned") in basis
     assert ("label", "projected") in basis
     assert ("lexicon", "projected") in basis
-    # 2 questions x (0.05 induce + 500 * measured label rate) + two flat stages
+    # the headline is exactly what the rows add up to — no separate arithmetic
     assert est["est_total_usd"] == pytest.approx(
-        2 * (0.05 + 0.1) + 2 * pipeline.FLAT_STAGE_USD, abs=1e-6)
+        sum(i["est_cost_usd"] for i in est["items"]), abs=1e-6)
+    # and it sits inside the band, which is a band and not a point
+    assert est["est_low_usd"] <= est["est_total_usd"] <= est["est_high_usd"]
     # a question that already has a taxonomy is disclosed, not silently redone
     assert est["questions_with_existing_taxonomy"] == ["2"]
+
+
+def test_estimate_counts_labeling_prompts_when_a_taxonomy_exists(
+        jobs_dir, two_questions, monkeypatch):
+    """The one basis upgrade this rework buys: with a taxonomy on disk the
+    labeling prompts are fully determined, so they are built and counted
+    instead of multiplied by a rate."""
+    monkeypatch.setattr(pipeline.induction, "resolve_description",
+                        lambda d, p: "desc")
+    monkeypatch.setattr(pipeline.induction, "load_questions_bulk",
+                        lambda p, qs: _rows_by_q({q: [f"7:{q}:{i}"
+                                                      for i in range(4)]
+                                                 for q in qs}))
+    monkeypatch.setattr(pipeline.induction, "plan_dry_run", _fake_plan)
+    monkeypatch.setattr(pipeline, "_taxonomy_exists", lambda ds, q: True)
+    monkeypatch.setattr(pipeline, "_latest_taxonomy", lambda ds, q: {
+        "question_text": "q?",
+        "labels": [{"label_id": "1_001", "name": "parks",
+                    "description": "green space"}],
+    })
+
+    est = pipeline.estimate_dataset("7")
+    label_rows = [i for i in est["items"] if i["stage"] == "label"]
+    assert label_rows, "expected a labeling row per question"
+    for row in label_rows:
+        # no credentials in the offline suite, so the counter falls back —
+        # but it fell back on REAL prompts, not on a per-response rate
+        assert row["input_basis"] == "heuristic"
+        assert row["est_input_tokens"] > 0
+    # every row's tokens roll up into the dataset totals
+    assert est["est_input_tokens"] == sum(
+        i["est_input_tokens"] for i in est["items"])
 
 
 def test_run_endpoint_is_409_when_a_job_is_in_flight(jobs_dir, two_questions,
@@ -187,6 +228,28 @@ def _rows_by_q(spec):
             for q, keys in spec.items()}
 
 
+def _fake_plan(rows, meta, cs, seed, pi, po, desc, **kwargs):
+    """Stand-in for induction.plan_dry_run.
+
+    Takes **kwargs because the real one now also accepts `counter` and `cal`;
+    returns the full key set `_priced_item` reads, including the token counts
+    it prices from (the stubbed est_cost_usd is deliberately ignored by the
+    caller, which re-prices from tokens at the configured rate).
+    """
+    return {
+        "n_chunks": 1,
+        "total_calls": 3,
+        "responses_usable": 500,
+        "responses_sentinel_filtered": 0,
+        "responses_empty": 0,
+        "est_input_tokens": 20_000,
+        "est_output_tokens": 5_000,
+        "est_cost_usd": 0.05,
+        "input_basis": "counted",
+        "count_calls": 1,
+    }
+
+
 def test_incremental_stages_pick_the_right_branch_per_question(
         jobs_dir, two_questions, monkeypatch):
     """q1: taxonomy+labels with new rows -> label_incr. q2: taxonomy only ->
@@ -200,7 +263,7 @@ def test_incremental_stages_pick_the_right_branch_per_question(
     stages = pipeline._build_incremental_stages("7", two_questions, rows, 60)
     assert [s.key for s in stages] == [
         "label_incr:1", "label:2", "induce:3", "label:3",
-        "lexicon", "locations", "summary"]
+        "subthemes", "lexicon", "locations", "summary"]
     incr = stages[0]
     assert incr.command[:2] == ["-m", "scripts.label_incremental"]
     assert incr.command[incr.command.index("--batch-size") + 1] == "60"
@@ -251,10 +314,7 @@ def test_incremental_estimate_plans_a_brand_new_column(jobs_dir, two_questions,
     monkeypatch.setattr(pipeline.induction, "load_questions_bulk",
                         lambda p, qs: _rows_by_q({"1": ["7:1:0", "7:1:8"],
                                                   "2": ["7:2:0"]}))
-    monkeypatch.setattr(pipeline.induction, "plan_dry_run",
-                        lambda rows, meta, cs, seed, pi, po, desc: {
-                            "n_chunks": 1, "total_calls": 3,
-                            "responses_usable": 500, "est_cost_usd": 0.05})
+    monkeypatch.setattr(pipeline.induction, "plan_dry_run", _fake_plan)
     # q2 is the new column: no taxonomy, no labels
     monkeypatch.setattr(pipeline, "_taxonomy_exists", lambda ds, q: q != "2")
     monkeypatch.setattr(pipeline, "_prior_label_keys",

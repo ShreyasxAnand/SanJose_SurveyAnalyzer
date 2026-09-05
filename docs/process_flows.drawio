@@ -119,7 +119,7 @@
     </mxGraphModel>
   </diagram>
   <diagram id="stage2" name="2 Taxonomy building">
-    <mxGraphModel dx="1585" dy="865" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="900" pageHeight="1050" math="0" shadow="0">
+    <mxGraphModel dx="2564" dy="914" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="900" pageHeight="1050" math="0" shadow="0">
       <root>
         <mxCell id="0" />
         <mxCell id="1" parent="0" />
@@ -135,7 +135,7 @@
         <mxCell id="t4" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" value="Two-level taxonomy (Parent &gt; Child), new versioned run; latest run wins" vertex="1">
           <mxGeometry height="60" width="250" x="55" y="450" as="geometry" />
         </mxCell>
-        <mxCell id="t9" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" value="Stage 3: every response labeled against it as-is (no approval gate)" vertex="1">
+        <mxCell id="t9" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" value="Stage 3: every response labeled against it&amp;nbsp;" vertex="1">
           <mxGeometry height="60" width="250" x="55" y="570" as="geometry" />
         </mxCell>
         <mxCell id="t8" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" value="Sub-themes (grandchild layer) induced inside categories with 150+ members; every member sub-coded; auto-review merges duplicates and folds restatements" vertex="1">
@@ -147,7 +147,7 @@
         <mxCell id="te1" edge="1" parent="1" source="t1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" target="t2" value="all usable responses, split into disjoint chunks (non-answers skipped, nothing sampled away)">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
-        <mxCell id="te2" edge="1" parent="1" source="t2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" target="t3" value="checkpointed here: a crash during merge never re-pays for the map pass">
+        <mxCell id="te2" edge="1" parent="1" source="t2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" target="t3" value="checkpointed here: a crash during merge never re runs the map pass">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
         <mxCell id="te3" edge="1" parent="1" source="t3" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" target="t4">
@@ -166,47 +166,47 @@
     </mxGraphModel>
   </diagram>
   <diagram id="stage3" name="3 Labelling">
-    <mxGraphModel dx="1000" dy="700" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="850" pageHeight="650" math="0" shadow="0">
+    <mxGraphModel dx="2264" dy="777" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="850" pageHeight="650" math="0" shadow="0">
       <root>
         <mxCell id="0" />
         <mxCell id="1" parent="0" />
-        <mxCell id="l1" value="Latest taxonomy (ids frozen for labeling)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
-          <mxGeometry x="110" y="40" width="200" height="50" as="geometry" />
+        <mxCell id="l1" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" value="Latest taxonomy (ids frozen for labeling)" vertex="1">
+          <mxGeometry height="50" width="200" x="110" y="40" as="geometry" />
         </mxCell>
-        <mxCell id="l2" value="responses.parquet (full corpus)" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=15;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
-          <mxGeometry x="530" y="30" width="200" height="70" as="geometry" />
+        <mxCell id="l2" parent="1" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=15;fillColor=#d5e8d4;strokeColor=#82b366;" value="responses.parquet (full corpus)" vertex="1">
+          <mxGeometry height="70" width="200" x="530" y="30" as="geometry" />
         </mxCell>
-        <mxCell id="l3" value="Model tags every response with ALL matching themes (multi-label, batched); also extracts verbatim places, time phrases, actionability, incident flag" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
-          <mxGeometry x="295" y="170" width="260" height="90" as="geometry" />
+        <mxCell id="l3" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" value="Model tags every response with ALL matching themes (multi-label, batched); also extracts verbatim places, time phrases, actionability, incident flag" vertex="1">
+          <mxGeometry height="90" width="260" x="295" y="170" as="geometry" />
         </mxCell>
-        <mxCell id="l4" value="assignments.json — the source of every category count in answers" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=15;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
-          <mxGeometry x="295" y="300" width="260" height="80" as="geometry" />
+        <mxCell id="l4" parent="1" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=15;fillColor=#d5e8d4;strokeColor=#82b366;" value="assignments.json — the source of every category count in answers" vertex="1">
+          <mxGeometry height="80" width="260" x="295" y="300" as="geometry" />
         </mxCell>
-        <mxCell id="l5" value="Lexicon: deterministic keyword dictionary" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
-          <mxGeometry x="60" y="450" width="200" height="60" as="geometry" />
+        <mxCell id="l5" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" value="Lexicon: deterministic keyword dictionary" vertex="1">
+          <mxGeometry height="60" width="200" x="60" y="450" as="geometry" />
         </mxCell>
-        <mxCell id="l6" value="Locations layer: place names per response" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
-          <mxGeometry x="330" y="450" width="190" height="60" as="geometry" />
+        <mxCell id="l6" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" value="Locations layer: place names per response" vertex="1">
+          <mxGeometry height="60" width="190" x="330" y="450" as="geometry" />
         </mxCell>
-        <mxCell id="l7" value="Taxonomy summary: compact digest the query router reads" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
-          <mxGeometry x="590" y="450" width="200" height="60" as="geometry" />
+        <mxCell id="l7" parent="1" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" value="Taxonomy summary: compact digest the query router reads" vertex="1">
+          <mxGeometry height="60" width="200" x="590" y="450" as="geometry" />
         </mxCell>
-        <mxCell id="le1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;entryX=0.25;entryY=0;" edge="1" parent="1" source="l1" target="l3">
+        <mxCell id="le1" edge="1" parent="1" source="l1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;entryX=0.25;entryY=0;" target="l3">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
-        <mxCell id="le2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;entryX=0.75;entryY=0;" edge="1" parent="1" source="l2" target="l3">
+        <mxCell id="le2" edge="1" parent="1" source="l2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;entryX=0.75;entryY=0;" target="l3">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
-        <mxCell id="le3" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" edge="1" parent="1" source="l3" target="l4">
+        <mxCell id="le3" edge="1" parent="1" source="l3" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;" target="l4">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
-        <mxCell id="le4" value="corpus text, not the labels (deterministic extraction, one grouping call)" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0;exitY=0.5;entryX=0.5;entryY=0;" edge="1" parent="1" source="l2" target="l5">
+        <mxCell id="le4" edge="1" parent="1" source="l2" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0;exitY=0.5;entryX=0.5;entryY=0;" target="l5" value="corpus text, not the labels (deterministic extraction, one grouping call)">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
-        <mxCell id="le5" value="verbatim place spans" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="l4" target="l6">
+        <mxCell id="le5" edge="1" parent="1" source="l4" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;" target="l6" value="verbatim place spans">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
-        <mxCell id="le6" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.75;exitY=1;entryX=0.5;entryY=0;" edge="1" parent="1" source="l4" target="l7">
+        <mxCell id="le6" edge="1" parent="1" source="l4" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;exitX=0.75;exitY=1;entryX=0.5;entryY=0;" target="l7">
           <mxGeometry relative="1" as="geometry" />
         </mxCell>
       </root>
